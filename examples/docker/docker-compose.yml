@@ -1,0 +1,19 @@
+# Run a local SearXNG instance with the JSON format enabled.
+# The port is bound to loopback on purpose: a JSON-enabled instance without
+# the limiter must not be exposed publicly.
+services:
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./searxng:/etc/searxng:ro
+    environment:
+      SEARXNG_BASE_URL: http://127.0.0.1:8080/
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID

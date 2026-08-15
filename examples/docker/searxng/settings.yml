@@ -1,0 +1,17 @@
+# Minimal SearXNG settings for use as a dsh search backend.
+# Everything else inherits the image defaults (use_default_settings).
+use_default_settings: true
+
+server:
+  # Change this for anything beyond local use: `openssl rand -hex 32`.
+  secret_key: "change-me-to-a-random-string"
+  # The limiter is disabled for a loopback-only instance. If you ever expose
+  # this instance beyond localhost, re-enable it (`limiter: true`).
+  limiter: false
+
+search:
+  # The dsh plugin needs `json` here. Most public instances enable only
+  # `html`, which is why no public instance is configured by default.
+  formats:
+    - html
+    - json

@@ -1,0 +1,218 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { WebError } from '@deepseek-ai/dsh-web'
+import {
+  SEARXNG_PROVIDER_ID,
+  SearxngSearchProvider,
+  mapSearxngResponse,
+  mapSearxngResult,
+} from '../src/provider.ts'
+import type { SearxngResult } from '../src/types.ts'
+
+const BASE = 'http://127.0.0.1:8080'
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  })
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+describe('mapSearxngResult', () => {
+  it('maps a full entry to url/title/snippet/publishedAt', () => {
+    const entry: SearxngResult = {
+      url: 'https://example.com/a',
+      title: 'A result',
+      content: 'A snippet',
+      engine: 'google',
+      score: 1.5,
+      publishedDate: '2026-01-02T03:04:05Z',
+    }
+    expect(mapSearxngResult(entry)).toEqual({
+      url: 'https://example.com/a',
+      title: 'A result',
+      snippet: 'A snippet',
+      publishedAt: '2026-01-02T03:04:05Z',
+    })
+  })
+
+  it('keeps an entry with only url and title (seam allows URL-only sources)', () => {
+    const entry: SearxngResult = { url: 'https://example.com/b', title: 'B', content: '' }
+    expect(mapSearxngResult(entry)).toEqual({ url: 'https://example.com/b', title: 'B' })
+  })
+
+  it('keeps an entry with only a url', () => {
+    expect(mapSearxngResult({ url: 'https://example.com/c', title: null, content: null })).toEqual({
+      url: 'https://example.com/c',
+    })
+  })
+
+  it('drops an entry without a url', () => {
+    expect(mapSearxngResult({ title: 'orphan', content: 'no url' })).toBeUndefined()
+    expect(mapSearxngResult({ url: '', title: 'empty url' })).toBeUndefined()
+    expect(mapSearxngResult({ url: null })).toBeUndefined()
+  })
+
+  it('drops blank-only fields instead of inventing them', () => {
+    expect(mapSearxngResult({ url: 'https://example.com/d', title: '  ', content: ' \t ' })).toEqual({
+      url: 'https://example.com/d',
+    })
+  })
+})
+
+describe('mapSearxngResponse', () => {
+  it('maps results and reports truncated: false (the seam owns truncation)', () => {
+    const result = mapSearxngResponse({
+      query: 'q',
+      results: [
+        { url: 'https://example.com/1', title: '1', content: 's1' },
+        { title: 'no url' },
+      ],
+      number_of_results: 42,
+    })
+    expect(result).toEqual({
+      sources: [{ url: 'https://example.com/1', title: '1', snippet: 's1' }],
+      truncated: false,
+    })
+  })
+
+  it('tolerates a missing results array', () => {
+    expect(mapSearxngResponse({ query: 'q' })).toEqual({ sources: [], truncated: false })
+  })
+})
+
+describe('SearxngSearchProvider', () => {
+  it('registers under the stable searxng id', () => {
+    expect(new SearxngSearchProvider({ baseURL: BASE }).id).toBe(SEARXNG_PROVIDER_ID)
+  })
+
+  describe('available', () => {
+    it('is true for an absolute base URL', () => {
+      expect(new SearxngSearchProvider({ baseURL: BASE }).available()).toBe(true)
+    })
+
+    it('is false without a base URL or with a relative one', () => {
+      expect(new SearxngSearchProvider({ baseURL: '' }).available()).toBe(false)
+      expect(new SearxngSearchProvider({ baseURL: 'localhost:8080' }).available()).toBe(false)
+    })
+  })
+
+  describe('search', () => {
+    it('requests the JSON format with query and optional filters', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        jsonResponse({ results: [{ url: 'https://example.com/1', content: 's' }] }),
+      )
+      vi.stubGlobal('fetch', fetchMock)
+
+      const provider = new SearxngSearchProvider({
+        baseURL: BASE,
+        language: 'zh-CN',
+        engines: 'bing,duckduckgo',
+        categories: 'general',
+      })
+      const result = await provider.search({ query: '你好 world' })
+
+      expect(result.sources).toEqual([{ url: 'https://example.com/1', snippet: 's' }])
+      expect(fetchMock).toHaveBeenCalledOnce()
+      const [url, init] = fetchMock.mock.calls[0]! as [string, RequestInit]
+      const parsed = new URL(url)
+      expect(parsed.origin + parsed.pathname).toBe(`${BASE}/search`)
+      expect(parsed.searchParams.get('q')).toBe('你好 world')
+      expect(parsed.searchParams.get('format')).toBe('json')
+      expect(parsed.searchParams.get('language')).toBe('zh-CN')
+      expect(parsed.searchParams.get('engines')).toBe('bing,duckduckgo')
+      expect(parsed.searchParams.get('categories')).toBe('general')
+      expect(init.method).toBe('GET')
+      expect((init.headers as Record<string, string>)['accept']).toBe('application/json')
+    })
+
+    it('omits filter parameters when unconfigured', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [] }))
+      vi.stubGlobal('fetch', fetchMock)
+
+      await new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q', maxResults: 3 })
+
+      const parsed = new URL(fetchMock.mock.calls[0]![0] as string)
+      expect(parsed.searchParams.has('language')).toBe(false)
+      expect(parsed.searchParams.has('engines')).toBe(false)
+      expect(parsed.searchParams.has('categories')).toBe(false)
+    })
+
+    it('sends the configured authorization header verbatim', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [] }))
+      vi.stubGlobal('fetch', fetchMock)
+
+      await new SearxngSearchProvider({ baseURL: BASE, authHeader: 'Bearer tok' }).search({ query: 'q' })
+
+      const init = fetchMock.mock.calls[0]![1] as RequestInit
+      expect((init.headers as Record<string, string>)['authorization']).toBe('Bearer tok')
+    })
+
+    it('forwards the abort signal', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [] }))
+      vi.stubGlobal('fetch', fetchMock)
+      const controller = new AbortController()
+
+      await new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' }, controller.signal)
+
+      expect((fetchMock.mock.calls[0]![1] as RequestInit).signal).toBe(controller.signal)
+    })
+
+    it.each([
+      [403, /JSON format|search\.formats/],
+      [429, /rate limit/i],
+      [502, /HTTP 502/],
+    ])('maps HTTP %i to a WEB_PROVIDER_ERROR with guidance', async (status, pattern) => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('nope', { status })))
+
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })
+      await expect(attempt).rejects.toSatisfy((error: unknown) => {
+        expect(error).toBeInstanceOf(WebError)
+        expect((error as WebError).code).toBe('WEB_PROVIDER_ERROR')
+        expect((error as WebError).message).toMatch(pattern)
+        return true
+      })
+    })
+
+    it('maps a network failure to WEB_PROVIDER_ERROR with the cause chained', async () => {
+      const cause = new TypeError('fetch failed')
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(cause))
+
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })
+      await expect(attempt).rejects.toSatisfy((error: unknown) => {
+        expect((error as WebError).code).toBe('WEB_PROVIDER_ERROR')
+        expect((error as WebError).cause).toBe(cause)
+        return true
+      })
+    })
+
+    it('maps an abort during fetch to WEB_ABORTED', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new DOMException('aborted', 'AbortError')))
+
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })
+      await expect(attempt).rejects.toSatisfy((error: unknown) => {
+        expect((error as WebError).code).toBe('WEB_ABORTED')
+        return true
+      })
+    })
+
+    it('maps a non-JSON 200 body to WEB_PROVIDER_ERROR', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+        new Response('<html>not json</html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        }),
+      ))
+
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })
+      await expect(attempt).rejects.toSatisfy((error: unknown) => {
+        expect((error as WebError).code).toBe('WEB_PROVIDER_ERROR')
+        expect((error as WebError).message).toMatch(/unprocessable response body/)
+        return true
+      })
+    })
+  })
+})

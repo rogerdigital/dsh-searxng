@@ -1,0 +1,9 @@
+# The dsh-searxng bundle patch: registers a SearXNG-backed search
+# provider into the web capability seam (ctx.web). Configure the instance via
+# this row's `config` (baseURL and friends) or the SEARXNG_BASE_URL
+# environment variable. With no other search provider installed, the seam
+# auto-selects this one once `baseURL` is set; otherwise select it explicitly
+# with `searchProvider: searxng` on the web row, or DSH_WEB_SEARCH_PROVIDER.
+- insert:
+    - id: web-search-searxng
+      name: 'dsh-searxng'

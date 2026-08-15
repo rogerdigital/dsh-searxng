@@ -1,0 +1,63 @@
+{
+  "name": "dsh-searxng",
+  "version": "0.1.0",
+  "description": "SearXNG-backed search provider for the DeepSeek Harness web capability seam (ctx.web)",
+  "type": "module",
+  "main": "lib/index.mjs",
+  "types": "lib/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.mts",
+      "default": "./lib/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "test": "vitest run",
+    "prepublishOnly": "pnpm run build"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "searxng",
+    "search",
+    "metasearch",
+    "agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rogerdigital/dsh-searxng.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-launch-environment": ">=0.0.1-rc.1 <0.2.0",
+    "@deepseek-ai/dsh-web": ">=0.1.0-rc.1 <0.2.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-launch-environment": "0.0.1-rc.3",
+    "@deepseek-ai/dsh-web": "0.1.0-rc.6",
+    "@types/node": "^22.10.0",
+    "tsdown": "^0.22.14",
+    "typescript": "^5.8.0",
+    "vitest": "^3.0.0"
+  }
+}
