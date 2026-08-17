@@ -1,0 +1,6 @@
+node_modules/
+lib/
+.worktrees/
+*.tgz
+.DS_Store
+coverage/
