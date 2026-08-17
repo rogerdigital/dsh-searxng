@@ -31,9 +31,10 @@ const USER_AGENT = 'dsh-searxng/0.1.0'
 export interface SearxngSearchProviderOptions {
   /**
    * Base URL of the SearXNG instance, e.g. `http://127.0.0.1:8080`. The
-   * instance must have `json` in its `search.formats`. Empty/absent makes
-   * the provider unavailable — no public instance is assumed, because most
-   * disable the JSON format and rate-limit heavily.
+   * instance must have `json` in its `search.formats`; query and fragment
+   * components are not accepted. Empty/absent makes the provider unavailable —
+   * no public instance is assumed, because most disable the JSON format and
+   * rate-limit heavily.
    */
   baseURL: string
   /** Locale passed as SearXNG's `language` parameter, e.g. `zh-CN`. */
@@ -169,9 +170,10 @@ function httpFailureMessage(status: number): string {
 }
 
 /**
- * True when `baseURL` parses as an absolute http(s) URL (a cheap local config
- * check). Bare `URL.canParse` would accept e.g. `localhost:8080` — valid URL
- * syntax with an unusable `localhost:` scheme that only fails later at fetch.
+ * True when `baseURL` parses as an absolute http(s) URL with no query or
+ * fragment (a cheap local config check). Bare `URL.canParse` would accept e.g.
+ * `localhost:8080` — valid URL syntax with an unusable `localhost:` scheme
+ * that only fails later at fetch.
  */
 function isValidBaseUrl(baseURL: string): boolean {
   if (!URL.canParse(baseURL)) return false
