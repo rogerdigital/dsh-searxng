@@ -85,7 +85,8 @@ dsh is in developer preview with breaking changes expected. This table tracks te
 
 | Plugin version | `@deepseek-ai/dsh-web` | `@deepseek-ai/dsh-launch-environment` | Notes |
 |---|---|---|---|
-| 0.1.0 | `>=0.1.0-rc.6 <0.2.0` (tested against `0.1.0-rc.6`) | `>=0.0.1-rc.3 <0.2.0` (tested against `0.0.1-rc.3`) | Initial release |
+| Unreleased | `>=0.1.0-rc.6 <0.2.0` (tested against `0.1.0-rc.6`) | `>=0.0.1-rc.3 <0.2.0` (tested against `0.0.1-rc.3`) | First-round hardening |
+| 0.1.0 | `>=0.1.0-rc.1 <0.2.0` | `>=0.0.1-rc.1 <0.2.0` | Initial release |
 
 ## Develop
 
