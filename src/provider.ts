@@ -114,7 +114,7 @@ export class SearxngSearchProvider implements WebSearchProvider {
 
     let response: Response
     try {
-      response = await fetch(`${this.options.baseURL}/search?${params.toString()}`, {
+      response = await fetch(buildSearchUrl(this.options.baseURL, params), {
         method: 'GET',
         headers: {
           'accept': 'application/json',
@@ -144,6 +144,15 @@ export class SearxngSearchProvider implements WebSearchProvider {
   }
 }
 
+/** Build the JSON search endpoint while preserving an optional deployment subpath. */
+function buildSearchUrl(baseURL: string, params: URLSearchParams): string {
+  const url = new URL(baseURL)
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}/search`
+  url.search = params.toString()
+  url.hash = ''
+  return url.toString()
+}
+
 /**
  * Human-readable failure text that names the two fixes a user can actually
  * make: HTTP 403 is almost always a SearXNG instance without `json` in
@@ -166,8 +175,10 @@ function httpFailureMessage(status: number): string {
  */
 function isValidBaseUrl(baseURL: string): boolean {
   if (!URL.canParse(baseURL)) return false
-  const protocol = new URL(baseURL).protocol
-  return protocol === 'http:' || protocol === 'https:'
+  const url = new URL(baseURL)
+  return (url.protocol === 'http:' || url.protocol === 'https:')
+    && url.search.length === 0
+    && url.hash.length === 0
 }
 
 /** True for a fetch/`AbortSignal` abort, surfaced as `WEB_ABORTED`. */

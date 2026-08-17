@@ -98,9 +98,30 @@ describe('SearxngSearchProvider', () => {
       expect(new SearxngSearchProvider({ baseURL: '' }).available()).toBe(false)
       expect(new SearxngSearchProvider({ baseURL: 'localhost:8080' }).available()).toBe(false)
     })
+
+    it.each([`${BASE}?x=1`, `${BASE}#section`])(
+      'is false when the base URL contains a query or fragment: %s',
+      (baseURL) => {
+        expect(new SearxngSearchProvider({ baseURL }).available()).toBe(false)
+      },
+    )
   })
 
   describe('search', () => {
+    it.each([
+      [`${BASE}/`, `${BASE}/search`],
+      [`${BASE}/searxng`, `${BASE}/searxng/search`],
+      [`${BASE}/searxng/`, `${BASE}/searxng/search`],
+    ])('normalizes the base URL %s', async (baseURL, expectedPath) => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [] }))
+      vi.stubGlobal('fetch', fetchMock)
+
+      await new SearxngSearchProvider({ baseURL }).search({ query: 'q' })
+
+      const requested = new URL(fetchMock.mock.calls[0]![0] as string)
+      expect(requested.origin + requested.pathname).toBe(expectedPath)
+    })
+
     it('requests the JSON format with query and optional filters', async () => {
       const fetchMock = vi.fn().mockResolvedValue(
         jsonResponse({ results: [{ url: 'https://example.com/1', content: 's' }] }),
