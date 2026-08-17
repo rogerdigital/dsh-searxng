@@ -114,19 +114,19 @@ Add the package manager declaration and scripts:
   "build": "tsdown",
   "typecheck": "tsc --noEmit",
   "test": "vitest run",
-  "pack:check": "npm pack --dry-run --cache ./node_modules/.cache/npm",
+  "pack:check": "pnpm pack --pack-destination ./node_modules/.cache/pack",
   "verify": "pnpm typecheck && pnpm test && pnpm build && pnpm pack:check",
   "prepublishOnly": "pnpm run build"
 }
 ```
 
-The package cache stays under ignored `node_modules`, avoiding dependence on a potentially broken user-level npm cache.
+The tarball stays under ignored `node_modules`, avoiding dependence on a potentially broken user-level npm cache and checking the real packed artifact.
 
 - [ ] **Step 2: Run the unified verification command**
 
 Run: `pnpm verify`
 
-Expected: type checking passes, all tests pass, the ESM/types build succeeds, and npm prints a dry-run tarball containing the intended six release files.
+Expected: type checking passes, all tests pass, the ESM/types build succeeds, and pnpm creates a tarball containing the intended six release files under ignored `node_modules/.cache/pack`.
 
 ### Task 4: Add Continuous Integration
 

@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "SearXNG-backed search provider for the DeepSeek Harness web capability seam (ctx.web)",
   "type": "module",
+  "packageManager": "pnpm@10.23.0",
   "main": "lib/index.mjs",
   "types": "lib/index.d.mts",
   "exports": {
@@ -23,7 +24,10 @@
   },
   "scripts": {
     "build": "tsdown",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "pack:check": "pnpm pack --pack-destination ./node_modules/.cache/pack",
+    "verify": "pnpm typecheck && pnpm test && pnpm build && pnpm pack:check",
     "prepublishOnly": "pnpm run build"
   },
   "keywords": [
