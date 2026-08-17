@@ -133,7 +133,7 @@ Expected: type checking passes, all tests pass, the ESM/types build succeeds, an
 **Files:**
 - Create: `.github/workflows/ci.yml`
 
-- [ ] **Step 1: Add the minimum-version CI job**
+- [ ] **Step 1: Add runtime and build-tool CI coverage**
 
 Create this workflow:
 
@@ -149,24 +149,34 @@ permissions:
 
 jobs:
   verify:
+    name: Verify (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 24]
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           version: 10.23.0
           run_install: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: ${{ matrix.node-version }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm verify
+      - if: matrix.node-version == 20
+        run: pnpm typecheck && pnpm test
+      - if: matrix.node-version == 24
+        run: pnpm verify
 ```
+
+Node.js 20 verifies the package's declared minimum runtime through type checking and tests. Node.js 24 runs the full build and pack verification because `tsdown@0.22.14` requires Node.js `^22.18.0 || >=24.11.0`.
 
 - [ ] **Step 2: Validate workflow syntax locally**
 
-Run a YAML parse check using an already available parser, then inspect the workflow keys. Expected: the file parses and contains one `verify` job on Node.js 20.
+Run a YAML parse check using an already available parser, then inspect the workflow keys. Expected: the file parses and contains one `verify` matrix covering Node.js 20 and 24, with full package verification on Node.js 24.
 
 ### Task 5: Align Compatibility Claims With Tested Versions
 
