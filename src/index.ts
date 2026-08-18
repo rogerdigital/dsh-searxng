@@ -28,7 +28,7 @@ export const inject = ['web']
 
 /** Plugin config (all optional — `apply` fills env-var and constant defaults). */
 export interface Config {
-  /** SearXNG instance base URL. Falls back to `$SEARXNG_BASE_URL`. Empty → provider unavailable. */
+  /** SearXNG instance base URL without a query or fragment. Falls back to `$SEARXNG_BASE_URL`. Empty → unavailable. */
   baseURL?: string
   /** Locale passed as SearXNG's `language` parameter, e.g. `zh-CN`. */
   language?: string
