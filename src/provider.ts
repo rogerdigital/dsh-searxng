@@ -22,7 +22,7 @@ import type { SearxngResult, SearxngSearchResponse } from './types.ts'
 export const SEARXNG_PROVIDER_ID = 'searxng'
 
 /** Attribution header sent on every request. Bump with the package version. */
-const USER_AGENT = 'dsh-searxng/0.1.0'
+const USER_AGENT = 'dsh-searxng/0.1.1'
 
 /**
  * Resolved provider options (the plugin's `apply` supplies env-var and
