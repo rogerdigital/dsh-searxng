@@ -59,8 +59,13 @@ function sanitizeLogText(value: string): string {
   return value
     .replace(/("authorization"\s*:\s*")[^"]*(")/gi, '$1[REDACTED]$2')
     .replace(/(authorization\s*[:=]\s*)[^\r\n,;]+/gi, '$1[REDACTED]')
-    .replace(/((?:secret(?:[_-]?key)?|password|api[_-]?key|access[_-]?token|refresh[_-]?token|query)\s*[:=]\s*)([^\s,;]+)/gi, '$1[REDACTED]')
-    .replace(/("(?:secret(?:[_-]?key)?|password|api[_-]?key|access[_-]?token|refresh[_-]?token|query)"\s*:\s*")[^"]*(")/gi, '$1[REDACTED]$2')
+    .replace(/("(?:search(?:[_-]?query)|query)"\s*:\s*")(?:\\.|[^"\\])*(")/gi, '$1[REDACTED]$2')
+    .replace(
+      /(^|[^a-z\d_-])((?:search(?:[_-]?query)|query)\s*[:=]\s*)(.*?)(?=\s*(?:[,;]\s*[a-z][\w-]*\s*[:=]|\r?\n|$))/gim,
+      '$1$2[REDACTED]',
+    )
+    .replace(/((?:secret(?:[_-]?key)?|password|api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[:=]\s*)([^\s,;]+)/gi, '$1[REDACTED]')
+    .replace(/("(?:secret(?:[_-]?key)?|password|api[_-]?key|access[_-]?token|refresh[_-]?token)"\s*:\s*")[^"]*(")/gi, '$1[REDACTED]$2')
 }
 
 function capUtf8(value: string, limit: number): string {

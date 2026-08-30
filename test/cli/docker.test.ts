@@ -191,6 +191,36 @@ describe('CliDockerAdapter Compose operations', () => {
     }
   })
 
+  it.each([
+    ['query=needleAlpha needleBeta needleGamma needleDelta\nstatus=ok', ['status=ok']],
+    ['search_query: needleAlpha needleBeta needleGamma needleDelta, status=ok', ['status=ok']],
+    ['SEARCH-QUERY=needleAlpha: needleBeta? needleGamma! needleDelta; elapsed=12', ['elapsed=12']],
+    ['SearchQuery: needleAlpha,needleBeta needleGamma needleDelta\nlevel=info', ['level=info']],
+    ['{"query":"needleAlpha needleBeta needleGamma needleDelta","status":"ok"}', ['"status":"ok"']],
+    ['{"search_query":"needleAlpha, needleBeta; needleGamma needleDelta","status":"ok"}', ['"status":"ok"']],
+    [
+      'query=needleAlpha needleBeta\nstatus=ok\nsearch-query: needleGamma needleDelta\nlevel=info',
+      ['status=ok', 'level=info'],
+    ],
+  ])('redacts complete multi-word search values without hiding adjacent fields: %s', async (line, safeFields) => {
+    const runner = new FakeRunner(ok(ownedInspect), ok(line))
+    const logs = await new CliDockerAdapter(runner, { maxLogBytes: 4096 }).logs(identity, 10)
+    for (const term of ['needleAlpha', 'needleBeta', 'needleGamma', 'needleDelta']) {
+      expect(logs.toLowerCase()).not.toContain(term.toLowerCase())
+    }
+    for (const field of safeFields) expect(logs).toContain(field)
+  })
+
+  it('redacts all query terms before applying the byte cap', async () => {
+    const line = `query=needleAlpha needleBeta needleGamma needleDelta\n${'x'.repeat(200)}`
+    const runner = new FakeRunner(ok(ownedInspect), ok(line))
+    const logs = await new CliDockerAdapter(runner, { maxLogBytes: 32 }).logs(identity, 10)
+    expect(Buffer.byteLength(logs)).toBeLessThanOrEqual(32)
+    for (const term of ['needleAlpha', 'needleBeta', 'needleGamma', 'needleDelta']) {
+      expect(logs.toLowerCase()).not.toContain(term.toLowerCase())
+    }
+  })
+
   it('passes bounded logs through the injected structural redactor', async () => {
     const runner = new FakeRunner(ok(ownedInspect), ok('public private'))
     const adapter = new CliDockerAdapter(runner, {
