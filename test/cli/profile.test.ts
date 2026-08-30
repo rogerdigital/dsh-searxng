@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { parse, parseDocument } from 'yaml'
 import { afterEach, describe, expect, it } from 'vitest'
+import { CliError } from '../../src/cli/errors.ts'
 import type { CommandResult, CommandRunner } from '../../src/cli/process.ts'
 import {
   NodeProfileManager,
@@ -15,11 +16,23 @@ const roots: string[] = []
 
 class RecordingRunner implements CommandRunner {
   readonly calls: Array<{ command: string; args: readonly string[] }> = []
+  readonly signals: Array<AbortSignal | undefined> = []
   response: CommandResult = { exitCode: 0, stdout: '', stderr: '' }
   failure: unknown
+  handler?: (
+    command: string,
+    args: readonly string[],
+    options?: { signal?: AbortSignal },
+  ) => Promise<CommandResult>
 
-  async run(command: string, args: readonly string[]): Promise<CommandResult> {
+  async run(
+    command: string,
+    args: readonly string[],
+    options?: { signal?: AbortSignal },
+  ): Promise<CommandResult> {
     this.calls.push({ command, args: [...args] })
+    this.signals.push(options?.signal)
+    if (this.handler !== undefined) return this.handler(command, args, options)
     if (this.failure !== undefined) throw this.failure
     return this.response
   }
@@ -306,6 +319,31 @@ describe('transactional attachment', () => {
     await expect(fs.readFile(patchPath)).resolves.toEqual(original)
   })
 
+  it('rethrows a safe validation CliError unchanged after successful rollback', async () => {
+    const validationError = new CliError(
+      'E_AUTH_FAILED',
+      'SearXNG authentication failed',
+      'Check the configured authorization header and retry',
+    )
+    const { manager } = await fixture({ patch: '[]\n' })
+    let error: unknown
+    try {
+      await manager.attach('web', 'http://localhost:8080', async () => { throw validationError })
+    } catch (cause) { error = cause }
+    expect(error).toBe(validationError)
+  })
+
+  it('rethrows validation cancellation unchanged after successful rollback', async () => {
+    const cancellation = new Error('The operation was aborted')
+    cancellation.name = 'AbortError'
+    const { manager } = await fixture({ patch: '[]\n' })
+    let error: unknown
+    try {
+      await manager.attach('web', 'http://localhost:8080', async () => { throw cancellation })
+    } catch (cause) { error = cause }
+    expect(error).toBe(cancellation)
+  })
+
   it('restores original absence after validation fails', async () => {
     const { manager, patchPath } = await fixture()
     await expect(manager.attach('web', 'http://localhost:8080', async () => {
@@ -378,7 +416,11 @@ describe('rollback and file safety', () => {
     } catch (cause) { error = cause }
     expect(error).toMatchObject({
       code: 'E_PROFILE_WRITE',
-      details: { primaryFailure: 'validation', rollbackFailures: ['patch'] },
+      details: {
+        primaryFailure: 'validation',
+        primaryError: 'unknown',
+        rollbackFailures: ['patch'],
+      },
     })
     expect(JSON.stringify(error)).not.toContain('private.invalid')
     expect(JSON.stringify(error)).not.toContain('validation token')
@@ -400,7 +442,7 @@ describe('rollback and file safety', () => {
     })
   })
 
-  it('maps command cancellation and process failures to stable safe errors', async () => {
+  it('preserves command cancellation after confirming there was no install side effect', async () => {
     const runner = new RecordingRunner()
     const cancellation = new Error('cancel secret endpoint https://private.invalid?q=token')
     cancellation.name = 'AbortError'
@@ -408,9 +450,181 @@ describe('rollback and file safety', () => {
     const { manager, patchPath } = await fixture({ patch: '[]\n', runner })
     let error: unknown
     try { await manager.attach('web', 'http://localhost:8080', async () => {}) } catch (cause) { error = cause }
-    expect(error).toMatchObject({ code: 'E_PROFILE_WRITE', details: { primaryFailure: 'install' } })
+    expect(error).toBe(cancellation)
     expect(JSON.stringify(error)).not.toContain('private.invalid')
     await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe('[]\n')
+  })
+
+  it('passes the exact signal to add, detects an install side effect after abort, cleans it, then rethrows cancellation', async () => {
+    const controller = new AbortController()
+    const cancellation = new Error('cancelled')
+    cancellation.name = 'AbortError'
+    const runner = new RecordingRunner()
+    const { manager, dir } = await fixture({ patch: '[]\n', runner })
+    runner.handler = async (_command, args) => {
+      if (args.includes('add')) {
+        await fs.writeFile(join(dir, 'package.json'), JSON.stringify({ dependencies: { 'dsh-searxng': '0.1.0' } }))
+        throw cancellation
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    let error: unknown
+    try {
+      await manager.attach('web', 'http://localhost:8080', async () => {}, controller.signal)
+    } catch (cause) { error = cause }
+
+    expect(error).toBe(cancellation)
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'remove', 'dsh-searxng'],
+    ])
+    expect(runner.signals[0]).toBe(controller.signal)
+  })
+
+  it('detects and removes an install side effect after a nonzero add result', async () => {
+    const runner = new RecordingRunner()
+    const { manager, dir } = await fixture({ patch: '[]\n', runner })
+    runner.handler = async (_command, args) => {
+      if (args.includes('add')) {
+        await fs.writeFile(join(dir, 'package.json'), JSON.stringify({
+          dsh: { profile: { bundles: ['dsh-searxng'] } },
+        }))
+        return { exitCode: 1, stdout: '', stderr: 'unsafe process output' }
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {})).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { primaryFailure: 'install', primaryError: 'process' },
+    })
+    expect(runner.calls.at(-1)?.args).toEqual(['plugin', '--profile', 'web', 'remove', 'dsh-searxng'])
+  })
+
+  it('preserves a patch initialized by the add command', async () => {
+    const runner = new RecordingRunner()
+    const { manager, dir, patchPath } = await fixture({ runner })
+    runner.handler = async () => {
+      await fs.writeFile(join(dir, 'package.json'), JSON.stringify({ dependencies: { 'dsh-searxng': '0.1.0' } }))
+      await fs.writeFile(patchPath, '# initialized by dsh\n- id: initialized\n  config: { keep: true }\n')
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await manager.attach('web', 'http://localhost:8080', async () => {})
+    const output = await fs.readFile(patchPath, 'utf8')
+    expect(output).toContain('# initialized by dsh')
+    expect(ids(output)).toEqual(['initialized', 'web-search-searxng'])
+  })
+
+  it('renders from an existing patch edited during add', async () => {
+    const runner = new RecordingRunner()
+    const { manager, dir, patchPath } = await fixture({ patch: '[]\n', runner })
+    runner.handler = async () => {
+      await fs.writeFile(join(dir, 'package.json'), JSON.stringify({ dependencies: { 'dsh-searxng': '0.1.0' } }))
+      await fs.writeFile(patchPath, '# changed during add\n- id: concurrent-add\n')
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await manager.attach('web', 'http://localhost:8080', async () => {})
+    const output = await fs.readFile(patchPath, 'utf8')
+    expect(output).toContain('# changed during add')
+    expect(ids(output)).toEqual(['concurrent-add', 'web-search-searxng'])
+  })
+
+  it('does not overwrite a concurrent patch change observed before commit', async () => {
+    const original = '# original\n[]\n'
+    const concurrent = '# concurrent before commit\n- id: editor\n'
+    let patchReads = 0
+    let patchPath = ''
+    const fileSystem: ProfileFileSystem = {
+      ...fs,
+      readFile: (async (...args: Parameters<typeof fs.readFile>) => {
+        if (String(args[0]) === patchPath) {
+          patchReads += 1
+          if (patchReads === 3) await fs.writeFile(patchPath, concurrent)
+        }
+        return fs.readFile(...args)
+      }) as typeof fs.readFile,
+    }
+    const created = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.0' } },
+      patch: original,
+      fileSystem,
+    })
+    patchPath = created.patchPath
+
+    await expect(created.manager.attach('web', 'http://localhost:8080', async () => {})).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { primaryFailure: 'write', primaryError: 'profile-conflict' },
+    })
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(concurrent)
+  })
+
+  it('preserves a concurrent validation edit and reports rollback conflict', async () => {
+    const concurrent = '# concurrent during validation\n- id: editor\n'
+    const validationError = new CliError('E_SEARCH_FAILED', 'Search failed', 'Retry')
+    const { manager, patchPath } = await fixture({ patch: '[]\n' })
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {
+      await fs.writeFile(patchPath, concurrent)
+      throw validationError
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: {
+        primaryFailure: 'validation',
+        primaryError: 'E_SEARCH_FAILED',
+        rollbackFailures: ['patch-conflict'],
+      },
+    })
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(concurrent)
+  })
+
+  it('treats a same-byte atomic replacement during validation as a rollback conflict', async () => {
+    const validationError = new CliError('E_SEARCH_FAILED', 'Search failed', 'Retry')
+    const { manager, patchPath } = await fixture({ patch: '[]\n' })
+    let replacementInode: number | undefined
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {
+      const managedBytes = await fs.readFile(patchPath)
+      const replacement = `${patchPath}.editor`
+      await fs.writeFile(replacement, managedBytes)
+      await fs.rename(replacement, patchPath)
+      replacementInode = (await fs.lstat(patchPath)).ino
+      throw validationError
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { rollbackFailures: ['patch-conflict'] },
+    })
+    expect((await fs.lstat(patchPath)).ino).toBe(replacementInode)
+    expect(await fs.readFile(patchPath, 'utf8')).toContain('dsh-searxng managed attachment')
+  })
+
+  it('cleans temporary files and restores the original after a directory fsync failure', async () => {
+    let failDirectorySync = true
+    const fileSystem: ProfileFileSystem = {
+      ...fs,
+      open: async (...args: Parameters<typeof fs.open>) => {
+        const handle = await fs.open(...args)
+        if (args[1] === 'r' && failDirectorySync) {
+          failDirectorySync = false
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === 'sync') return async () => { throw new Error('directory fsync failed') }
+              const value = Reflect.get(target, property, target) as unknown
+              return typeof value === 'function' ? value.bind(target) : value
+            },
+          })
+        }
+        return handle
+      },
+    }
+    const original = Buffer.from('# exact\n[]\n')
+    const { manager, dir, patchPath } = await fixture({ patch: original.toString(), fileSystem })
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {})).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { primaryFailure: 'write', primaryError: 'filesystem', rollbackFailures: [] },
+    })
+    await expect(fs.readFile(patchPath)).resolves.toEqual(original)
+    expect((await fs.readdir(dir)).filter((name) => name.includes('.tmp-'))).toEqual([])
   })
 
   it('writes user-only files and leaves no temporary artifacts', async () => {
@@ -477,5 +691,36 @@ describe('YAML document shape', () => {
     expect(output).toContain('*shared')
     expect(output).toContain("style: 'quoted'")
     expect(parseDocument(output).errors).toEqual([])
+  })
+
+  it('rejects an aliased target config safely before mutation', async () => {
+    const patch = `- id: source
+  config: &shared
+    timeoutMs: 1000
+- id: web-search-searxng
+  config: *shared
+`
+    const original = Buffer.from(patch)
+    const { manager, runner, patchPath } = await fixture({ patch })
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {}))
+      .rejects.toMatchObject({ code: 'E_PROFILE_WRITE', details: {} })
+    expect(runner.calls).toEqual([])
+    await expect(fs.readFile(patchPath)).resolves.toEqual(original)
+  })
+
+  it('rejects removing a managed anchor referenced by a later retained alias', async () => {
+    const patch = `# dsh-searxng managed attachment
+- id: web-search-searxng
+  config: &managed
+    baseURL: http://old.invalid
+- id: later
+  config: *managed
+`
+    const original = Buffer.from(patch)
+    const { manager, runner, patchPath } = await fixture({ patch })
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {}))
+      .rejects.toMatchObject({ code: 'E_PROFILE_WRITE', details: {} })
+    expect(runner.calls).toEqual([])
+    await expect(fs.readFile(patchPath)).resolves.toEqual(original)
   })
 })
