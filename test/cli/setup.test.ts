@@ -351,6 +351,19 @@ describe('setup', () => {
     expect(test.deps.state.write).not.toHaveBeenCalled()
   })
 
+  it('rejects a managed idempotent result after manifest dependency removal during provider validation', async () => {
+    const initial = managedState()
+    initial.profiles.web = { mode: 'managed', endpoint: ENDPOINT }
+    const concurrent = new CliError(
+      'E_PROFILE_CONCURRENT_MODIFICATION',
+      'manifest changed',
+      'retry setup',
+    )
+    const test = harness({ state: initial, ownership: 'owned', profileAttached: true, validatePostcheckError: concurrent })
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toBe(concurrent)
+    expect(test.deps.state.write).not.toHaveBeenCalled()
+  })
+
   it('uses the effective profile auth and search config for raw and provider validation', async () => {
     const initial = managedState()
     initial.profiles.web = { mode: 'managed', endpoint: ENDPOINT }
@@ -466,7 +479,20 @@ describe('setup', () => {
     expect(test.deps.state.write).not.toHaveBeenCalled()
   })
 
-  it('restores managed state when a state-only repair races with an attachment replacement', async () => {
+  it('rejects an external idempotent result after a same-byte manifest inode replacement during provider validation', async () => {
+    const endpoint = 'https://search.example/path'
+    const initial: StateV1 = { schemaVersion: 1, profiles: { work: { mode: 'external', endpoint } } }
+    const concurrent = new CliError(
+      'E_PROFILE_CONCURRENT_MODIFICATION',
+      'manifest replaced',
+      'retry setup',
+    )
+    const test = harness({ state: initial, profileAttached: true, validatePostcheckError: concurrent })
+    await expect(setup({ profile: 'work', port: 8080, url: endpoint }, test.deps)).rejects.toBe(concurrent)
+    expect(test.deps.state.write).not.toHaveBeenCalled()
+  })
+
+  it('restores managed state when a state-only repair races with manifest dependency removal', async () => {
     const previous = managedState()
     const concurrent = new CliError(
       'E_PROFILE_CONCURRENT_MODIFICATION',
@@ -483,6 +509,34 @@ describe('setup', () => {
     expect(test.profiles.attach).not.toHaveBeenCalled()
     expect(test.writes).toHaveLength(2)
     expect(test.state()).toEqual(previous)
+  })
+
+  it('preserves manifest concurrency context when state-only repair rollback also fails', async () => {
+    const credential = 'Bearer manifest-race-private-token'
+    const previous = managedState()
+    const concurrent = new CliError(
+      'E_PROFILE_CONCURRENT_MODIFICATION',
+      'manifest changed',
+      'retry setup',
+    )
+    const test = harness({
+      state: previous,
+      ownership: 'owned',
+      profileAttached: true,
+      validatePostcheckError: concurrent,
+      writeBehaviors: ['success', 'fail-before'],
+      profileConfig: { authHeader: credential },
+    })
+    const error = await setup({ profile: 'web', port: 8080 }, test.deps).catch((cause: unknown) => cause)
+    expect(error).toMatchObject({
+      code: 'E_INTERNAL',
+      details: {
+        primaryError: 'E_PROFILE_CONCURRENT_MODIFICATION',
+        rollbackFailures: ['state'],
+      },
+    })
+    expect(test.docker.down).not.toHaveBeenCalled()
+    expect(JSON.stringify((error as CliError).toJSON())).not.toContain(credential)
   })
 
   it.each(['fail-before', 'fail-after'] as const)(

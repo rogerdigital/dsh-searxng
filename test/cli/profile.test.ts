@@ -193,6 +193,41 @@ describe('ProfileManager contract and discovery', () => {
     expect((await fs.lstat(patchPath)).ino).not.toBe(before.ino)
   })
 
+  it('rejects manifest dependency removal during read-only attachment validation', async () => {
+    const patch = `# dsh-searxng managed attachment
+- id: web-search-searxng
+  config:
+    baseURL: http://localhost:8080
+`
+    const { manager, dir, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.1' } },
+      patch,
+    })
+    const manifestPath = join(dir, 'package.json')
+    await expect(manager.validate('web', 'http://localhost:8080', async () => {
+      await fs.writeFile(manifestPath, `${JSON.stringify({ dependencies: {} }, null, 2)}\n`)
+    })).rejects.toMatchObject({ code: 'E_PROFILE_CONCURRENT_MODIFICATION' })
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(patch)
+  })
+
+  it('rejects a same-byte manifest inode replacement during read-only attachment validation', async () => {
+    const packageJson = `${JSON.stringify({ dependencies: { 'dsh-searxng': '0.1.1' } }, null, 2)}\n`
+    const patch = `# dsh-searxng managed attachment
+- id: web-search-searxng
+  config:
+    baseURL: http://localhost:8080
+`
+    const { manager, dir } = await fixture({ packageJson, patch })
+    const manifestPath = join(dir, 'package.json')
+    const before = await fs.lstat(manifestPath)
+    await expect(manager.validate('web', 'http://localhost:8080', async () => {
+      const replacement = `${manifestPath}.replacement`
+      await fs.writeFile(replacement, packageJson)
+      await fs.rename(replacement, manifestPath)
+    })).rejects.toMatchObject({ code: 'E_PROFILE_CONCURRENT_MODIFICATION' })
+    expect((await fs.lstat(manifestPath)).ino).not.toBe(before.ino)
+  })
+
   it('resolves an empty profile to the official web profile layout', async () => {
     const { dshHome, manager } = await fixture()
     await expect(manager.inspect('')).resolves.toEqual({

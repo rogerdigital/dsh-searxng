@@ -451,15 +451,21 @@ export class NodeProfileManager implements ProfileManager {
     const name = resolvedProfileName(profile)
     const normalizedEndpoint = normalizeEndpoint(endpoint)
     const dir = this.resolveProfileDirectory(name)
-    const installed = await this.readInstalled(join(dir, 'package.json'))
+    const manifestPath = join(dir, 'package.json')
+    let manifestSnapshot: PatchSnapshot
     let snapshot: PatchSnapshot
     try {
+      manifestSnapshot = await this.readManifestSnapshot(manifestPath)
       snapshot = await this.readPatchSnapshot(join(dir, 'cordis.patch.yml'))
     } catch (error) {
       if (error instanceof ProfileConflictError) throw concurrentProfileModification()
       throw error
     }
-    if (!installed || snapshot.bytes === undefined) throw concurrentProfileModification()
+    if (
+      manifestSnapshot.bytes === undefined ||
+      !this.installedFromManifestSnapshot(manifestSnapshot) ||
+      snapshot.bytes === undefined
+    ) throw concurrentProfileModification()
     const parsed = parsePatch(snapshot.bytes)
     if (!isCurrentManagedAttachment(parsed, normalizedEndpoint)) throw concurrentProfileModification()
     const target = lastTarget(parsed)
@@ -477,8 +483,12 @@ export class NodeProfileManager implements ProfileManager {
 
     let unchanged = false
     try {
+      const manifestAfter = await this.readManifestSnapshot(manifestPath)
       const after = await this.readPatchSnapshot(join(dir, 'cordis.patch.yml'))
-      unchanged = sameSnapshot(snapshot, after)
+      unchanged = sameSnapshot(manifestSnapshot, manifestAfter) &&
+        sameSnapshot(snapshot, after) &&
+        manifestAfter.bytes !== undefined &&
+        this.installedFromManifestSnapshot(manifestAfter)
     } catch {
       unchanged = false
     }
@@ -720,6 +730,37 @@ export class NodeProfileManager implements ProfileManager {
     } catch (error) {
       if (ioCode(error) === 'ENOENT') return false
       if (error instanceof CliError) throw error
+      throw profileWriteError('Unable to read the DSH profile manifest')
+    }
+  }
+
+  private installedFromManifestSnapshot(snapshot: PatchSnapshot): boolean {
+    if (snapshot.bytes === undefined) return false
+    let value: unknown
+    try { value = JSON.parse(snapshot.bytes.toString()) } catch { throw profileWriteError('The DSH profile manifest is invalid') }
+    return installedFromManifest(value)
+  }
+
+  private async readManifestSnapshot(packagePath: string): Promise<PatchSnapshot> {
+    let before: Awaited<ReturnType<typeof fs.lstat>>
+    try {
+      before = await this.fileSystem.lstat(packagePath)
+    } catch (error) {
+      if (ioCode(error) === 'ENOENT') return { exists: false }
+      if (error instanceof CliError) throw error
+      throw profileWriteError('Unable to read the DSH profile manifest')
+    }
+    if (before.isSymbolicLink() || !before.isFile()) throw profileWriteError('The DSH profile manifest is unsafe')
+    try {
+      const bytes = Buffer.from(await this.fileSystem.readFile(packagePath))
+      const after = await this.fileSystem.lstat(packagePath)
+      if (after.isSymbolicLink() || !after.isFile() || !sameIdentity(fileIdentity(before), fileIdentity(after))) {
+        throw new ProfileConflictError()
+      }
+      return { exists: true, bytes, identity: fileIdentity(after) }
+    } catch (error) {
+      if (error instanceof ProfileConflictError || error instanceof CliError) throw error
+      if (ioCode(error) === 'ENOENT') throw new ProfileConflictError()
       throw profileWriteError('Unable to read the DSH profile manifest')
     }
   }
