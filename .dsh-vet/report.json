@@ -1,0 +1,23 @@
+{
+  "schema": "dsh-vet/v1",
+  "target": {
+    "kind": "local-path",
+    "specifier": "."
+  },
+  "scanner": {
+    "name": "dsh-vet",
+    "version": "0.2.0",
+    "ranAt": "2026-08-30T08:51:05.093Z"
+  },
+  "summary": {
+    "grade": "A",
+    "counts": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0,
+      "info": 0
+    }
+  },
+  "findings": []
+}
