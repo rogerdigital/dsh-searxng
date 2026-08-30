@@ -7,6 +7,7 @@ describe('parseCliArgs', () => {
       command: 'setup',
       profile: 'web',
       port: 8080,
+      portExplicit: false,
       json: false,
     })
   })
@@ -17,6 +18,7 @@ describe('parseCliArgs', () => {
       profile: 'work',
       url: 'https://search.example',
       port: 9090,
+      portExplicit: true,
       json: true,
     })
   })
@@ -29,7 +31,7 @@ describe('parseCliArgs', () => {
   })
 
   it.each([1, 65535])('accepts setup port boundary %s', (port) => {
-    expect(parseCliArgs(['setup', '--port', String(port)])).toMatchObject({ command: 'setup', port })
+    expect(parseCliArgs(['setup', '--port', String(port)])).toMatchObject({ command: 'setup', port, portExplicit: true })
   })
 
   it.each(['status', 'doctor'])('parses %s with defaults', (command) => {

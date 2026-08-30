@@ -8,7 +8,7 @@ import { SEARXNG_IMAGE, type AssetRenderer, type ManagedIdentity } from '../../s
 import type { DockerAdapter } from '../../src/cli/docker.ts'
 import { CliError } from '../../src/cli/errors.ts'
 import type { EnvironmentService } from '../../src/cli/environment.ts'
-import type { ProfileManager } from '../../src/cli/profile.ts'
+import type { ProfileAttachmentConfig, ProfileManager } from '../../src/cli/profile.ts'
 import type { SearxngProbe } from '../../src/cli/searxng.ts'
 import type { StateStore, StateV1 } from '../../src/cli/state.ts'
 import { createSetup, setup, type SetupDependencies } from '../../src/cli/setup.ts'
@@ -30,6 +30,15 @@ interface HarnessOptions {
   preflightError?: unknown
   ownershipError?: unknown
   writeError?: unknown
+  ownershipSequence?: ReadonlyArray<'absent' | 'owned' | Error>
+  readinessErrors?: readonly unknown[]
+  upError?: unknown
+  downError?: unknown
+  dshError?: unknown
+  profileAttached?: boolean
+  profileConfig?: Partial<ProfileAttachmentConfig>
+  postAttachError?: unknown
+  writeBehaviors?: ReadonlyArray<'success' | 'fail-before' | 'fail-after'>
 }
 
 function managedState(overrides: Partial<NonNullable<StateV1['managed']>> = {}): StateV1 {
@@ -59,14 +68,21 @@ function harness(options: HarnessOptions = {}) {
   let readinessFailures = options.readinessFailures ?? 0
   let realSearchFailures = options.realSearchFailures ?? 0
   let profileEndpoint = 'before'
+  const ownershipSequence = [...(options.ownershipSequence ?? [])]
+  const readinessErrors = [...(options.readinessErrors ?? [])]
+  const writeBehaviors = [...(options.writeBehaviors ?? [])]
+  const probeInputs: Array<Record<string, unknown>> = []
 
   const stateStore: StateStore = {
     read: vi.fn(async () => { events.push('state-read'); return structuredClone(state) }),
     write: vi.fn(async (next) => {
       events.push('state-write')
+      const behavior = writeBehaviors.shift()
+      if (behavior === 'fail-before') throw new Error('state write failed with secret=private')
       if (options.writeError !== undefined) throw options.writeError
       state = structuredClone(next)
       writes.push(structuredClone(next))
+      if (behavior === 'fail-after') throw new Error('state write finalization failed with query=private')
     }),
     withLock: vi.fn(async (operation) => {
       events.push('lock')
@@ -82,6 +98,10 @@ function harness(options: HarnessOptions = {}) {
       events.push('managed-preflight')
       if (options.preflightError !== undefined) throw options.preflightError
     }),
+    preflightDsh: vi.fn(async () => {
+      events.push('dsh-preflight')
+      if (options.dshError !== undefined) throw options.dshError
+    }),
   }
   const docker: DockerAdapter = {
     preflight: vi.fn(async () => { events.push('docker-preflight'); return { serverVersion: '27', composeVersion: '2.30' } }),
@@ -89,11 +109,20 @@ function harness(options: HarnessOptions = {}) {
       events.push('ownership')
       identities.push(identity)
       if (options.ownershipError !== undefined) throw options.ownershipError
+      const sequenced = ownershipSequence.shift()
+      if (sequenced instanceof Error) throw sequenced
+      if (sequenced !== undefined) return sequenced
       return options.ownership ?? 'absent'
     }),
-    up: vi.fn(async (identity) => { events.push('docker-up'); identities.push(identity) }),
+    up: vi.fn(async (identity) => {
+      events.push('docker-up'); identities.push(identity)
+      if (options.upError !== undefined) throw options.upError
+    }),
     restart: vi.fn(async (identity) => { events.push('docker-restart'); identities.push(identity) }),
-    down: vi.fn(async () => { events.push('docker-down') }),
+    down: vi.fn(async () => {
+      events.push('docker-down')
+      if (options.downError !== undefined) throw options.downError
+    }),
     logs: vi.fn(async () => ''),
   }
   const assets: AssetRenderer = {
@@ -106,13 +135,16 @@ function harness(options: HarnessOptions = {}) {
   const searxng: SearxngProbe = {
     readiness: vi.fn(async () => {
       events.push('readiness')
+      const error = readinessErrors.shift()
+      if (error !== undefined) throw error
       if (readinessFailures > 0) {
         readinessFailures -= 1
         throw new CliError('E_SEARXNG_START_TIMEOUT', 'not ready', 'repair')
       }
     }),
-    realSearch: vi.fn(async () => {
+    realSearch: vi.fn(async (input) => {
       events.push('real-search')
+      probeInputs.push(input as Record<string, unknown>)
       if (realSearchFailures > 0) {
         realSearchFailures -= 1
         throw new CliError('E_SEARCH_FAILED', 'managed search is unhealthy', 'repair')
@@ -120,19 +152,31 @@ function harness(options: HarnessOptions = {}) {
       if (options.realSearchError !== undefined) throw options.realSearchError
       return { endpoint: ENDPOINT, resultCount: 1, elapsedMs: 1 }
     }),
-    providerSearch: vi.fn(async () => {
+    providerSearch: vi.fn(async (input) => {
       events.push('provider-search')
+      probeInputs.push(input as Record<string, unknown>)
       if (options.providerSearchError !== undefined) throw options.providerSearchError
       return { endpoint: ENDPOINT, resultCount: 1, elapsedMs: 1 }
     }),
   }
   const profiles: ProfileManager = {
     inspect: vi.fn(async () => ({ installed: false, patchPath: '/tmp/patch' })),
+    preview: vi.fn(async (_profile, endpoint) => {
+      events.push('profile-preview')
+      return {
+        installed: options.profileAttached ?? false,
+        attached: options.profileAttached ?? false,
+        config: { baseURL: endpoint, ...options.profileConfig },
+      }
+    }),
     attach: vi.fn(async (_profile, endpoint, validate) => {
       events.push('profile-attach')
       const previous = profileEndpoint
       profileEndpoint = endpoint
-      try { await validate() } catch (error) { profileEndpoint = previous; throw error }
+      try {
+        await validate({ baseURL: endpoint, ...options.profileConfig })
+        if (options.postAttachError !== undefined) throw options.postAttachError
+      } catch (error) { profileEndpoint = previous; throw error }
     }),
     detach: vi.fn(async () => {}),
   }
@@ -145,7 +189,10 @@ function harness(options: HarnessOptions = {}) {
     profiles,
     now: () => new Date('2026-08-30T01:02:03.004Z'),
   }
-  return { deps, events, writes, renders, identities, docker, assets, environment, profiles, state: () => state, profileEndpoint: () => profileEndpoint }
+  return {
+    deps, events, writes, renders, identities, docker, assets, environment, profiles, probeInputs,
+    state: () => state, profileEndpoint: () => profileEndpoint,
+  }
 }
 
 describe('setup', () => {
@@ -155,7 +202,7 @@ describe('setup', () => {
 
     expect(result).toEqual({ profile: 'web', endpoint: ENDPOINT, reused: false })
     expect(test.events).toEqual([
-      'lock', 'environment', 'state-read', 'docker-preflight', 'ownership', 'managed-preflight',
+      'lock', 'environment', 'state-read', 'dsh-preflight', 'docker-preflight', 'ownership', 'profile-preview', 'managed-preflight',
       'render', 'docker-up', 'readiness', 'real-search', 'profile-attach',
       'provider-search', 'state-write', 'unlock',
     ])
@@ -195,7 +242,7 @@ describe('setup', () => {
     const test = harness({ state: managedState(), ownership: 'owned' })
     await expect(setup({ profile: 'work', port: 8080 }, test.deps)).resolves.toEqual({ profile: 'work', endpoint: ENDPOINT, reused: true })
     expect(test.events).toEqual([
-      'lock', 'environment', 'state-read', 'docker-preflight', 'ownership', 'readiness',
+      'lock', 'environment', 'state-read', 'dsh-preflight', 'docker-preflight', 'ownership', 'profile-preview', 'readiness',
       'real-search', 'profile-attach', 'provider-search', 'state-write', 'unlock',
     ])
     expect(test.state().profiles).toEqual({
@@ -210,13 +257,14 @@ describe('setup', () => {
     const randomSecret = vi.fn(() => 'b'.repeat(64))
     await expect(createSetup({ randomSecret })({ profile: 'web', port: 8080 }, test.deps)).resolves.toMatchObject({ reused: false })
     expect(test.events).toEqual([
-      'lock', 'environment', 'state-read', 'docker-preflight', 'ownership', 'readiness', 'docker-restart',
+      'lock', 'environment', 'state-read', 'dsh-preflight', 'docker-preflight', 'ownership', 'profile-preview', 'readiness', 'docker-restart',
       'readiness', 'real-search', 'profile-attach', 'provider-search',
       'state-write', 'unlock',
     ])
     expect(test.environment.preflightManaged).not.toHaveBeenCalled()
     expect(test.assets.render).not.toHaveBeenCalled()
     expect(test.docker.up).not.toHaveBeenCalled()
+    expect(test.docker.down).not.toHaveBeenCalled()
     expect(randomSecret).not.toHaveBeenCalled()
     expect(test.state().managed).toMatchObject({
       deploymentVersion: 1,
@@ -230,16 +278,66 @@ describe('setup', () => {
     })
   })
 
-  it('repairs an owned matching deployment when readiness passes but its real search is unhealthy', async () => {
+  it('does not restart when readiness passes but real search has an unclassified deterministic failure', async () => {
     const test = harness({ state: managedState(), ownership: 'owned', realSearchFailures: 1 })
-    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).resolves.toMatchObject({ reused: false })
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
+    expect(test.docker.restart).not.toHaveBeenCalled()
+    expect(test.profiles.attach).not.toHaveBeenCalled()
+  })
+
+  it.each(['E_JSON_DISABLED', 'E_AUTH_FAILED', 'E_RATE_LIMITED', 'E_SEARCH_FAILED'] as const)(
+    'does not restart for deterministic readiness failure %s',
+    async (code) => {
+      const failure = new CliError(code, 'deterministic failure', 'fix configuration')
+      const test = harness({ state: managedState(), ownership: 'owned', readinessErrors: [failure] })
+      await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toBe(failure)
+      expect(test.docker.restart).not.toHaveBeenCalled()
+      expect(test.assets.render).not.toHaveBeenCalled()
+    },
+  )
+
+  it('is byte-level idempotent when managed state and the effective attachment are already correct', async () => {
+    const initial = managedState()
+    initial.profiles.web = { mode: 'managed', endpoint: ENDPOINT }
+    const test = harness({ state: initial, ownership: 'owned', profileAttached: true })
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).resolves.toEqual({ profile: 'web', endpoint: ENDPOINT, reused: true })
+    expect(test.profiles.attach).not.toHaveBeenCalled()
+    expect(test.deps.state.write).not.toHaveBeenCalled()
+    expect(test.writes).toEqual([])
+    expect(test.state()).toEqual(initial)
     expect(test.events).toEqual([
-      'lock', 'environment', 'state-read', 'docker-preflight', 'ownership', 'readiness', 'real-search',
-      'docker-restart', 'readiness', 'real-search', 'profile-attach', 'provider-search',
-      'state-write', 'unlock',
+      'lock', 'environment', 'state-read', 'dsh-preflight', 'docker-preflight', 'ownership',
+      'profile-preview', 'readiness', 'real-search', 'provider-search', 'unlock',
     ])
-    expect(test.environment.preflightManaged).not.toHaveBeenCalled()
-    expect(test.assets.render).not.toHaveBeenCalled()
+  })
+
+  it('uses the effective profile auth and search config for raw and provider validation', async () => {
+    const initial = managedState()
+    initial.profiles.web = { mode: 'managed', endpoint: ENDPOINT }
+    const config = { language: 'zh-CN', engines: 'bing', categories: 'general', authHeader: 'Bearer private-token' }
+    const test = harness({ state: initial, ownership: 'owned', profileAttached: true, profileConfig: config })
+    await setup({ profile: 'web', port: 8080 }, test.deps)
+    expect(test.probeInputs).toEqual([
+      { baseURL: ENDPOINT, ...config },
+      { baseURL: ENDPOINT, ...config },
+    ])
+    expect(JSON.stringify(test.events)).not.toContain('private-token')
+  })
+
+  it('inherits the persisted managed port only when CLI port was not explicit', async () => {
+    const endpoint = 'http://127.0.0.1:9090'
+    const initial = managedState({ port: 9090, endpoint })
+    initial.profiles.web = { mode: 'managed', endpoint }
+    const inherited = harness({ state: initial, ownership: 'owned', profileAttached: true })
+    await expect(setup({ profile: 'web', port: 8080, portExplicit: false }, inherited.deps))
+      .resolves.toEqual({ profile: 'web', endpoint, reused: true })
+    expect(inherited.profiles.preview).toHaveBeenCalledWith('web', endpoint, undefined)
+
+    const explicit = harness({ state: initial, ownership: 'owned' })
+    await expect(setup({ profile: 'web', port: 8080, portExplicit: true }, explicit.deps)).rejects.toMatchObject({
+      code: 'E_STATE_INVALID', action: expect.stringMatching(/repair|migrat/i),
+    })
+    expect(explicit.docker.preflight).not.toHaveBeenCalled()
   })
 
   it('stops instead of rotating configuration when owned resources lack matching state', async () => {
@@ -247,7 +345,7 @@ describe('setup', () => {
     await expect(setup({ profile: 'web', port: 8080 }, missing.deps)).rejects.toMatchObject({
       code: 'E_STATE_INVALID', action: expect.stringMatching(/doctor|repair/i),
     })
-    expect(missing.events).toEqual(['lock', 'environment', 'state-read', 'docker-preflight', 'ownership', 'unlock'])
+    expect(missing.events).toEqual(['lock', 'environment', 'state-read', 'dsh-preflight', 'docker-preflight', 'ownership', 'unlock'])
 
     const mismatched = harness({ state: managedState({ image: 'other-image' }), ownership: 'owned' })
     await expect(setup({ profile: 'web', port: 8080 }, mismatched.deps)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
@@ -271,6 +369,7 @@ describe('setup', () => {
     await expect(setup({ profile: 'web', port: 8080 }, restartFailure.deps)).rejects.toMatchObject({ action: expect.stringMatching(/doctor|repair/i) })
     expect(restartFailure.events).not.toContain('profile-attach')
     expect(restartFailure.events).not.toContain('state-write')
+    expect(restartFailure.docker.down).not.toHaveBeenCalled()
 
     const stillUnhealthy = harness({ state: managedState(), ownership: 'owned', readinessFailures: 2 })
     await expect(setup({ profile: 'web', port: 8080 }, stillUnhealthy.deps)).rejects.toMatchObject({
@@ -278,6 +377,7 @@ describe('setup', () => {
     })
     expect(stillUnhealthy.events).not.toContain('profile-attach')
     expect(stillUnhealthy.events).not.toContain('state-write')
+    expect(stillUnhealthy.docker.down).not.toHaveBeenCalled()
   })
 
   it('validates and normalizes an external endpoint with zero Docker, managed-preflight, or asset calls', async () => {
@@ -285,13 +385,22 @@ describe('setup', () => {
     const test = harness({ state: initial })
     await expect(setup({ profile: 'work', port: 9999, url: 'https://search.example/path///' }, test.deps))
       .resolves.toEqual({ profile: 'work', endpoint: 'https://search.example/path', reused: false })
-    expect(test.events).toEqual(['lock', 'environment', 'state-read', 'real-search', 'profile-attach', 'provider-search', 'state-write', 'unlock'])
+    expect(test.events).toEqual(['lock', 'environment', 'state-read', 'dsh-preflight', 'profile-preview', 'real-search', 'profile-attach', 'provider-search', 'state-write', 'unlock'])
     expect(test.docker.preflight).not.toHaveBeenCalled()
     expect(test.docker.inspectOwnership).not.toHaveBeenCalled()
     expect(test.assets.render).not.toHaveBeenCalled()
     expect(test.environment.preflightManaged).not.toHaveBeenCalled()
     expect(test.state().managed).toEqual(initial.managed)
     expect(test.state().profiles.work).toEqual({ mode: 'external', endpoint: 'https://search.example/path' })
+  })
+
+  it('requires dsh before every external profile operation', async () => {
+    const missing = new CliError('E_DSH_MISSING', 'missing', 'install dsh')
+    const test = harness({ dshError: missing })
+    await expect(setup({ profile: 'web', port: 8080, url: 'https://search.example' }, test.deps)).rejects.toBe(missing)
+    expect(test.profiles.preview).not.toHaveBeenCalled()
+    expect(test.deps.searxng.realSearch).not.toHaveBeenCalled()
+    expect(test.profiles.attach).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -308,7 +417,7 @@ describe('setup', () => {
   it('refuses an occupied new port before render or Docker mutation', async () => {
     const test = harness({ preflightError: new CliError('E_PORT_CONFLICT', 'occupied', 'choose another') })
     await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toMatchObject({ code: 'E_PORT_CONFLICT' })
-    expect(test.events).toEqual(['lock', 'environment', 'state-read', 'docker-preflight', 'ownership', 'managed-preflight', 'unlock'])
+    expect(test.events).toEqual(['lock', 'environment', 'state-read', 'dsh-preflight', 'docker-preflight', 'ownership', 'profile-preview', 'managed-preflight', 'unlock'])
     expect(test.assets.render).not.toHaveBeenCalled()
     expect(test.docker.up).not.toHaveBeenCalled()
   })
@@ -316,7 +425,7 @@ describe('setup', () => {
   it('refuses foreign resources before rendering or mutation', async () => {
     const test = harness({ ownershipError: new CliError('E_RESOURCE_FOREIGN', 'foreign', 'rename it') })
     await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toMatchObject({ code: 'E_RESOURCE_FOREIGN' })
-    expect(test.events).toEqual(['lock', 'environment', 'state-read', 'docker-preflight', 'ownership', 'unlock'])
+    expect(test.events).toEqual(['lock', 'environment', 'state-read', 'dsh-preflight', 'docker-preflight', 'ownership', 'unlock'])
     expect(test.assets.render).not.toHaveBeenCalled()
     expect(test.docker.up).not.toHaveBeenCalled()
   })
@@ -334,6 +443,79 @@ describe('setup', () => {
     expect(test.profileEndpoint()).toBe('before')
     expect(test.events).not.toContain('state-write')
     expect(test.events.at(-1)).toBe('unlock')
+  })
+
+  it.each([
+    ['partial up', { upError: new CliError('E_INTERNAL', 'partial up', 'retry'), ownershipSequence: ['absent', 'owned'] }],
+    ['readiness', { readinessErrors: [new CliError('E_SEARXNG_START_TIMEOUT', 'timeout', 'retry')], ownershipSequence: ['absent', 'owned'] }],
+    ['real search', { realSearchError: new CliError('E_SEARCH_FAILED', 'search failed', 'retry'), ownershipSequence: ['absent', 'owned'] }],
+    ['provider search', { providerSearchError: new CliError('E_SEARCH_FAILED', 'provider failed', 'retry'), ownershipSequence: ['absent', 'owned'] }],
+    ['state write', { writeBehaviors: ['fail-before'], ownershipSequence: ['absent', 'owned'] }],
+  ] as const)('rolls back transaction-created Docker resources after %s failure', async (_stage, options) => {
+    const test = harness(options as HarnessOptions)
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toBeDefined()
+    expect(test.events.slice(-3)).toEqual(['ownership', 'docker-down', 'unlock'])
+    expect(test.docker.down).toHaveBeenCalledWith(expect.objectContaining({ composePath: COMPOSE_PATH }), true)
+    expect(test.state()).toEqual({ schemaVersion: 1, profiles: {} })
+  })
+
+  it('rolls back transaction-created resources on cancellation after Docker mutation', async () => {
+    const controller = new AbortController()
+    const cancellation = new Error('cancelled after up')
+    const test = harness({ ownershipSequence: ['absent', 'owned'] })
+    vi.mocked(test.deps.searxng.readiness).mockImplementationOnce(async () => {
+      test.events.push('readiness')
+      controller.abort(cancellation)
+      throw cancellation
+    })
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps, controller.signal)).rejects.toBe(cancellation)
+    expect(test.events.slice(-3)).toEqual(['ownership', 'docker-down', 'unlock'])
+  })
+
+  it('restores previous state after attach postcheck fails following a committed state write', async () => {
+    const previous: StateV1 = { schemaVersion: 1, profiles: { old: { mode: 'external', endpoint: 'https://old.example' } } }
+    const postcheck = new CliError('E_PROFILE_WRITE', 'profile changed after validation', 'repair profile')
+    const test = harness({ state: previous, postAttachError: postcheck, ownershipSequence: ['absent', 'owned'] })
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toBe(postcheck)
+    expect(test.profileEndpoint()).toBe('before')
+    expect(test.writes).toHaveLength(2)
+    expect(test.writes.at(-1)).toEqual(previous)
+    expect(test.state()).toEqual(previous)
+    expect(test.events.slice(-4)).toEqual(['state-write', 'ownership', 'docker-down', 'unlock'])
+  })
+
+  it('continues all rollback steps and reports only safe categories when rollback also fails', async () => {
+    const credential = 'Bearer private-token'
+    const test = harness({
+      postAttachError: new Error(`postcheck ${credential}`),
+      ownershipSequence: ['absent', 'owned'],
+      writeBehaviors: ['success', 'fail-before'],
+      downError: new Error(`docker rollback ${credential}`),
+      profileConfig: { authHeader: credential },
+    })
+    const error = await setup({ profile: 'web', port: 8080 }, test.deps).catch((cause: unknown) => cause)
+    expect(error).toMatchObject({
+      code: 'E_INTERNAL',
+      details: { rollbackFailures: expect.arrayContaining(['state', 'docker']) },
+    })
+    expect(test.events).toContain('docker-down')
+    expect(JSON.stringify((error as CliError).toJSON())).not.toContain(credential)
+  })
+
+  it('stops cleanup safely when its ownership guard fails and never attempts Docker deletion', async () => {
+    const credential = 'Bearer cleanup-private-token'
+    const test = harness({
+      readinessErrors: [new CliError('E_SEARXNG_START_TIMEOUT', 'timeout', 'retry')],
+      ownershipSequence: ['absent', new Error(`ownership inspection ${credential}`)],
+      profileConfig: { authHeader: credential },
+    })
+    const error = await setup({ profile: 'web', port: 8080 }, test.deps).catch((cause: unknown) => cause)
+    expect(error).toMatchObject({
+      code: 'E_INTERNAL',
+      details: { rollbackFailures: ['docker-ownership'] },
+    })
+    expect(test.docker.down).not.toHaveBeenCalled()
+    expect(JSON.stringify((error as CliError).toJSON())).not.toContain(credential)
   })
 
   it('propagates cancellation while always unlocking and never writing healthy state', async () => {
@@ -370,6 +552,24 @@ describe('production CLI entry', () => {
     expect(stdout).toHaveLength(1)
     expect(JSON.parse(stdout[0]!)).toEqual({ endpoint: ENDPOINT, profile: 'web', reused: false })
     expect(stderr).toEqual([])
+  })
+
+  it('preserves an existing managed port when setup omits --port', async () => {
+    const endpoint = 'http://127.0.0.1:9090'
+    const initial = managedState({ port: 9090, endpoint })
+    initial.profiles.web = { mode: 'managed', endpoint }
+    const test = harness({ state: initial, ownership: 'owned', profileAttached: true })
+    const stdout: string[] = []
+    const exitCode = await runCli(['setup', '--json'], {
+      dependencies: test.deps,
+      stdout: (text) => stdout.push(text),
+      stderr: vi.fn(),
+    })
+    expect(exitCode).toBe(0)
+    expect(JSON.parse(stdout[0]!)).toEqual({ endpoint, profile: 'web', reused: true })
+    expect(test.profiles.preview).toHaveBeenCalledWith('web', endpoint, undefined)
+    expect(test.environment.preflightManaged).not.toHaveBeenCalled()
+    expect(test.assets.render).not.toHaveBeenCalled()
   })
 
   it('prints an actionable one-write human ready result without exposing secrets', async () => {

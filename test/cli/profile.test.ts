@@ -77,10 +77,63 @@ describe('ProfileManager contract and discovery', () => {
   it('is structural so a plain fake satisfies the public interface', async () => {
     const fake: ProfileManager = {
       inspect: async () => ({ installed: false, patchPath: '/profile/cordis.patch.yml' }),
+      preview: async (_profile, endpoint) => ({ installed: false, attached: false, config: { baseURL: endpoint } }),
       attach: async () => {},
       detach: async () => {},
     }
     await expect(fake.inspect('web')).resolves.toMatchObject({ installed: false })
+  })
+
+  it('previews the exact effective provider config without mutating the profile', async () => {
+    const patch = `- id: web-search-searxng
+  config:
+    baseURL: http://old.invalid
+    language: zh-CN
+    engines: bing,google
+    categories: general
+    authHeader: Bearer private-token
+    unrelated: keep
+`
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.1' } },
+      patch,
+    })
+
+    await expect(manager.preview('web', 'https://search.example/root/')).resolves.toEqual({
+      installed: true,
+      attached: false,
+      config: {
+        baseURL: 'https://search.example/root',
+        language: 'zh-CN',
+        engines: 'bing,google',
+        categories: 'general',
+        authHeader: 'Bearer private-token',
+      },
+    })
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(patch)
+  })
+
+  it('recognizes only the final effective correctly managed attachment', async () => {
+    const correct = `# dsh-searxng managed attachment
+- id: web-search-searxng
+  config:
+    baseURL: http://localhost:8080
+    language: en
+`
+    const attached = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.1' } },
+      patch: correct,
+    })
+    await expect(attached.manager.preview('web', 'http://localhost:8080')).resolves.toMatchObject({
+      attached: true,
+      config: { baseURL: 'http://localhost:8080', language: 'en' },
+    })
+
+    const overridden = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.1' } },
+      patch: `${correct}- id: web-search-searxng\n  config:\n    baseURL: http://user.invalid\n`,
+    })
+    await expect(overridden.manager.preview('web', 'http://localhost:8080')).resolves.toMatchObject({ attached: false })
   })
 
   it('resolves an empty profile to the official web profile layout', async () => {
@@ -120,6 +173,33 @@ describe('ProfileManager contract and discovery', () => {
 })
 
 describe('transactional attachment', () => {
+  it('passes a safe clone of the exact written effective config to validation', async () => {
+    const patch = `- id: web-search-searxng
+  config:
+    language: zh-CN
+    engines: bing
+    categories: general
+    authHeader: Bearer private-token
+`
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.1' } },
+      patch,
+    })
+    let received: object | undefined
+    await manager.attach('web', 'https://search.example/', async (config) => {
+      received = config
+      ;(config as { baseURL: string }).baseURL = 'http://mutated.invalid'
+    })
+    expect(received).toEqual({
+      baseURL: 'http://mutated.invalid',
+      language: 'zh-CN',
+      engines: 'bing',
+      categories: 'general',
+      authHeader: 'Bearer private-token',
+    })
+    const rows = parse(await fs.readFile(patchPath, 'utf8')) as Array<{ config?: Record<string, unknown> }>
+    expect(rows.at(-1)?.config?.baseURL).toBe('https://search.example')
+  })
   it('installs with exact argv, writes an empty patch, then validates', async () => {
     const events: string[] = []
     const runner = new RecordingRunner()

@@ -22,8 +22,28 @@ const MANAGED_MARKER = 'dsh-searxng managed attachment'
 
 export interface ProfileManager {
   inspect(profile: string, signal?: AbortSignal): Promise<{ installed: boolean; patchPath: string }>
-  attach(profile: string, endpoint: string, validate: () => Promise<void>, signal?: AbortSignal): Promise<void>
+  preview(profile: string, endpoint: string, signal?: AbortSignal): Promise<ProfileAttachmentPreview>
+  attach(
+    profile: string,
+    endpoint: string,
+    validate: (config: ProfileAttachmentConfig) => Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<void>
   detach(profile: string, signal?: AbortSignal): Promise<void>
+}
+
+export interface ProfileAttachmentConfig {
+  baseURL: string
+  language?: string
+  engines?: string
+  categories?: string
+  authHeader?: string
+}
+
+export interface ProfileAttachmentPreview {
+  installed: boolean
+  attached: boolean
+  config: ProfileAttachmentConfig
 }
 
 export interface ProfileFileSystem {
@@ -273,6 +293,46 @@ function configOf(
   return config.clone() as YAMLMap<unknown, unknown>
 }
 
+function providerConfig(config: YAMLMap<unknown, unknown>, endpoint?: string): ProfileAttachmentConfig {
+  let value: unknown
+  try { value = config.toJSON() } catch { throw profileWriteError('The target DSH profile config is invalid') }
+  if (!isPlainRecord(value)) throw profileWriteError('The target DSH profile config is invalid')
+  const configuredBaseURL = endpoint ?? value.baseURL
+  if (typeof configuredBaseURL !== 'string') throw profileWriteError('The target DSH profile config has no valid SearXNG endpoint')
+  const result: ProfileAttachmentConfig = { baseURL: normalizeEndpoint(configuredBaseURL) }
+  for (const key of ['language', 'engines', 'categories', 'authHeader'] as const) {
+    const field = value[key]
+    if (field === undefined) continue
+    if (typeof field !== 'string') throw profileWriteError(`The target DSH profile ${key} config is invalid`)
+    result[key] = field
+  }
+  return result
+}
+
+function cloneProviderConfig(config: ProfileAttachmentConfig): ProfileAttachmentConfig {
+  return { ...config }
+}
+
+function lastTarget(parsed: ParsedPatch): YAMLMap<unknown, unknown> | undefined {
+  let target: YAMLMap<unknown, unknown> | undefined
+  for (const item of parsed.sequence.items) if (isTargetPatch(item)) target = item
+  return target
+}
+
+function configFromAttachment(bytes: Buffer): ProfileAttachmentConfig {
+  const parsed = parsePatch(bytes)
+  const target = lastTarget(parsed)
+  if (target === undefined) throw profileWriteError('The managed DSH profile attachment is missing')
+  return providerConfig(configOf(parsed.document, target))
+}
+
+function isCurrentManagedAttachment(parsed: ParsedPatch, endpoint: string): boolean {
+  const managed = parsed.sequence.items.filter(isManagedPatch)
+  const target = lastTarget(parsed)
+  if (managed.length !== 1 || target === undefined || !isManagedPatch(target)) return false
+  return providerConfig(configOf(parsed.document, target)).baseURL === endpoint
+}
+
 function serializePatch(document: Document<Node, true>): Buffer {
   try {
     const source = document.toString()
@@ -352,10 +412,25 @@ export class NodeProfileManager implements ProfileManager {
     return { installed, patchPath }
   }
 
+  async preview(profile: string, endpoint: string, signal?: AbortSignal): Promise<ProfileAttachmentPreview> {
+    signal?.throwIfAborted()
+    const name = resolvedProfileName(profile)
+    const normalizedEndpoint = normalizeEndpoint(endpoint)
+    const dir = this.resolveProfileDirectory(name)
+    const installed = await this.readInstalled(join(dir, 'package.json'))
+    const snapshot = await this.readPatchSnapshot(join(dir, 'cordis.patch.yml'))
+    const source = snapshot.bytes ?? Buffer.from('[]\n')
+    const current = parsePatch(source)
+    const attached = installed && isCurrentManagedAttachment(current, normalizedEndpoint)
+    const output = renderAttachment(parsePatch(source), normalizedEndpoint)
+    signal?.throwIfAborted()
+    return { installed, attached, config: cloneProviderConfig(configFromAttachment(output)) }
+  }
+
   async attach(
     profile: string,
     endpoint: string,
-    validate: () => Promise<void>,
+    validate: (config: ProfileAttachmentConfig) => Promise<void>,
     signal?: AbortSignal,
   ): Promise<void> {
     signal?.throwIfAborted()
@@ -421,7 +496,7 @@ export class NodeProfileManager implements ProfileManager {
       }
 
       failureStage = 'validation'
-      await validate()
+      await validate(cloneProviderConfig(configFromAttachment(output)))
       const afterValidation = await this.readPatchSnapshot(patchPath)
       if (rollbackExpected === undefined || !sameSnapshot(afterValidation, rollbackExpected)) {
         throw new ProfileConflictError()

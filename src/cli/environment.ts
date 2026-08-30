@@ -32,6 +32,7 @@ export function homeId(dshHome: string): string {
 export interface ResolvedEnvironment { dshHome: string; profileDir: string; managedDir: string; homeId: string }
 export interface EnvironmentService {
   resolve(profile: string): Promise<ResolvedEnvironment>
+  preflightDsh(signal?: AbortSignal): Promise<void>
   preflightManaged(port: number, signal?: AbortSignal): Promise<void>
 }
 export interface PortChecker { (port: number, signal?: AbortSignal): Promise<boolean> }
@@ -75,6 +76,9 @@ export class NodeEnvironmentService implements EnvironmentService {
       throw new CliError('E_PORT_CONFLICT', 'Unable to verify port availability', 'Choose another port or stop the process using it')
     }
     if (!available) throw new CliError('E_PORT_CONFLICT', `Port ${port} is already in use`, 'Choose another port')
+  }
+  async preflightDsh(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
     try {
       const result = await this.commandRunner.run(this.dshCommand, ['--version'], { signal })
       signal?.throwIfAborted()

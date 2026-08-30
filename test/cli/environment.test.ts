@@ -43,7 +43,7 @@ describe('environment helpers', () => {
     expect(homeId(normalized)).not.toContain(normalized)
   })
 
-  it('resolves a profile and preflights dsh and port through injected dependencies', async () => {
+  it('resolves a profile and preflights port separately from dsh', async () => {
     const service = new NodeEnvironmentService({
       env: { DSH_HOME: '/tmp/dsh' }, homedir: '/Users/test',
       portChecker: async (port) => port !== 8080,
@@ -51,12 +51,13 @@ describe('environment helpers', () => {
     })
     await expect(service.resolve('web')).resolves.toMatchObject({ dshHome: '/tmp/dsh', profileDir: '/tmp/dsh/profiles/web', managedDir: '/tmp/dsh/dsh-searxng' })
     await expect(service.preflightManaged(8080)).rejects.toMatchObject({ code: 'E_PORT_CONFLICT' })
+    await expect(service.preflightDsh()).resolves.toBeUndefined()
   })
 
-  it('preflight invokes dsh --version exactly without shell options', async () => {
+  it('dsh preflight invokes dsh --version exactly without shell options', async () => {
     const run = vi.fn(async (...args: Parameters<NonNullable<ConstructorParameters<typeof NodeEnvironmentService>[0]['commandRunner']['run']>>) => ({ exitCode: 0, stdout: '', stderr: '' }))
     const service = new NodeEnvironmentService({ portChecker: async () => true, commandRunner: { run } })
-    await service.preflightManaged(8080)
+    await service.preflightDsh()
     expect(run).toHaveBeenCalledWith('dsh', ['--version'], { signal: undefined })
   })
 
@@ -67,7 +68,7 @@ describe('environment helpers', () => {
   })
 
   it.each([{ exitCode: 127 }, { exitCode: 1 }])('reports missing or nonzero dsh with stable error', async (result) => {
-    await expect(new NodeEnvironmentService({ portChecker: async () => true, commandRunner: { run: async () => ({ ...result, stdout: '', stderr: '' }) } }).preflightManaged(8080)).rejects.toMatchObject({ code: 'E_DSH_MISSING', action: 'Install dsh and ensure it is on PATH' })
+    await expect(new NodeEnvironmentService({ portChecker: async () => true, commandRunner: { run: async () => ({ ...result, stdout: '', stderr: '' }) } }).preflightDsh()).rejects.toMatchObject({ code: 'E_DSH_MISSING', action: 'Install dsh and ensure it is on PATH' })
   })
 
   it('maps a thrown ENOENT from dsh --version to the stable missing-dsh error', async () => {
@@ -77,7 +78,7 @@ describe('environment helpers', () => {
       commandRunner: { run: async () => { throw missing } },
     })
 
-    await expect(service.preflightManaged(8080)).rejects.toMatchObject({
+    await expect(service.preflightDsh()).rejects.toMatchObject({
       code: 'E_DSH_MISSING',
       action: 'Install dsh and ensure it is on PATH',
     })
@@ -106,10 +107,12 @@ describe('environment helpers', () => {
         homeId: '0123456789abcdef',
       }),
       preflightManaged: async () => {},
+      preflightDsh: async () => {},
     }
 
     await expect(service.resolve('web')).resolves.toMatchObject({ profileDir: '/fake/profiles/web' })
     await expect(service.preflightManaged(8080)).resolves.toBeUndefined()
+    await expect(service.preflightDsh()).resolves.toBeUndefined()
   })
 
   it('propagates an already-aborted signal unchanged without invoking dependencies', async () => {
@@ -154,7 +157,7 @@ describe('environment helpers', () => {
       },
     })
 
-    await expect(service.preflightManaged(8080, controller.signal)).rejects.toBe(cancellation)
+    await expect(service.preflightDsh(controller.signal)).rejects.toBe(cancellation)
   })
 
   it.each(['port checker', 'dsh --version'] as const)(
@@ -172,7 +175,10 @@ describe('environment helpers', () => {
         },
       })
 
-      await expect(service.preflightManaged(8080)).rejects.toBe(cancellation)
+      const operation = dependency === 'port checker'
+        ? service.preflightManaged(8080)
+        : service.preflightDsh()
+      await expect(operation).rejects.toBe(cancellation)
     },
   )
 })

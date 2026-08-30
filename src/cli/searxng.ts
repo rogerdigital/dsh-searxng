@@ -1,5 +1,9 @@
 import { CliError } from './errors.ts'
-import { requestJsonWithRetry } from '../provider.ts'
+import {
+  requestJsonWithRetry,
+  SearxngSearchProvider,
+  type SearxngSearchProviderOptions,
+} from '../provider.ts'
 
 const PROBE_QUERY = 'deepseek harness'
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000
@@ -12,6 +16,9 @@ const RETRYABLE_STATUS = new Set([502, 503, 504])
 export interface ProbeOptions {
   baseURL: string
   authHeader?: string
+  language?: string
+  engines?: string
+  categories?: string
   /** Total readiness deadline; per-attempt timeout for real/provider searches. */
   timeoutMs?: number
   /** Optional attempt cap. Readiness otherwise polls until its deadline. */
@@ -28,7 +35,11 @@ export interface ProbeResult {
 export interface SearxngProbe {
   readiness(options: ProbeOptions, signal?: AbortSignal): Promise<void>
   realSearch(options: ProbeOptions, signal?: AbortSignal): Promise<ProbeResult>
-  providerSearch(options: ProbeOptions, signal?: AbortSignal): Promise<ProbeResult>
+  providerSearch(options: SearxngSearchProviderOptions, signal?: AbortSignal): Promise<ProbeResult>
+}
+
+export interface DefaultSearxngProbeOptions {
+  providerFactory?: (options: SearxngSearchProviderOptions) => Pick<SearxngSearchProvider, 'search'>
 }
 
 interface ProbeAttemptResult {
@@ -54,6 +65,12 @@ export async function probeSearxng(options: ProbeOptions, signal?: AbortSignal):
 }
 
 export class DefaultSearxngProbe implements SearxngProbe {
+  private readonly providerFactory: NonNullable<DefaultSearxngProbeOptions['providerFactory']>
+
+  constructor(options: DefaultSearxngProbeOptions = {}) {
+    this.providerFactory = options.providerFactory ?? ((providerOptions) => new SearxngSearchProvider(providerOptions))
+  }
+
   async readiness(options: ProbeOptions, signal?: AbortSignal): Promise<void> {
     await runReadiness(options, signal)
   }
@@ -62,8 +79,19 @@ export class DefaultSearxngProbe implements SearxngProbe {
     return probeSearxng(options, signal)
   }
 
-  providerSearch(options: ProbeOptions, signal?: AbortSignal): Promise<ProbeResult> {
-    return probeSearxng(options, signal)
+  async providerSearch(options: SearxngSearchProviderOptions, signal?: AbortSignal): Promise<ProbeResult> {
+    signal?.throwIfAborted()
+    const startedAt = Date.now()
+    try {
+      const result = await this.providerFactory({ ...options }).search({ query: PROBE_QUERY, maxResults: 1 }, signal)
+      signal?.throwIfAborted()
+      if (result.sources.length === 0) throw searchFailed('The configured provider returned no usable search result')
+      return { endpoint: options.baseURL, resultCount: result.sources.length, elapsedMs: Math.max(0, Date.now() - startedAt) }
+    } catch (error) {
+      signal?.throwIfAborted()
+      if (error instanceof CliError) throw error
+      throw searchFailed('The configured SearXNG provider search failed')
+    }
   }
 }
 
@@ -142,7 +170,7 @@ async function probeAttempt(
   signal?: AbortSignal,
 ): Promise<ProbeAttemptResult> {
   const request = await requestJsonWithRetry({
-    url: buildProbeUrl(endpoint),
+    url: buildProbeUrl(endpoint, options),
     headers: {
       accept: 'application/json',
       ...(options.authHeader !== undefined && options.authHeader.length > 0
@@ -182,10 +210,15 @@ function validateEndpoint(baseURL: string): string {
   return url.toString().replace(/\/$/, '')
 }
 
-function buildProbeUrl(endpoint: string): string {
+function buildProbeUrl(endpoint: string, options: ProbeOptions): string {
   const url = new URL(endpoint)
   url.pathname = `${url.pathname.replace(/\/+$/, '')}/search`
-  url.search = new URLSearchParams({ q: PROBE_QUERY, format: 'json' }).toString()
+  const params = new URLSearchParams({ q: PROBE_QUERY, format: 'json' })
+  for (const key of ['language', 'engines', 'categories'] as const) {
+    const value = options[key]
+    if (value !== undefined && value.length > 0) params.set(key, value)
+  }
+  url.search = params.toString()
   return url.toString()
 }
 

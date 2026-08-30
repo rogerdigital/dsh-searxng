@@ -37,6 +37,24 @@ describe('probeSearxng', () => {
     expect(requested.searchParams.get('format')).toBe('json')
   })
 
+  it('applies effective language, engine, category, and auth settings to raw probes', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [{ url: 'https://example.com/result' }] }))
+    await probeSearxng({
+      baseURL: BASE,
+      language: 'zh-CN',
+      engines: 'bing,google',
+      categories: 'general',
+      authHeader: 'Bearer private-token',
+      fetch: fetchMock,
+    })
+    const [request, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    const requested = new URL(request)
+    expect(requested.searchParams.get('language')).toBe('zh-CN')
+    expect(requested.searchParams.get('engines')).toBe('bing,google')
+    expect(requested.searchParams.get('categories')).toBe('general')
+    expect(init.headers).toMatchObject({ authorization: 'Bearer private-token' })
+  })
+
   it.each([
     [401, 'E_AUTH_FAILED'],
     [403, 'E_JSON_DISABLED'],
@@ -210,13 +228,43 @@ describe('DefaultSearxngProbe', () => {
     expect(fetchMock).toHaveBeenCalledOnce()
   })
 
-  it('requires non-empty valid results for real and provider searches', async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(jsonResponse({ results: [{ url: 'https://example.com/a' }] }))
-      .mockResolvedValueOnce(jsonResponse({ results: [{ url: 'https://example.com/b' }] }))
+  it('requires non-empty valid results for real searches', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ results: [{ url: 'https://example.com/a' }] }))
     const probe = new DefaultSearxngProbe()
     await expect(probe.realSearch({ baseURL: BASE, fetch: fetchMock })).resolves.toMatchObject({ resultCount: 1 })
-    await expect(probe.providerSearch({ baseURL: BASE, fetch: fetchMock })).resolves.toMatchObject({ resultCount: 1 })
+  })
+
+  it('validates through SearxngSearchProvider with the exact effective profile config', async () => {
+    const search = vi.fn(async () => ({ sources: [{ url: 'https://example.com/provider' }], truncated: false }))
+    const providerFactory = vi.fn(() => ({ search }))
+    const signal = new AbortController().signal
+    const probe = new DefaultSearxngProbe({ providerFactory })
+    const config = {
+      baseURL: BASE,
+      language: 'zh-CN',
+      engines: 'bing,google',
+      categories: 'general',
+      authHeader: 'Bearer private-token',
+    }
+
+    await expect(probe.providerSearch(config, signal)).resolves.toMatchObject({ endpoint: BASE, resultCount: 1 })
+    expect(providerFactory).toHaveBeenCalledWith(config)
+    expect(search).toHaveBeenCalledWith({ query: PROBE_QUERY, maxResults: 1 }, signal)
+  })
+
+  it('returns a safe failure when the real provider path has no result or throws', async () => {
+    const credential = 'Bearer private-token'
+    const empty = new DefaultSearxngProbe({
+      providerFactory: () => ({ search: async () => ({ sources: [], truncated: false }) }),
+    })
+    await expect(empty.providerSearch({ baseURL: BASE, authHeader: credential })).rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
+
+    const failed = new DefaultSearxngProbe({
+      providerFactory: () => ({ search: async () => { throw new Error(`failed ${credential}`) } }),
+    })
+    const error = await failed.providerSearch({ baseURL: BASE, authHeader: credential }).catch((cause: unknown) => cause)
+    expect(error).toMatchObject({ code: 'E_SEARCH_FAILED' })
+    expect(JSON.stringify((error as CliError).toJSON())).not.toContain(credential)
   })
 
   it('bounds Retry-After rather than waiting for the server value', async () => {

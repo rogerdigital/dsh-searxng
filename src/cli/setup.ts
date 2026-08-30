@@ -18,7 +18,7 @@ export interface SetupDependencies {
   now(): Date
 }
 
-export interface SetupInput { profile: string; port: number; url?: string }
+export interface SetupInput { profile: string; port: number; portExplicit?: boolean; url?: string }
 export interface SetupResult { profile: string; endpoint: string; reused: boolean }
 
 interface SetupFactoryOptions { randomSecret?: () => string }
@@ -40,6 +40,29 @@ function managedRecoveryFailed(): CliError {
     'E_STATE_INVALID',
     'Managed SearXNG is still unhealthy after restart',
     'Run dsh-searxng doctor and repair the managed deployment',
+  )
+}
+
+function portMigrationRequired(): CliError {
+  return new CliError(
+    'E_STATE_INVALID',
+    'The requested port differs from the existing managed deployment',
+    'Run dsh-searxng doctor and use an explicit repair or migration workflow',
+  )
+}
+
+function rollbackIncomplete(primary: unknown, rollbackFailures: readonly string[]): CliError {
+  const inherited = primary instanceof CliError && Array.isArray(primary.details.rollbackFailures)
+    ? primary.details.rollbackFailures.filter((value): value is string => typeof value === 'string')
+    : []
+  return new CliError(
+    'E_INTERNAL',
+    'Setup failed and rollback was incomplete',
+    'Run dsh-searxng doctor and repair the managed deployment before retrying',
+    {
+      primaryError: primary instanceof CliError ? primary.code : isAbort(primary) ? 'abort' : 'internal',
+      rollbackFailures: [...inherited, ...rollbackFailures],
+    },
   )
 }
 
@@ -127,6 +150,59 @@ function externalState(previous: StateV1, input: SetupInput, endpoint: string): 
   }
 }
 
+function profileStateMatches(previous: StateV1, input: SetupInput, endpoint: string, mode: 'managed' | 'external'): boolean {
+  const current = previous.profiles[input.profile]
+  return current?.mode === mode && current.endpoint === endpoint
+}
+
+async function attachAndCommit(
+  input: SetupInput,
+  endpoint: string,
+  previous: StateV1,
+  next: StateV1,
+  dependencies: SetupDependencies,
+  signal?: AbortSignal,
+): Promise<void> {
+  let stateCommitted = false
+  try {
+    await dependencies.profiles.attach(
+      input.profile,
+      endpoint,
+      async (config) => {
+        await dependencies.searxng.providerSearch(config, signal)
+        await dependencies.state.write(next)
+        stateCommitted = true
+      },
+      signal,
+    )
+  } catch (primary) {
+    if (!stateCommitted) throw primary
+    try {
+      await dependencies.state.write(previous)
+    } catch {
+      throw rollbackIncomplete(primary, ['state'])
+    }
+    throw primary
+  }
+}
+
+async function cleanupCreatedDeployment(
+  identity: ManagedIdentity,
+  dependencies: SetupDependencies,
+): Promise<string[]> {
+  const failures: string[] = []
+  let ownership: 'absent' | 'owned' | undefined
+  try {
+    ownership = await dependencies.docker.inspectOwnership(identity)
+  } catch {
+    failures.push('docker-ownership')
+  }
+  if (ownership === 'owned') {
+    try { await dependencies.docker.down(identity, true) } catch { failures.push('docker') }
+  }
+  return failures
+}
+
 function isAbort(error: unknown, signal?: AbortSignal): boolean {
   return signal?.aborted === true ||
     (error !== null && typeof error === 'object' && 'name' in error && error.name === 'AbortError')
@@ -139,14 +215,10 @@ async function externalSetup(
   dependencies: SetupDependencies,
   signal?: AbortSignal,
 ): Promise<SetupResult> {
-  await dependencies.searxng.realSearch({ baseURL: endpoint }, signal)
-  await dependencies.profiles.attach(
-    input.profile,
-    endpoint,
-    async () => { await dependencies.searxng.providerSearch({ baseURL: endpoint }, signal) },
-    signal,
-  )
-  await dependencies.state.write(externalState(previous, input, endpoint))
+  const preview = await dependencies.profiles.preview(input.profile, endpoint, signal)
+  await dependencies.searxng.realSearch(preview.config, signal)
+  const next = externalState(previous, input, endpoint)
+  await attachAndCommit(input, endpoint, previous, next, dependencies, signal)
   return { profile: input.profile, endpoint, reused: false }
 }
 
@@ -171,42 +243,40 @@ async function managedSetup(
     throw inconsistentManagedDeployment()
   }
 
+  const preview = await dependencies.profiles.preview(input.profile, endpoint, signal)
+
   if (matching) {
-    let healthy = false
     try {
-      await dependencies.searxng.readiness({ baseURL: endpoint }, signal)
-      await dependencies.searxng.realSearch({ baseURL: endpoint }, signal)
-      healthy = true
+      await dependencies.searxng.readiness(preview.config, signal)
     } catch (error) {
       if (isAbort(error, signal)) throw error
-    }
-    if (healthy) {
-      await dependencies.profiles.attach(
-        input.profile,
-        endpoint,
-        async () => { await dependencies.searxng.providerSearch({ baseURL: endpoint }, signal) },
-        signal,
-      )
-      await dependencies.state.write(managedState(previous, input, endpoint, placeholderIdentity, dependencies))
-      return { profile: input.profile, endpoint, reused: true }
+      if (!(error instanceof CliError) || error.code !== 'E_SEARXNG_START_TIMEOUT') throw error
+      await dependencies.docker.restart(placeholderIdentity, signal)
+      try {
+        await dependencies.searxng.readiness(preview.config, signal)
+        await dependencies.searxng.realSearch(preview.config, signal)
+      } catch (recoveryError) {
+        if (isAbort(recoveryError, signal)) throw recoveryError
+        throw managedRecoveryFailed()
+      }
+      const next = managedState(previous, input, endpoint, placeholderIdentity, dependencies)
+      await attachAndCommit(input, endpoint, previous, next, dependencies, signal)
+      return { profile: input.profile, endpoint, reused: false }
     }
 
-    await dependencies.docker.restart(placeholderIdentity, signal)
-    try {
-      await dependencies.searxng.readiness({ baseURL: endpoint }, signal)
-      await dependencies.searxng.realSearch({ baseURL: endpoint }, signal)
-    } catch (error) {
-      if (isAbort(error, signal)) throw error
-      throw managedRecoveryFailed()
+    await dependencies.searxng.realSearch(preview.config, signal)
+    if (preview.attached && profileStateMatches(previous, input, endpoint, 'managed')) {
+      await dependencies.searxng.providerSearch(preview.config, signal)
+      return { profile: input.profile, endpoint, reused: true }
     }
-    await dependencies.profiles.attach(
-      input.profile,
-      endpoint,
-      async () => { await dependencies.searxng.providerSearch({ baseURL: endpoint }, signal) },
-      signal,
-    )
-    await dependencies.state.write(managedState(previous, input, endpoint, placeholderIdentity, dependencies))
-    return { profile: input.profile, endpoint, reused: false }
+    const next = managedState(previous, input, endpoint, placeholderIdentity, dependencies)
+    if (preview.attached) {
+      await dependencies.searxng.providerSearch(preview.config, signal)
+      await dependencies.state.write(next)
+    } else {
+      await attachAndCommit(input, endpoint, previous, next, dependencies, signal)
+    }
+    return { profile: input.profile, endpoint, reused: true }
   }
 
   await dependencies.environment.preflightManaged(input.port, signal)
@@ -218,17 +288,20 @@ async function managedSetup(
     secret: randomSecret(),
   })
   const identity = { ...placeholderIdentity, composePath: rendered.composePath }
-  await dependencies.docker.up(identity, signal)
-  await dependencies.searxng.readiness({ baseURL: endpoint }, signal)
-  await dependencies.searxng.realSearch({ baseURL: endpoint }, signal)
-  await dependencies.profiles.attach(
-    input.profile,
-    endpoint,
-    async () => { await dependencies.searxng.providerSearch({ baseURL: endpoint }, signal) },
-    signal,
-  )
-  await dependencies.state.write(managedState(previous, input, endpoint, identity, dependencies))
-  return { profile: input.profile, endpoint, reused: false }
+  try {
+    // From this point onward, any resources discovered under this identity may
+    // only have been created by this first-setup transaction.
+    await dependencies.docker.up(identity, signal)
+    await dependencies.searxng.readiness(preview.config, signal)
+    await dependencies.searxng.realSearch(preview.config, signal)
+    const next = managedState(previous, input, endpoint, identity, dependencies)
+    await attachAndCommit(input, endpoint, previous, next, dependencies, signal)
+    return { profile: input.profile, endpoint, reused: false }
+  } catch (primary) {
+    const cleanupFailures = await cleanupCreatedDeployment(identity, dependencies)
+    if (cleanupFailures.length > 0) throw rollbackIncomplete(primary, cleanupFailures)
+    throw primary
+  }
 }
 
 export function createSetup(options: SetupFactoryOptions = {}) {
@@ -244,13 +317,23 @@ export function createSetup(options: SetupFactoryOptions = {}) {
         const environment = await dependencies.environment.resolve(input.profile)
         const previous = await dependencies.state.read()
         if (input.url !== undefined) {
-          return externalSetup(input, safeEndpoint(input.url), previous, dependencies, signal)
+          const endpoint = safeEndpoint(input.url)
+          await dependencies.environment.preflightDsh(signal)
+          return externalSetup(input, endpoint, previous, dependencies, signal)
         }
-        return managedSetup(input, previous, environment, dependencies, randomSecret, signal)
+        const portExplicit = input.portExplicit ?? true
+        let port = input.port
+        if (previous.managed !== undefined) {
+          if (!portExplicit) port = previous.managed.port
+          else if (port !== previous.managed.port) throw portMigrationRequired()
+        }
+        await dependencies.environment.preflightDsh(signal)
+        return managedSetup({ ...input, port }, previous, environment, dependencies, randomSecret, signal)
       })
     } catch (error) {
+      if (error instanceof CliError) throw error
       if (signal?.aborted) signal.throwIfAborted()
-      if (error instanceof CliError || isAbort(error, signal)) throw error
+      if (isAbort(error, signal)) throw error
       throw setupFailed()
     }
   }

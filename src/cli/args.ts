@@ -6,6 +6,7 @@ export type CliCommand =
       profile: string
       url?: string
       port: number
+      portExplicit: boolean
       json: boolean
     }
   | {
@@ -97,7 +98,14 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   if (cliCommand === 'remove' && purgeData && !service) invalid('--purge-data requires --service')
   if (cliCommand === 'remove' && yes && !purgeData) invalid('--yes requires --purge-data')
 
-  if (cliCommand === 'setup') return { command: cliCommand, profile, ...(url === undefined ? {} : { url }), port, json }
+  if (cliCommand === 'setup') return {
+    command: cliCommand,
+    profile,
+    ...(url === undefined ? {} : { url }),
+    port,
+    portExplicit: parsed.values.port !== undefined,
+    json,
+  }
   if (cliCommand === 'remove') return { command: cliCommand, profile, json, service, purgeData, yes }
   return { command: cliCommand, profile, json }
 }

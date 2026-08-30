@@ -147,7 +147,12 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
   try {
     const dependencies = options.dependencies ?? options.createDependencies?.() ?? createProductionDependencies()
     const result = await setup(
-      { profile: command.profile, port: command.port, ...(command.url === undefined ? {} : { url: command.url }) },
+      {
+        profile: command.profile,
+        port: command.port,
+        portExplicit: command.portExplicit,
+        ...(command.url === undefined ? {} : { url: command.url }),
+      },
       dependencies,
       options.signal,
     )
