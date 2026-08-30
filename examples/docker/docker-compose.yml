@@ -1,9 +1,8 @@
-# Run a local SearXNG instance with the JSON format enabled.
-# The port is bound to loopback on purpose: a JSON-enabled instance without
-# the limiter must not be exposed publicly.
+# Development-only example. The supported user path is `npx dsh-searxng setup`.
+# Keep this JSON-enabled instance bound to loopback.
 services:
   searxng:
-    image: searxng/searxng:latest
+    image: ghcr.io/searxng/searxng:2026.8.20-8d3dd0cd4@sha256:e7bb47bebf338c52c55c7bed92293873cfe757b554b261829c0d710fd8307fa3
     restart: unless-stopped
     ports:
       - "127.0.0.1:8080:8080"
@@ -11,9 +10,12 @@ services:
       - ./searxng:/etc/searxng:ro
     environment:
       SEARXNG_BASE_URL: http://127.0.0.1:8080/
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?Set SEARXNG_SECRET to a random value}
     cap_drop:
       - ALL
     cap_add:
       - CHOWN
       - SETGID
       - SETUID
+    security_opt:
+      - no-new-privileges:true

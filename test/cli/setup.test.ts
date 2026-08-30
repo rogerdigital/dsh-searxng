@@ -822,6 +822,14 @@ describe('setup', () => {
 })
 
 describe('production CLI entry', () => {
+  it('prints packed-CLI help without constructing dependencies', async () => {
+    const stdout: string[] = []
+    const createDependencies = vi.fn()
+    const exitCode = await runCli(['--help'], { createDependencies, stdout: (text) => stdout.push(text) })
+    expect(exitCode).toBe(0)
+    expect(stdout.join('')).toMatch(/setup[\s\S]*status[\s\S]*doctor[\s\S]*remove/)
+    expect(createDependencies).not.toHaveBeenCalled()
+  })
   it('returns zero and emits exactly one JSON success for setup', async () => {
     const test = harness()
     const stdout: string[] = []

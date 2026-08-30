@@ -64,6 +64,21 @@ function usageError(message: string): CliError {
   return new CliError('E_USAGE', message, 'Run dsh-searxng setup with supported options')
 }
 
+const HELP = `dsh-searxng
+
+Usage:
+  dsh-searxng setup [--profile NAME] [--port PORT] [--url URL] [--json]
+  dsh-searxng status [--profile NAME] [--json]
+  dsh-searxng doctor [--profile NAME] [--json]
+  dsh-searxng remove [--profile NAME] [--service] [--purge-data --yes] [--json]
+
+Commands:
+  setup    Configure an external SearXNG endpoint or create an owned Docker service
+  status   Stop at the first failed health check
+  doctor   Report the complete ordered diagnostic chain
+  remove   Detach a profile, optionally removing the owned service and data
+`
+
 export function createLoopbackPortChecker(serverFactory: () => Server = createServer): PortChecker {
   return async (port, signal) => {
     signal?.throwIfAborted()
@@ -158,6 +173,11 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
   } catch {
     presentError(usageError('Invalid command arguments'), presenter)
     return 2
+  }
+
+  if (command.command === 'help') {
+    stdout(HELP)
+    return 0
   }
 
   try {

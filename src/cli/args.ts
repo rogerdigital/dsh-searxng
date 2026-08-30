@@ -1,6 +1,7 @@
 import { parseArgs } from 'node:util'
 
 export type CliCommand =
+  | { command: 'help' }
   | {
       command: 'setup'
       profile: string
@@ -31,6 +32,7 @@ const options = {
   service: { type: 'boolean' as const },
   'purge-data': { type: 'boolean' as const },
   yes: { type: 'boolean' as const },
+  help: { type: 'boolean' as const, short: 'h' },
 }
 
 function invalid(message: string): never {
@@ -76,6 +78,12 @@ function parseUrl(value: string | undefined): string | undefined {
 export function parseCliArgs(argv: readonly string[]): CliCommand {
   const parsed = parseArgs({ args: [...argv], options, allowPositionals: true, strict: true })
   const [command, ...extra] = parsed.positionals
+  if (parsed.values.help === true) {
+    if (command !== undefined || extra.length > 0 || Object.entries(parsed.values).some(([key, value]) => key !== 'help' && value !== undefined)) {
+      invalid('--help cannot be combined with a command or other options')
+    }
+    return { command: 'help' }
+  }
   if (!command || extra.length > 0 || !['setup', 'status', 'doctor', 'remove'].includes(command)) {
     invalid('expected one command: setup, status, doctor, or remove')
   }

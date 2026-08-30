@@ -1,10 +1,9 @@
-# Minimal SearXNG settings for use as a dsh search backend.
-# Everything else inherits the image defaults (use_default_settings).
+# Development-only settings. Compose replaces this placeholder from
+# SEARXNG_SECRET; the packaged setup generates and stores a private secret.
 use_default_settings: true
 
 server:
-  # Change this for anything beyond local use: `openssl rand -hex 32`.
-  secret_key: "change-me-to-a-random-string"
+  secret_key: "ultrasecretkey"
   # The limiter is disabled for a loopback-only instance. If you ever expose
   # this instance beyond localhost, re-enable it (`limiter: true`).
   limiter: false

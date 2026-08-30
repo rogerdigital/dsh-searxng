@@ -2,6 +2,13 @@ import { describe, expect, it } from 'vitest'
 import { parseCliArgs } from '../../src/cli/args.ts'
 
 describe('parseCliArgs', () => {
+  it.each([['--help'], ['-h']])('parses %s without requiring a command', (flag) => {
+    expect(parseCliArgs([flag])).toEqual({ command: 'help' })
+  })
+
+  it('rejects help combined with mutations', () => {
+    expect(() => parseCliArgs(['setup', '--help'])).toThrow(/cannot be combined/i)
+  })
   it('defaults setup to the web profile and port 8080', () => {
     expect(parseCliArgs(['setup'])).toEqual({
       command: 'setup',
