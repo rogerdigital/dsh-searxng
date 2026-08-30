@@ -186,20 +186,18 @@ function configOf(
 
 function renderAttachment(parsed: ParsedPatch, endpoint: string): Buffer {
   const { document, sequence } = parsed
-  let lastUserConfig: YAMLMap<unknown, unknown> | undefined
-  let lastManagedConfig: YAMLMap<unknown, unknown> | undefined
+  let lastEffectiveConfig: YAMLMap<unknown, unknown> | undefined
   const retained: Node[] = []
 
   for (const item of sequence.items) {
+    if (isTargetPatch(item)) lastEffectiveConfig = configOf(document, item)
     if (isManagedPatch(item)) {
-      lastManagedConfig = configOf(document, item)
       continue
     }
     retained.push(item)
-    if (isTargetPatch(item)) lastUserConfig = configOf(document, item)
   }
 
-  const config = lastUserConfig ?? lastManagedConfig ?? document.createNode({}) as YAMLMap<unknown, unknown>
+  const config = lastEffectiveConfig ?? document.createNode({}) as YAMLMap<unknown, unknown>
   config.set('baseURL', endpoint)
   const managed = document.createNode({ id: TARGET_ID }) as YAMLMap<unknown, unknown>
   if (!isMap(managed)) throw profileWriteError()

@@ -201,6 +201,68 @@ describe('transactional attachment', () => {
     })
   })
 
+  it('copies a later managed config instead of an earlier unmarked target config', async () => {
+    const patch = `- id: web-search-searxng
+  config:
+    timeoutMs: 1000
+    source: user
+# dsh-searxng managed attachment
+- id: web-search-searxng
+  config:
+    timeoutMs: 9000
+    source: managed
+    laterOnly: keep
+    baseURL: http://old.invalid
+`
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.0' } },
+      patch,
+    })
+
+    await manager.attach('web', 'http://new.example', async () => {})
+
+    const rows = parse(await fs.readFile(patchPath, 'utf8')) as Array<{
+      id: string
+      config: Record<string, unknown>
+    }>
+    expect(rows.at(-1)?.config).toEqual({
+      timeoutMs: 9000,
+      source: 'managed',
+      laterOnly: 'keep',
+      baseURL: 'http://new.example',
+    })
+  })
+
+  it('copies a later unmarked target config after an earlier managed patch', async () => {
+    const patch = `# dsh-searxng managed attachment
+- id: web-search-searxng
+  config:
+    source: managed
+    baseURL: http://old.invalid
+- id: web-search-searxng
+  config:
+    source: later-user
+    userOnly: keep
+    baseURL: http://user.invalid
+`
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.0' } },
+      patch,
+    })
+
+    await manager.attach('web', 'http://new.example', async () => {})
+
+    const rows = parse(await fs.readFile(patchPath, 'utf8')) as Array<{
+      id: string
+      config: Record<string, unknown>
+    }>
+    expect(rows.at(-1)?.config).toEqual({
+      source: 'later-user',
+      userOnly: 'keep',
+      baseURL: 'http://new.example',
+    })
+  })
+
   it.each([
     'ftp://search.example',
     'https://user:password@search.example',
