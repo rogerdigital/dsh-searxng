@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { createServer, type Server } from 'node:net'
-import { pathToFileURL } from 'node:url'
+import { realpath } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import { resolve } from 'node:path'
 import { parseCliArgs } from './cli/args.ts'
 import { FileAssetRenderer } from './cli/assets.ts'
@@ -30,6 +31,25 @@ export interface ProductionDependencyOptions {
   homedir?: string
   runner?: CommandRunner
   portChecker?: PortChecker
+}
+
+export async function isMainModule(
+  moduleUrl: string,
+  executedPath: string | undefined,
+  canonicalize: (path: string) => Promise<string> = realpath,
+): Promise<boolean> {
+  if (executedPath === undefined) return false
+  let modulePath: string
+  try { modulePath = fileURLToPath(moduleUrl) } catch { return false }
+  try {
+    const [canonicalModule, canonicalExecuted] = await Promise.all([
+      canonicalize(modulePath),
+      canonicalize(executedPath),
+    ])
+    return canonicalModule === canonicalExecuted
+  } catch {
+    return resolve(modulePath) === resolve(executedPath)
+  }
 }
 
 function usageError(message: string): CliError {
@@ -131,7 +151,19 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
       dependencies,
       options.signal,
     )
-    presentSuccess(result, presenter)
+    if (format === 'json') {
+      presentSuccess(result, presenter)
+    } else {
+      stdout([
+        'SearXNG ready',
+        `Profile: ${result.profile}`,
+        `Endpoint: ${result.endpoint}`,
+        'Validation: real search and provider search passed',
+        `Deployment: ${result.reused ? 'reused' : 'created or recovered'}`,
+        `Next: dsh --profile ${result.profile}`,
+        '',
+      ].join('\n'))
+    }
     return 0
   } catch (error) {
     presentError(error, presenter)
@@ -151,7 +183,6 @@ async function main(): Promise<void> {
   }
 }
 
-const executedPath = process.argv[1]
-if (executedPath !== undefined && import.meta.url === pathToFileURL(resolve(executedPath)).href) {
-  void main()
+if (await isMainModule(import.meta.url, process.argv[1])) {
+  await main()
 }

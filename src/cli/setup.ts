@@ -27,6 +27,22 @@ function setupFailed(): CliError {
   return new CliError('E_INTERNAL', 'Setup failed unexpectedly', 'Run dsh-searxng doctor and retry')
 }
 
+function inconsistentManagedDeployment(): CliError {
+  return new CliError(
+    'E_STATE_INVALID',
+    'Managed deployment state does not match Docker resources',
+    'Run dsh-searxng doctor and repair the managed deployment',
+  )
+}
+
+function managedRecoveryFailed(): CliError {
+  return new CliError(
+    'E_STATE_INVALID',
+    'Managed SearXNG is still unhealthy after restart',
+    'Run dsh-searxng doctor and repair the managed deployment',
+  )
+}
+
 function safeEndpoint(value: string): string {
   let url: URL
   try { url = new URL(value) } catch { throw new CliError('E_USAGE', 'The SearXNG endpoint is invalid', 'Use an absolute HTTP or HTTPS URL') }
@@ -147,8 +163,13 @@ async function managedSetup(
 
   await dependencies.docker.preflight(signal)
   const ownership = await dependencies.docker.inspectOwnership(placeholderIdentity, signal)
-  const matching = ownership === 'owned' &&
+  const hasState = previous.managed !== undefined
+  const matching = hasState && ownership === 'owned' &&
     isMatchingManagedState(previous.managed, placeholderIdentity, endpoint, input.port)
+
+  if ((hasState && !matching) || (!hasState && ownership === 'owned')) {
+    throw inconsistentManagedDeployment()
+  }
 
   if (matching) {
     let healthy = false
@@ -169,9 +190,26 @@ async function managedSetup(
       await dependencies.state.write(managedState(previous, input, endpoint, placeholderIdentity, dependencies))
       return { profile: input.profile, endpoint, reused: true }
     }
+
+    await dependencies.docker.restart(placeholderIdentity, signal)
+    try {
+      await dependencies.searxng.readiness({ baseURL: endpoint }, signal)
+      await dependencies.searxng.realSearch({ baseURL: endpoint }, signal)
+    } catch (error) {
+      if (isAbort(error, signal)) throw error
+      throw managedRecoveryFailed()
+    }
+    await dependencies.profiles.attach(
+      input.profile,
+      endpoint,
+      async () => { await dependencies.searxng.providerSearch({ baseURL: endpoint }, signal) },
+      signal,
+    )
+    await dependencies.state.write(managedState(previous, input, endpoint, placeholderIdentity, dependencies))
+    return { profile: input.profile, endpoint, reused: false }
   }
 
-  if (!matching) await dependencies.environment.preflightManaged(input.port, signal)
+  await dependencies.environment.preflightManaged(input.port, signal)
   const rendered = await dependencies.assets.render({
     stateDir: environment.managedDir,
     identity: placeholderIdentity,

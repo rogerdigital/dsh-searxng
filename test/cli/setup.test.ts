@@ -1,6 +1,8 @@
 import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
-import { readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { pathToFileURL } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
 import { SEARXNG_IMAGE, type AssetRenderer, type ManagedIdentity } from '../../src/cli/assets.ts'
 import type { DockerAdapter } from '../../src/cli/docker.ts'
@@ -10,7 +12,7 @@ import type { ProfileManager } from '../../src/cli/profile.ts'
 import type { SearxngProbe } from '../../src/cli/searxng.ts'
 import type { StateStore, StateV1 } from '../../src/cli/state.ts'
 import { createSetup, setup, type SetupDependencies } from '../../src/cli/setup.ts'
-import { createLoopbackPortChecker, runCli } from '../../src/cli.ts'
+import { createLoopbackPortChecker, isMainModule, runCli } from '../../src/cli.ts'
 
 const HOME_ID = '0123456789abcdef'
 const MANAGED_DIR = '/tmp/dsh/dsh-searxng'
@@ -90,6 +92,7 @@ function harness(options: HarnessOptions = {}) {
       return options.ownership ?? 'absent'
     }),
     up: vi.fn(async (identity) => { events.push('docker-up'); identities.push(identity) }),
+    restart: vi.fn(async (identity) => { events.push('docker-restart'); identities.push(identity) }),
     down: vi.fn(async () => { events.push('docker-down') }),
     logs: vi.fn(async () => ''),
   }
@@ -202,15 +205,29 @@ describe('setup', () => {
     expect(test.state().managed?.lastHealthyAt).toBe('2026-08-30T01:02:03.004Z')
   })
 
-  it('repairs matching owned but unhealthy deployment without mistaking its port for a conflict', async () => {
+  it('recovers a matching owned but unhealthy deployment by restarting without rotating its configuration', async () => {
     const test = harness({ state: managedState(), ownership: 'owned', readinessFailures: 1 })
-    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).resolves.toMatchObject({ reused: false })
+    const randomSecret = vi.fn(() => 'b'.repeat(64))
+    await expect(createSetup({ randomSecret })({ profile: 'web', port: 8080 }, test.deps)).resolves.toMatchObject({ reused: false })
     expect(test.events).toEqual([
-      'lock', 'environment', 'state-read', 'docker-preflight', 'ownership', 'readiness', 'render',
-      'docker-up', 'readiness', 'real-search', 'profile-attach', 'provider-search',
+      'lock', 'environment', 'state-read', 'docker-preflight', 'ownership', 'readiness', 'docker-restart',
+      'readiness', 'real-search', 'profile-attach', 'provider-search',
       'state-write', 'unlock',
     ])
     expect(test.environment.preflightManaged).not.toHaveBeenCalled()
+    expect(test.assets.render).not.toHaveBeenCalled()
+    expect(test.docker.up).not.toHaveBeenCalled()
+    expect(randomSecret).not.toHaveBeenCalled()
+    expect(test.state().managed).toMatchObject({
+      deploymentVersion: 1,
+      image: SEARXNG_IMAGE,
+      endpoint: ENDPOINT,
+      port: 8080,
+      homeId: HOME_ID,
+      projectName: PROJECT,
+      containerName: PROJECT,
+      lastHealthyAt: '2026-08-30T01:02:03.004Z',
+    })
   })
 
   it('repairs an owned matching deployment when readiness passes but its real search is unhealthy', async () => {
@@ -218,10 +235,49 @@ describe('setup', () => {
     await expect(setup({ profile: 'web', port: 8080 }, test.deps)).resolves.toMatchObject({ reused: false })
     expect(test.events).toEqual([
       'lock', 'environment', 'state-read', 'docker-preflight', 'ownership', 'readiness', 'real-search',
-      'render', 'docker-up', 'readiness', 'real-search', 'profile-attach', 'provider-search',
+      'docker-restart', 'readiness', 'real-search', 'profile-attach', 'provider-search',
       'state-write', 'unlock',
     ])
     expect(test.environment.preflightManaged).not.toHaveBeenCalled()
+    expect(test.assets.render).not.toHaveBeenCalled()
+  })
+
+  it('stops instead of rotating configuration when owned resources lack matching state', async () => {
+    const missing = harness({ ownership: 'owned' })
+    await expect(setup({ profile: 'web', port: 8080 }, missing.deps)).rejects.toMatchObject({
+      code: 'E_STATE_INVALID', action: expect.stringMatching(/doctor|repair/i),
+    })
+    expect(missing.events).toEqual(['lock', 'environment', 'state-read', 'docker-preflight', 'ownership', 'unlock'])
+
+    const mismatched = harness({ state: managedState({ image: 'other-image' }), ownership: 'owned' })
+    await expect(setup({ profile: 'web', port: 8080 }, mismatched.deps)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+    expect(mismatched.assets.render).not.toHaveBeenCalled()
+    expect(mismatched.docker.up).not.toHaveBeenCalled()
+    expect(mismatched.docker.restart).not.toHaveBeenCalled()
+  })
+
+  it('stops for repair when state claims a deployment but its Docker resources are absent', async () => {
+    const test = harness({ state: managedState(), ownership: 'absent' })
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toMatchObject({
+      code: 'E_STATE_INVALID', action: expect.stringMatching(/doctor|repair/i),
+    })
+    expect(test.assets.render).not.toHaveBeenCalled()
+    expect(test.docker.up).not.toHaveBeenCalled()
+  })
+
+  it('does not attach or write healthy state when restart fails or remains unhealthy', async () => {
+    const restartFailure = harness({ state: managedState(), ownership: 'owned', readinessFailures: 1 })
+    vi.mocked(restartFailure.deps.docker.restart).mockRejectedValueOnce(new CliError('E_INTERNAL', 'Restart failed', 'Run doctor and repair'))
+    await expect(setup({ profile: 'web', port: 8080 }, restartFailure.deps)).rejects.toMatchObject({ action: expect.stringMatching(/doctor|repair/i) })
+    expect(restartFailure.events).not.toContain('profile-attach')
+    expect(restartFailure.events).not.toContain('state-write')
+
+    const stillUnhealthy = harness({ state: managedState(), ownership: 'owned', readinessFailures: 2 })
+    await expect(setup({ profile: 'web', port: 8080 }, stillUnhealthy.deps)).rejects.toMatchObject({
+      code: 'E_STATE_INVALID', action: expect.stringMatching(/doctor|repair/i),
+    })
+    expect(stillUnhealthy.events).not.toContain('profile-attach')
+    expect(stillUnhealthy.events).not.toContain('state-write')
   })
 
   it('validates and normalizes an external endpoint with zero Docker, managed-preflight, or asset calls', async () => {
@@ -313,6 +369,25 @@ describe('production CLI entry', () => {
     expect(exitCode).toBe(0)
     expect(stdout).toHaveLength(1)
     expect(JSON.parse(stdout[0]!)).toEqual({ endpoint: ENDPOINT, profile: 'web', reused: false })
+    expect(stderr).toEqual([])
+  })
+
+  it('prints an actionable one-write human ready result without exposing secrets', async () => {
+    const test = harness()
+    const stdout: string[] = []
+    const stderr: string[] = []
+    const exitCode = await runCli(['setup', '--profile', 'work'], {
+      dependencies: test.deps,
+      stdout: (text) => stdout.push(text),
+      stderr: (text) => stderr.push(text),
+    })
+    expect(exitCode).toBe(0)
+    expect(stdout).toHaveLength(1)
+    expect(stdout[0]).toContain('Profile: work')
+    expect(stdout[0]).toContain(`Endpoint: ${ENDPOINT}`)
+    expect(stdout[0]).toMatch(/Validation:.*passed/i)
+    expect(stdout[0]).toContain('Next: dsh --profile work')
+    expect(stdout[0]).not.toMatch(/[a-f0-9]{64}/)
     expect(stderr).toEqual([])
   })
 
@@ -426,5 +501,22 @@ describe('production CLI entry', () => {
     const source = await readFile(new URL('../../src/cli.ts', import.meta.url), 'utf8')
     expect(packageJson.bin).toEqual({ 'dsh-searxng': './lib/cli.mjs' })
     expect(source.startsWith('#!/usr/bin/env node\n')).toBe(true)
+  })
+
+  it('detects a symlinked executable by real path but never treats an ordinary import as main', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-searxng-main-'))
+    const target = join(directory, 'cli.mjs')
+    const link = join(directory, 'dsh-searxng')
+    const imported = join(directory, 'imported.mjs')
+    try {
+      await writeFile(target, '#!/usr/bin/env node\n', 'utf8')
+      await writeFile(imported, '', 'utf8')
+      await symlink(target, link)
+      await expect(isMainModule(pathToFileURL(target).href, link)).resolves.toBe(true)
+      await expect(isMainModule(pathToFileURL(target).href, imported)).resolves.toBe(false)
+      await expect(isMainModule(pathToFileURL(target).href, join(directory, 'missing'))).resolves.toBe(false)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 })

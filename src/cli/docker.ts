@@ -9,6 +9,7 @@ export interface DockerAdapter {
   preflight(signal?: AbortSignal): Promise<{ serverVersion: string; composeVersion: string }>
   inspectOwnership(identity: ManagedIdentity, signal?: AbortSignal): Promise<'absent' | 'owned'>
   up(identity: ManagedIdentity, signal?: AbortSignal): Promise<void>
+  restart(identity: ManagedIdentity, signal?: AbortSignal): Promise<void>
   down(identity: ManagedIdentity, volumes: boolean, signal?: AbortSignal): Promise<void>
   logs(identity: ManagedIdentity, tail: number, signal?: AbortSignal): Promise<string>
 }
@@ -36,6 +37,18 @@ function foreignResource(): CliError {
 
 function operationFailed(operation: string): CliError {
   return new CliError('E_INTERNAL', `Docker Compose ${operation} failed`, 'Run dsh-searxng doctor and inspect Docker status')
+}
+
+function restartFailed(): CliError {
+  return new CliError('E_INTERNAL', 'Docker container restart failed', 'Run dsh-searxng doctor and repair the managed deployment')
+}
+
+function incompleteManagedResources(): CliError {
+  return new CliError(
+    'E_STATE_INVALID',
+    'Managed Docker resources are incomplete',
+    'Run dsh-searxng doctor and repair the managed deployment',
+  )
 }
 
 function composeMajor(version: string): number | undefined {
@@ -186,6 +199,26 @@ export class CliDockerAdapter implements DockerAdapter {
   async up(identity: ManagedIdentity, signal?: AbortSignal): Promise<void> {
     await this.inspectOwnership(identity, signal)
     await this.runCompose(identity, ['up', '--detach'], 'up', signal)
+  }
+
+  async restart(identity: ManagedIdentity, signal?: AbortSignal): Promise<void> {
+    validateIdentity(identity)
+    signal?.throwIfAborted()
+    const ownership: Array<'absent' | 'owned'> = []
+    for (const kind of ['container', 'network', 'volume'] as const) {
+      ownership.push(await this.inspectResource(identity, kind, signal))
+    }
+    if (ownership.some((resource) => resource === 'absent')) throw incompleteManagedResources()
+
+    let result: CommandResult
+    try {
+      result = await this.runner.run('docker', ['container', 'restart', identity.containerName], { signal })
+      signal?.throwIfAborted()
+    } catch (error) {
+      cancellation(error, signal)
+      throw restartFailed()
+    }
+    if (result.exitCode !== 0) throw restartFailed()
   }
 
   async down(identity: ManagedIdentity, volumes: boolean, signal?: AbortSignal): Promise<void> {

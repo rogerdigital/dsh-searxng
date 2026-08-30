@@ -170,6 +170,54 @@ describe('CliDockerAdapter ownership', () => {
 })
 
 describe('CliDockerAdapter Compose operations', () => {
+  it('restarts the exact owned container only after validating all owned resources', async () => {
+    const signal = new AbortController().signal
+    const runner = new FakeRunner(...ownedResourceResults(), ok('restarted'))
+    await new CliDockerAdapter(runner).restart(identity, signal)
+    expect(runner.invocations.map(({ command, args }) => [command, args])).toEqual([
+      ['docker', ['container', 'inspect', identity.containerName]],
+      ['docker', ['network', 'inspect', networkName]],
+      ['docker', ['volume', 'inspect', cacheVolumeName]],
+      ['docker', ['container', 'restart', identity.containerName]],
+    ])
+    expect(runner.invocations[3]?.options).toEqual({ signal })
+  })
+
+  it.each([
+    ['container', [ok(JSON.stringify([{ Config: { Labels: {} } }]))]],
+    ['network', [ok(ownedContainerInspect), ok(JSON.stringify([{ Labels: {} }]))]],
+    ['volume', [ok(ownedContainerInspect), ok(ownedNetworkInspect), ok(JSON.stringify([{ Labels: {} }]))]],
+  ] as const)('blocks restart when the %s is foreign', async (_kind, responses) => {
+    const runner = new FakeRunner(...responses)
+    await expectCode(new CliDockerAdapter(runner).restart(identity), 'E_RESOURCE_FOREIGN')
+    expect(runner.invocations.every(({ args }) => args[1] !== 'restart')).toBe(true)
+  })
+
+  it('blocks restart when the managed container or another required resource is absent', async () => {
+    const missingContainer = new FakeRunner(failed('No such container'), ok(ownedNetworkInspect), ok(ownedVolumeInspect))
+    await expectCode(new CliDockerAdapter(missingContainer).restart(identity), 'E_STATE_INVALID')
+    expect(missingContainer.invocations).toHaveLength(3)
+
+    const missingVolume = new FakeRunner(ok(ownedContainerInspect), ok(ownedNetworkInspect), failed('No such volume'))
+    await expectCode(new CliDockerAdapter(missingVolume).restart(identity), 'E_STATE_INVALID')
+    expect(missingVolume.invocations).toHaveLength(3)
+  })
+
+  it('propagates restart cancellation and maps nonzero output without leaking it', async () => {
+    const aborted = new Error('cancelled')
+    aborted.name = 'AbortError'
+    await expect(new CliDockerAdapter(new FakeRunner(...ownedResourceResults(), aborted)).restart(identity)).rejects.toBe(aborted)
+
+    const failedRunner = new FakeRunner(...ownedResourceResults(), failed('secret=a:b#c'))
+    const error = await new CliDockerAdapter(failedRunner).restart(identity).catch((caught: unknown) => caught)
+    expect(error).toMatchObject({
+      code: 'E_INTERNAL',
+      message: expect.stringMatching(/container restart/i),
+      action: expect.stringMatching(/doctor/i),
+    })
+    expect(JSON.stringify((error as CliError).toJSON())).not.toContain('a:b#c')
+  })
+
   it('uses exact identity arguments for an absent resource up', async () => {
     const runner = new FakeRunner(...absentResourceResults(), ok())
     await new CliDockerAdapter(runner).up(identity)
