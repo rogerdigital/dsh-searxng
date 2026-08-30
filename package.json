@@ -20,7 +20,10 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
-    }
+    },
+    "seams": [
+      "web"
+    ]
   },
   "scripts": {
     "build": "tsdown",
