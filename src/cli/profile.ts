@@ -1,6 +1,7 @@
 import * as fs from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import {
+  isAlias,
   isMap,
   isNode,
   isSeq,
@@ -235,13 +236,14 @@ function isManagedPatch(node: Node): node is YAMLMap<unknown, unknown> {
   return isTargetPatch(node) && hasManagedMarker(node)
 }
 
-function containsAnchor(value: unknown): boolean {
+function containsAnchorOrAlias(value: unknown): boolean {
   if (!isNode(value)) return false
+  if (isAlias(value)) return true
   if ('anchor' in value && typeof value.anchor === 'string' && value.anchor.length > 0) return true
   if (isMap(value)) {
-    return value.items.some((pair) => containsAnchor(pair.key) || containsAnchor(pair.value))
+    return value.items.some((pair) => containsAnchorOrAlias(pair.key) || containsAnchorOrAlias(pair.value))
   }
-  if (isSeq(value)) return value.items.some((item) => containsAnchor(item))
+  if (isSeq(value)) return value.items.some((item) => containsAnchorOrAlias(item))
   return false
 }
 
@@ -265,6 +267,9 @@ function configOf(
   const config = patch.get('config', true)
   if (config === undefined) return document.createNode({}) as YAMLMap<unknown, unknown>
   if (!isMap(config)) throw profileWriteError('The target DSH profile config is invalid')
+  if (containsAnchorOrAlias(config)) {
+    throw profileWriteError('The target DSH profile config contains an unsafe YAML anchor or alias')
+  }
   return config.clone() as YAMLMap<unknown, unknown>
 }
 
@@ -286,8 +291,8 @@ function renderAttachment(parsed: ParsedPatch, endpoint: string): Buffer {
   const retained: Node[] = []
 
   for (const item of sequence.items) {
-    if (isManagedPatch(item) && containsAnchor(item)) {
-      throw profileWriteError('The managed DSH profile patch contains an unsafe YAML anchor')
+    if (isManagedPatch(item) && containsAnchorOrAlias(item)) {
+      throw profileWriteError('The managed DSH profile patch contains an unsafe YAML anchor or alias')
     }
     if (isTargetPatch(item)) lastEffectiveConfig = configOf(document, item)
     if (isManagedPatch(item)) {
@@ -308,8 +313,8 @@ function renderAttachment(parsed: ParsedPatch, endpoint: string): Buffer {
 
 function renderDetachment(parsed: ParsedPatch): Buffer | undefined {
   for (const item of parsed.sequence.items) {
-    if (isManagedPatch(item) && containsAnchor(item)) {
-      throw profileWriteError('The managed DSH profile patch contains an unsafe YAML anchor')
+    if (isManagedPatch(item) && containsAnchorOrAlias(item)) {
+      throw profileWriteError('The managed DSH profile patch contains an unsafe YAML anchor or alias')
     }
   }
   const retained = parsed.sequence.items.filter((item) => !isManagedPatch(item))
@@ -380,6 +385,7 @@ export class NodeProfileManager implements ProfileManager {
     let rollbackExpected: PatchSnapshot | undefined
     let output: Buffer | undefined
     let failureStage: FailureStage = 'install'
+    let restoreOriginalAllowed = true
 
     try {
       if (!installedBefore) {
@@ -392,6 +398,10 @@ export class NodeProfileManager implements ProfileManager {
       failureStage = 'write'
       const renderBase = await this.readPatchSnapshot(patchPath)
       rollbackExpected = renderBase
+      if (pluginAdded && original.exists && !sameSnapshot(original, renderBase)) {
+        restoreOriginalAllowed = false
+        throw new ProfileConflictError()
+      }
       output = renderAttachment(parsePatch(renderBase.bytes ?? Buffer.from('[]\n')), normalizedEndpoint)
       // Portable best-effort CAS: within the trusted profile directory, compare
       // bytes plus file identity immediately before the atomic rename.
@@ -408,10 +418,15 @@ export class NodeProfileManager implements ProfileManager {
 
       failureStage = 'validation'
       await validate()
+      const afterValidation = await this.readPatchSnapshot(patchPath)
+      if (rollbackExpected === undefined || !sameSnapshot(afterValidation, rollbackExpected)) {
+        throw new ProfileConflictError()
+      }
       signal?.throwIfAborted()
     } catch (primaryError) {
       const rollbackFailures: string[] = []
       let patchRollbackBlocked = false
+      let effectivePrimaryError = primaryError
 
       if (!installedBefore && !pluginAdded && failureStage === 'install') {
         try {
@@ -422,6 +437,10 @@ export class NodeProfileManager implements ProfileManager {
         if (pluginAdded) {
           try {
             rollbackExpected = await this.readPatchSnapshot(patchPath)
+            if (original.exists && !sameSnapshot(original, rollbackExpected)) {
+              restoreOriginalAllowed = false
+              effectivePrimaryError = new ProfileConflictError()
+            }
           } catch (error) {
             rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
             patchRollbackBlocked = true
@@ -443,17 +462,23 @@ export class NodeProfileManager implements ProfileManager {
       }
 
       if (pluginAdded) {
+        const beforeRemove = rollbackCurrent
         let pluginRemoved = false
         try {
           await this.runPlugin(name, 'remove')
           pluginRemoved = true
         } catch {
           rollbackFailures.push('plugin')
-          rollbackCurrent = undefined
         }
-        if (pluginRemoved && rollbackCurrent !== undefined) {
+        if (beforeRemove !== undefined) {
           try {
-            rollbackCurrent = await this.readPatchSnapshot(patchPath)
+            const afterRemove = await this.readPatchSnapshot(patchPath)
+            if (!sameSnapshot(beforeRemove, afterRemove)) {
+              rollbackFailures.push('patch-conflict')
+              rollbackCurrent = undefined
+            } else {
+              rollbackCurrent = pluginRemoved ? afterRemove : undefined
+            }
           } catch (error) {
             rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
             rollbackCurrent = undefined
@@ -461,7 +486,7 @@ export class NodeProfileManager implements ProfileManager {
         }
       }
 
-      if (rollbackCurrent !== undefined) {
+      if (rollbackCurrent !== undefined && restoreOriginalAllowed) {
         try {
           await this.restoreSnapshot(patchPath, original, rollbackCurrent)
         } catch (error) {
@@ -470,15 +495,15 @@ export class NodeProfileManager implements ProfileManager {
       }
 
       if (rollbackFailures.length === 0) {
-        const cancellation = cancellationFrom(primaryError, signal)
+        const cancellation = cancellationFrom(effectivePrimaryError, signal)
         if (cancellation !== undefined) throw cancellation
-        if (primaryError instanceof CliError) throw primaryError
+        if (effectivePrimaryError instanceof CliError) throw effectivePrimaryError
       }
       throw profileWriteError(
         'Unable to attach SearXNG to the DSH profile',
         {
           primaryFailure: failureStage,
-          primaryError: primaryErrorClass(primaryError, failureStage, signal),
+          primaryError: primaryErrorClass(effectivePrimaryError, failureStage, signal),
           rollbackFailures,
         },
       )

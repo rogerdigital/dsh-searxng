@@ -442,7 +442,7 @@ describe('rollback and file safety', () => {
     })
   })
 
-  it('restores the original only after successful remove-side patch recreation', async () => {
+  it('preserves successful remove-side patch recreation as an ownership conflict', async () => {
     const events: string[] = []
     const runner = new RecordingRunner()
     let patchPath = ''
@@ -467,13 +467,16 @@ describe('rollback and file safety', () => {
     await expect(created.manager.attach('web', 'http://localhost:8080', async () => {
       events.push('validate')
       throw new Error('validation failed')
-    })).rejects.toMatchObject({ code: 'E_PROFILE_WRITE' })
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { rollbackFailures: ['patch-conflict'] },
+    })
 
-    expect(events).toEqual(['write', 'validate', 'remove', 'write'])
-    await expect(fs.readFile(patchPath)).resolves.toEqual(original)
+    expect(events).toEqual(['write', 'validate', 'remove'])
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe('# recreated by remove\n[]\n')
   })
 
-  it('removes a patch recreated by successful plugin cleanup when the original was absent', async () => {
+  it('preserves a patch recreated by successful plugin cleanup when the original was absent', async () => {
     const runner = new RecordingRunner()
     const { manager, patchPath } = await fixture({ runner })
     runner.handler = async (_command, args) => {
@@ -483,8 +486,11 @@ describe('rollback and file safety', () => {
 
     await expect(manager.attach('web', 'http://localhost:8080', async () => {
       throw new Error('validation failed')
-    })).rejects.toMatchObject({ code: 'E_PROFILE_WRITE' })
-    await expect(fs.lstat(patchPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { rollbackFailures: ['patch-conflict'] },
+    })
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe('# recreated by remove\n[]\n')
   })
 
   it('preserves a patch modified by failed plugin cleanup and reports the cleanup failure', async () => {
@@ -503,9 +509,33 @@ describe('rollback and file safety', () => {
       throw new Error('validation failed')
     })).rejects.toMatchObject({
       code: 'E_PROFILE_WRITE',
-      details: { rollbackFailures: expect.arrayContaining(['plugin']) },
+      details: { rollbackFailures: expect.arrayContaining(['plugin', 'patch-conflict']) },
     })
     await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(partial)
+  })
+
+  it('preserves a concurrent edit made while successful plugin cleanup is running', async () => {
+    const runner = new RecordingRunner()
+    const concurrent = '# concurrent during remove\n- id: newest\n'
+    const { manager, patchPath } = await fixture({ patch: '[]\n', runner })
+    runner.handler = async (_command, args) => {
+      if (args.includes('remove')) {
+        await new Promise<void>((resolve) => {
+          setTimeout(() => {
+            void fs.writeFile(patchPath, concurrent).then(() => resolve())
+          }, 0)
+        })
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {
+      throw new Error('validation failed')
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { rollbackFailures: ['patch-conflict'] },
+    })
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(concurrent)
   })
 
   it('preserves command cancellation after confirming there was no install side effect', async () => {
@@ -583,19 +613,29 @@ describe('rollback and file safety', () => {
     expect(ids(output)).toEqual(['initialized', 'web-search-searxng'])
   })
 
-  it('renders from an existing patch edited during add', async () => {
+  it('preserves an existing patch changed during add and reports a conflict before validation', async () => {
     const runner = new RecordingRunner()
-    const { manager, dir, patchPath } = await fixture({ patch: '[]\n', runner })
-    runner.handler = async () => {
-      await fs.writeFile(join(dir, 'package.json'), JSON.stringify({ dependencies: { 'dsh-searxng': '0.1.0' } }))
-      await fs.writeFile(patchPath, '# changed during add\n- id: concurrent-add\n')
+    const original = '# original A\n- id: original\n'
+    const changed = '# changed B during add\n- id: changed\n'
+    const { manager, dir, patchPath } = await fixture({ patch: original, runner })
+    runner.handler = async (_command, args) => {
+      if (args.includes('add')) {
+        await fs.writeFile(join(dir, 'package.json'), JSON.stringify({ dependencies: { 'dsh-searxng': '0.1.0' } }))
+        await fs.writeFile(patchPath, changed)
+      }
       return { exitCode: 0, stdout: '', stderr: '' }
     }
+    let validations = 0
 
-    await manager.attach('web', 'http://localhost:8080', async () => {})
-    const output = await fs.readFile(patchPath, 'utf8')
-    expect(output).toContain('# changed during add')
-    expect(ids(output)).toEqual(['concurrent-add', 'web-search-searxng'])
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {
+      validations += 1
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { primaryError: 'profile-conflict' },
+    })
+    expect(validations).toBe(0)
+    expect(runner.calls.at(-1)?.args).toEqual(['plugin', '--profile', 'web', 'remove', 'dsh-searxng'])
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(changed)
   })
 
   it('does not overwrite a concurrent patch change observed before commit', async () => {
@@ -662,6 +702,40 @@ describe('rollback and file safety', () => {
     })
     expect((await fs.lstat(patchPath)).ino).toBe(replacementInode)
     expect(await fs.readFile(patchPath, 'utf8')).toContain('dsh-searxng managed attachment')
+  })
+
+  it('does not report success when validation returns after a different-byte edit', async () => {
+    const concurrent = '# validation returned after edit\n- id: newest\n'
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.0' } },
+      patch: '[]\n',
+    })
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {
+      await fs.writeFile(patchPath, concurrent)
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { primaryError: 'profile-conflict', rollbackFailures: ['patch-conflict'] },
+    })
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(concurrent)
+  })
+
+  it('does not report success when validation returns after a same-byte inode replacement', async () => {
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.0' } },
+      patch: '[]\n',
+    })
+    let replacementInode: number | undefined
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {
+      const managedBytes = await fs.readFile(patchPath)
+      const replacement = `${patchPath}.validation-returned`
+      await fs.writeFile(replacement, managedBytes)
+      await fs.rename(replacement, patchPath)
+      replacementInode = (await fs.lstat(patchPath)).ino
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { primaryError: 'profile-conflict', rollbackFailures: ['patch-conflict'] },
+    })
+    expect((await fs.lstat(patchPath)).ino).toBe(replacementInode)
   })
 
   it('cleans temporary files and restores the original after a directory fsync failure', async () => {
@@ -887,6 +961,31 @@ describe('YAML document shape', () => {
       .rejects.toMatchObject({ code: 'E_PROFILE_WRITE', details: {} })
     expect(runner.calls).toEqual([])
     await expect(fs.readFile(patchPath)).resolves.toEqual(original)
+  })
+
+  it('rejects an anchored target config safely before first attachment', async () => {
+    const patch = `- id: web-search-searxng
+  config: &provider
+    timeoutMs: 1000
+    baseURL: http://old.invalid
+`
+    const original = Buffer.from(patch)
+    const { manager, runner, patchPath } = await fixture({ patch })
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {}))
+      .rejects.toMatchObject({ code: 'E_PROFILE_WRITE', details: {} })
+    expect(runner.calls).toEqual([])
+    await expect(fs.readFile(patchPath)).resolves.toEqual(original)
+  })
+
+  it('supports a normal first attach, reattach, and detach lifecycle', async () => {
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.0' } },
+      patch: '[]\n',
+    })
+    await manager.attach('web', 'http://first.example', async () => {})
+    await manager.attach('web', 'http://second.example', async () => {})
+    await manager.detach('web')
+    expect(parse(await fs.readFile(patchPath, 'utf8'))).toEqual([])
   })
 
   it('rejects removing a managed anchor referenced by a later retained alias', async () => {
