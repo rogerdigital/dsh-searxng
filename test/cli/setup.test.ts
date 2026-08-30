@@ -394,6 +394,38 @@ describe('setup', () => {
     expect(test.state().profiles.work).toEqual({ mode: 'external', endpoint: 'https://search.example/path' })
   })
 
+  it('is byte-level idempotent for an already attached matching external profile', async () => {
+    const endpoint = 'https://search.example/path'
+    const initial: StateV1 = {
+      schemaVersion: 1,
+      profiles: { work: { mode: 'external', endpoint } },
+    }
+    const test = harness({ state: initial, profileAttached: true })
+    await expect(setup({ profile: 'work', port: 8080, url: endpoint }, test.deps))
+      .resolves.toEqual({ profile: 'work', endpoint, reused: true })
+    expect(test.profiles.attach).not.toHaveBeenCalled()
+    expect(test.deps.state.write).not.toHaveBeenCalled()
+    expect(test.state()).toEqual(initial)
+    expect(test.events).toEqual([
+      'lock', 'environment', 'state-read', 'dsh-preflight', 'profile-preview',
+      'real-search', 'provider-search', 'unlock',
+    ])
+  })
+
+  it('does not mistake an attached external profile with mismatched state for an idempotent setup', async () => {
+    const endpoint = 'https://search.example/path'
+    const initial: StateV1 = {
+      schemaVersion: 1,
+      profiles: { work: { mode: 'external', endpoint: 'https://old.example' } },
+    }
+    const test = harness({ state: initial, profileAttached: true })
+    await expect(setup({ profile: 'work', port: 8080, url: endpoint }, test.deps))
+      .resolves.toEqual({ profile: 'work', endpoint, reused: false })
+    expect(test.profiles.attach).toHaveBeenCalledOnce()
+    expect(test.deps.state.write).toHaveBeenCalledOnce()
+    expect(test.state().profiles.work).toEqual({ mode: 'external', endpoint })
+  })
+
   it('requires dsh before every external profile operation', async () => {
     const missing = new CliError('E_DSH_MISSING', 'missing', 'install dsh')
     const test = harness({ dshError: missing })
@@ -484,6 +516,51 @@ describe('setup', () => {
     expect(test.events.slice(-4)).toEqual(['state-write', 'ownership', 'docker-down', 'unlock'])
   })
 
+  it('restores previous state after a managed state write commits bytes and then throws', async () => {
+    const credential = 'Bearer fail-after-private-token'
+    const previous: StateV1 = { schemaVersion: 1, profiles: { old: { mode: 'external', endpoint: 'https://old.example' } } }
+    const test = harness({
+      state: previous,
+      writeBehaviors: ['fail-after', 'success'],
+      ownershipSequence: ['absent', 'owned'],
+      profileConfig: { authHeader: credential },
+    })
+    const error = await setup({ profile: 'web', port: 8080 }, test.deps).catch((cause: unknown) => cause)
+    expect(error).toMatchObject({ code: 'E_INTERNAL' })
+    expect(test.profileEndpoint()).toBe('before')
+    expect(test.state()).toEqual(previous)
+    expect(test.writes.at(-1)).toEqual(previous)
+    expect(test.events.slice(-4)).toEqual(['state-write', 'ownership', 'docker-down', 'unlock'])
+    expect(JSON.stringify((error as CliError).toJSON())).not.toContain(credential)
+  })
+
+  it('restores previous state after an external state write commits bytes and then throws', async () => {
+    const previous: StateV1 = { schemaVersion: 1, profiles: { old: { mode: 'external', endpoint: 'https://old.example' } } }
+    const test = harness({ state: previous, writeBehaviors: ['fail-after', 'success'] })
+    await expect(setup({ profile: 'web', port: 8080, url: 'https://search.example' }, test.deps))
+      .rejects.toMatchObject({ code: 'E_INTERNAL' })
+    expect(test.profileEndpoint()).toBe('before')
+    expect(test.state()).toEqual(previous)
+    expect(test.writes.at(-1)).toEqual(previous)
+    expect(test.docker.down).not.toHaveBeenCalled()
+  })
+
+  it('aggregates an ambiguous state write failure when restoring previous state also fails', async () => {
+    const credential = 'Bearer restore-private-token'
+    const test = harness({
+      writeBehaviors: ['fail-after', 'fail-before'],
+      ownershipSequence: ['absent', 'owned'],
+      profileConfig: { authHeader: credential },
+    })
+    const error = await setup({ profile: 'web', port: 8080 }, test.deps).catch((cause: unknown) => cause)
+    expect(error).toMatchObject({
+      code: 'E_INTERNAL',
+      details: { rollbackFailures: ['state'] },
+    })
+    expect(test.docker.down).toHaveBeenCalledWith(expect.objectContaining({ composePath: COMPOSE_PATH }), true)
+    expect(JSON.stringify((error as CliError).toJSON())).not.toContain(credential)
+  })
+
   it('continues all rollback steps and reports only safe categories when rollback also fails', async () => {
     const credential = 'Bearer private-token'
     const test = harness({
@@ -533,8 +610,16 @@ describe('setup', () => {
     vi.mocked(test.deps.state.read).mockRejectedValueOnce(new Error('secret=q-private'))
     await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toMatchObject({ code: 'E_INTERNAL', message: 'Setup failed unexpectedly' })
     expect(test.events.at(-1)).toBe('unlock')
-    await expect(setup({ profile: 'web', port: 8080 }, { ...test.deps, state: { ...test.deps.state, write: async () => { throw new Error('query=private') } } }))
-      .rejects.toMatchObject({ code: 'E_INTERNAL', message: 'Setup failed unexpectedly' })
+    const writeError = await setup(
+      { profile: 'web', port: 8080 },
+      { ...test.deps, state: { ...test.deps.state, write: async () => { throw new Error('query=private') } } },
+    ).catch((cause: unknown) => cause)
+    expect(writeError).toMatchObject({
+      code: 'E_INTERNAL',
+      message: 'Setup failed and rollback was incomplete',
+      details: { rollbackFailures: ['state'] },
+    })
+    expect(JSON.stringify((writeError as CliError).toJSON())).not.toContain('query=private')
   })
 })
 

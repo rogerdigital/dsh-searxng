@@ -163,20 +163,20 @@ async function attachAndCommit(
   dependencies: SetupDependencies,
   signal?: AbortSignal,
 ): Promise<void> {
-  let stateCommitted = false
+  let stateWriteAttempted = false
   try {
     await dependencies.profiles.attach(
       input.profile,
       endpoint,
       async (config) => {
         await dependencies.searxng.providerSearch(config, signal)
+        stateWriteAttempted = true
         await dependencies.state.write(next)
-        stateCommitted = true
       },
       signal,
     )
   } catch (primary) {
-    if (!stateCommitted) throw primary
+    if (!stateWriteAttempted) throw primary
     try {
       await dependencies.state.write(previous)
     } catch {
@@ -217,6 +217,10 @@ async function externalSetup(
 ): Promise<SetupResult> {
   const preview = await dependencies.profiles.preview(input.profile, endpoint, signal)
   await dependencies.searxng.realSearch(preview.config, signal)
+  if (preview.attached && profileStateMatches(previous, input, endpoint, 'external')) {
+    await dependencies.searxng.providerSearch(preview.config, signal)
+    return { profile: input.profile, endpoint, reused: true }
+  }
   const next = externalState(previous, input, endpoint)
   await attachAndCommit(input, endpoint, previous, next, dependencies, signal)
   return { profile: input.profile, endpoint, reused: false }
