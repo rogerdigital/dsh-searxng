@@ -20,7 +20,21 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> => {
 function redactValue(value: unknown, seen: WeakSet<object>): unknown {
   try {
     if (value !== null && typeof value === 'object') { if (seen.has(value)) return REDACTED; seen.add(value) }
-    if (Array.isArray(value)) return Array.from(value, (item) => redactValue(item, seen))
+    if (Array.isArray(value)) {
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length')
+      if (!lengthDescriptor || !('value' in lengthDescriptor) || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0) return REDACTED
+      const result = new Array(lengthDescriptor.value)
+      for (const key of Reflect.ownKeys(value)) {
+        if (typeof key !== 'string' || key === 'length') continue
+        const index = Number(key)
+        if (!Number.isSafeInteger(index) || index < 0 || index >= lengthDescriptor.value || String(index) !== key) continue
+        let descriptor: PropertyDescriptor | undefined
+        try { descriptor = Object.getOwnPropertyDescriptor(value, key) } catch { result[index] = REDACTED; continue }
+        if (!descriptor?.enumerable) continue
+        result[index] = 'value' in descriptor ? redactValue(descriptor.value, seen) : REDACTED
+      }
+      return result
+    }
     if (value instanceof Error) return REDACTED
     if (isPlainObject(value)) {
       const result: Record<string, unknown> = {}

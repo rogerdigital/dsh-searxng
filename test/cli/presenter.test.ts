@@ -42,6 +42,7 @@ describe('CLI presenters', () => {
     const io = writers(); const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic; const sparse = new Array(2)
     presentSuccess({ undefined: undefined, bigint: BigInt(2), nan: NaN, cyclic, date: new Date('secret'), sparse }, { format: 'json', stdout: io.out, stderr: io.err })
     expect(() => JSON.parse(io.stdout[0]!)).not.toThrow()
+    expect(JSON.parse(io.stdout[0]!).sparse).toEqual([null, null])
     const error = new Error('secret cause'); error.name = 'secret name'
     presentError(error, { format: 'json', stdout: io.out, stderr: io.err })
     expect(() => JSON.parse(io.stderr[0]!)).not.toThrow()

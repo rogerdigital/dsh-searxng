@@ -32,6 +32,7 @@ function asSpawn(child: FakeChild): typeof spawn {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.useRealTimers()
 })
 
@@ -187,8 +188,9 @@ describe('NodeProcessRunner', () => {
     const child = createFakeChild(12345)
     const baselineErrorListeners = child.listenerCount('error')
     const baselineCloseListeners = child.listenerCount('close')
+    const terminationStrategy = { terminate: vi.fn() }
     const controller = new AbortController()
-    const pending = new NodeProcessRunner({ spawn: asSpawn(child), terminationGraceMs: 10, terminationForceMs: 20 }).run('command', ['--token', 'secret'], { signal: controller.signal })
+    const pending = new NodeProcessRunner({ spawn: asSpawn(child), terminationStrategy, terminationGraceMs: 10, terminationForceMs: 20 }).run('command', ['--token', 'secret'], { signal: controller.signal })
     let rejectionCount = 0
     const observed = pending.then(
       () => new Error('expected cleanup rejection'),
@@ -199,9 +201,10 @@ describe('NodeProcessRunner', () => {
     )
 
     controller.abort()
-    expect(child.kill).toHaveBeenNthCalledWith(1, 'SIGTERM')
+    expect(terminationStrategy.terminate).toHaveBeenNthCalledWith(1, child, false)
     await vi.advanceTimersByTimeAsync(10)
-    expect(child.kill).toHaveBeenNthCalledWith(2, 'SIGKILL')
+    expect(terminationStrategy.terminate).toHaveBeenNthCalledWith(2, child, true)
+    expect(child.kill).not.toHaveBeenCalled()
     await vi.advanceTimersByTimeAsync(20)
 
     const error = await observed

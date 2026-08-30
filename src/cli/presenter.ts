@@ -7,7 +7,7 @@ const SERIALIZATION_FALLBACK = '{"code":"E_INTERNAL","message":"Unable to serial
 function stableJson(value: unknown): string {
   if (value === undefined || typeof value === 'bigint') return 'null'
   if (typeof value === 'number' && !Number.isFinite(value)) return 'null'
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  if (Array.isArray(value)) return `[${Array.from(value, stableJson).join(',')}]`
   if (value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
     return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`).join(',')}}`
   }

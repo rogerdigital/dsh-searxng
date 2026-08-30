@@ -30,12 +30,30 @@ describe('redact', () => {
   it('returns a fixed placeholder for getPrototypeOf-throwing and revoked proxies', () => {
     const prototypeProxy = new Proxy({}, { getPrototypeOf() { throw new Error('prototype-secret') } })
     const revocable = Proxy.revocable({}, {})
+    const revocableArray = Proxy.revocable([], {})
     revocable.revoke()
+    revocableArray.revoke()
 
     expect(() => redact(prototypeProxy)).not.toThrow()
     expect(redact(prototypeProxy)).toBe('[REDACTED]')
     expect(() => redact(revocable.proxy)).not.toThrow()
     expect(redact(revocable.proxy)).toBe('[REDACTED]')
+    expect(() => redact(revocableArray.proxy)).not.toThrow()
+    expect(redact(revocableArray.proxy)).toBe('[REDACTED]')
+  })
+
+  it('redacts array accessors without invoking indexed getters and preserves holes', () => {
+    let getterInvocations = 0
+    const value = new Array(3)
+    Object.defineProperty(value, '0', { enumerable: true, get() { getterInvocations += 1; return 'array-secret' } })
+    value[2] = 'safe'
+
+    const result = redact(value)
+    expect(getterInvocations).toBe(0)
+    expect(result).toEqual(['[REDACTED]', , 'safe'])
+    expect(Array.isArray(result)).toBe(true)
+    if (Array.isArray(result)) expect(1 in result).toBe(false)
+    expect(JSON.stringify(result)).toBe('["[REDACTED]",null,"safe"]')
   })
 
   it('skips non-enumerable properties instead of serializing hidden values', () => {
