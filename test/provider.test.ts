@@ -537,5 +537,42 @@ describe('SearxngSearchProvider', () => {
         return true
       })
     })
+
+    it('cancels an unread non-JSON success body before reporting the contract error', async () => {
+      let cancellations = 0
+      const body = new ReadableStream({ cancel: () => { cancellations += 1 } })
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      })))
+
+      await expect(new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' }))
+        .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      expect(cancellations).toBe(1)
+    })
+
+    it('does not let stalled non-JSON body cancellation delay the contract error', async () => {
+      vi.useFakeTimers()
+      let cancellations = 0
+      const body = new ReadableStream({
+        cancel: () => {
+          cancellations += 1
+          return new Promise<void>(() => {})
+        },
+      })
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      })))
+      let rejection: unknown
+      void new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' }).catch((error: unknown) => {
+        rejection = error
+      })
+
+      await vi.advanceTimersByTimeAsync(1)
+
+      expect(rejection).toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      expect(cancellations).toBe(1)
+    })
   })
 })

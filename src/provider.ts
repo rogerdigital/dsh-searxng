@@ -128,6 +128,7 @@ async function requestJsonAttempt(
     if (!response.ok) return { response }
     const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
     if (!/(?:^|[;/\s])(?:application\/json|[^;/\s]+\+json)(?:[;/\s]|$)/.test(contentType)) {
+      cancelResponseBody(response)
       throw new RequestFailure('contract', 'SearXNG returned a non-JSON response')
     }
     try {
