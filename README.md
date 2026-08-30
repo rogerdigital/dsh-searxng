@@ -1,5 +1,7 @@
 # dsh-searxng
 
+[![dsh-vet](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rogerdigital/dsh-searxng/main/.dsh-vet/badge.json)](https://github.com/rogerdigital/dsh-searxng/blob/main/.dsh-vet/report.json)
+
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plugin that registers a
 [SearXNG](https://docs.searxng.org/)-backed search provider into the web capability seam
 (`ctx.web`), giving your agent `web_search` through a **free, self-hosted, key-less** metasearch
