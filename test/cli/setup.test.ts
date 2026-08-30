@@ -125,6 +125,7 @@ function harness(options: HarnessOptions = {}) {
       if (options.downError !== undefined) throw options.downError
     }),
     logs: vi.fn(async () => ''),
+    deploymentStatus: vi.fn(async () => ({ ownership: 'owned' as const, container: 'running' as const, composePath: COMPOSE_PATH })),
   }
   const assets: AssetRenderer = {
     render: vi.fn(async (input) => {
@@ -134,6 +135,7 @@ function harness(options: HarnessOptions = {}) {
     }),
   }
   const searxng: SearxngProbe = {
+    http: vi.fn(async () => {}),
     readiness: vi.fn(async () => {
       events.push('readiness')
       const error = readinessErrors.shift()
@@ -185,6 +187,7 @@ function harness(options: HarnessOptions = {}) {
       } catch (error) { profileEndpoint = previous; throw error }
     }),
     detach: vi.fn(async () => {}),
+    uninstall: vi.fn(async () => {}),
   }
   const deps: SetupDependencies = {
     environment,
@@ -888,7 +891,7 @@ describe('production CLI entry', () => {
     expect(stderr[0]).not.toContain(secretUrl)
   })
 
-  it.each(['status', 'doctor', 'remove'])('fails unwired %s explicitly instead of silently succeeding', async (command) => {
+  it.each(['status', 'doctor'])('wires %s and returns structured unhealthy diagnostics', async (command) => {
     const stdout: string[] = []
     const stderr: string[] = []
     const exitCode = await runCli([command, '--json'], {
@@ -896,9 +899,22 @@ describe('production CLI entry', () => {
       stdout: (text) => stdout.push(text),
       stderr: (text) => stderr.push(text),
     })
-    expect(exitCode).toBe(2)
-    expect(stdout).toEqual([])
-    expect(JSON.parse(stderr[0]!)).toMatchObject({ code: 'E_USAGE', message: expect.stringMatching(/not available yet/i) })
+    expect(exitCode).toBe(1)
+    expect(JSON.parse(stdout[0]!)).toMatchObject({ healthy: false, profile: 'web' })
+    expect(stderr).toEqual([])
+  })
+
+  it('wires idempotent profile removal through the CLI', async () => {
+    const stdout: string[] = []
+    const stderr: string[] = []
+    const exitCode = await runCli(['remove', '--json'], {
+      dependencies: harness().deps,
+      stdout: (text) => stdout.push(text),
+      stderr: (text) => stderr.push(text),
+    })
+    expect(exitCode).toBe(0)
+    expect(JSON.parse(stdout[0]!)).toEqual({ dataPurged: false, profile: 'web', profileRemoved: false, serviceRemoved: false })
+    expect(stderr).toEqual([])
   })
 
   it('maps operational errors to exit one and exactly one error output', async () => {

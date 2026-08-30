@@ -4,14 +4,17 @@ import { createServer, type Server } from 'node:net'
 import { realpath } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { resolve } from 'node:path'
+import { createInterface } from 'node:readline/promises'
 import { parseCliArgs } from './cli/args.ts'
 import { FileAssetRenderer } from './cli/assets.ts'
 import { CliDockerAdapter } from './cli/docker.ts'
+import { diagnose } from './cli/diagnostics.ts'
 import { managedDir, NodeEnvironmentService, resolveDshHome, type PortChecker } from './cli/environment.ts'
 import { CliError } from './cli/errors.ts'
 import { presentError, presentSuccess } from './cli/presenter.ts'
 import { NodeProcessRunner, type CommandRunner } from './cli/process.ts'
 import { NodeProfileManager } from './cli/profile.ts'
+import { remove, removeManagedDirectory, type RemoveDependencies } from './cli/remove.ts'
 import { DefaultSearxngProbe } from './cli/searxng.ts'
 import { setup, type SetupDependencies } from './cli/setup.ts'
 import { FileStateStore } from './cli/state.ts'
@@ -19,11 +22,16 @@ import { FileStateStore } from './cli/state.ts'
 type Writer = (text: string) => void
 
 export interface RunCliOptions {
-  dependencies?: SetupDependencies
-  createDependencies?: () => SetupDependencies
+  dependencies?: SetupDependencies | CliDependencies
+  createDependencies?: () => SetupDependencies | CliDependencies
   signal?: AbortSignal
   stdout?: Writer
   stderr?: Writer
+}
+
+export interface CliDependencies extends SetupDependencies {
+  confirmPurge: RemoveDependencies['confirmPurge']
+  removeManagedDirectory: RemoveDependencies['removeManagedDirectory']
 }
 
 export interface ProductionDependencyOptions {
@@ -109,7 +117,18 @@ export function createLoopbackPortChecker(serverFactory: () => Server = createSe
   }
 }
 
-export function createProductionDependencies(options: ProductionDependencyOptions = {}): SetupDependencies {
+async function confirmPurge(volumes: readonly string[]): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return false
+  const terminal = createInterface({ input: process.stdin, output: process.stdout })
+  try {
+    const answer = await terminal.question(`Permanently delete Docker volume ${volumes.join(', ')}? [y/N] `)
+    return /^(?:y|yes)$/i.test(answer.trim())
+  } finally {
+    terminal.close()
+  }
+}
+
+export function createProductionDependencies(options: ProductionDependencyOptions = {}): CliDependencies {
   const env = options.env ?? process.env
   const dshHome = resolveDshHome(env, options.homedir)
   const runner = options.runner ?? new NodeProcessRunner()
@@ -122,6 +141,8 @@ export function createProductionDependencies(options: ProductionDependencyOption
     searxng: new DefaultSearxngProbe(),
     profiles: new NodeProfileManager({ commandRunner: runner, dshHome }),
     now: () => new Date(),
+    confirmPurge,
+    removeManagedDirectory,
   }
 }
 
@@ -139,36 +160,68 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
     return 2
   }
 
-  if (command.command !== 'setup') {
-    presentError(usageError(`The ${command.command} command is not available yet`), presenter)
-    return 2
-  }
-
   try {
     const dependencies = options.dependencies ?? options.createDependencies?.() ?? createProductionDependencies()
-    const result = await setup(
+    if (command.command === 'setup') {
+      const result = await setup(
+        {
+          profile: command.profile,
+          port: command.port,
+          portExplicit: command.portExplicit,
+          ...(command.url === undefined ? {} : { url: command.url }),
+        },
+        dependencies,
+        options.signal,
+      )
+      if (format === 'json') presentSuccess(result, presenter)
+      else stdout([
+          'SearXNG ready',
+          `Profile: ${result.profile}`,
+          `Endpoint: ${result.endpoint}`,
+          'Validation: real search and provider search passed',
+          `Deployment: ${result.reused ? 'reused' : 'created or recovered'}`,
+          `Next: dsh --profile ${result.profile}`,
+          '',
+        ].join('\n'))
+      return 0
+    }
+
+    if (command.command === 'status' || command.command === 'doctor') {
+      const result = await diagnose(command.profile, command.command, dependencies, options.signal)
+      if (format === 'json') presentSuccess(result, presenter)
+      else if (result.healthy) stdout(`${command.command === 'status' ? 'Status' : 'Doctor'}: healthy\n`)
+      else {
+        const failure = result.checks.find((check) => check.status === 'fail')?.error
+        presentError(failure === undefined
+          ? new CliError('E_INTERNAL', 'Diagnostics failed', 'Inspect the diagnostic output')
+          : new CliError(failure.code, failure.message, failure.action), presenter)
+      }
+      return result.healthy ? 0 : 1
+    }
+
+    if (command.command !== 'remove') throw usageError('Unsupported command')
+    const extras = dependencies as Partial<CliDependencies>
+    const result = await remove(
       {
         profile: command.profile,
-        port: command.port,
-        portExplicit: command.portExplicit,
-        ...(command.url === undefined ? {} : { url: command.url }),
+        service: command.service,
+        purgeData: command.purgeData,
+        confirmed: command.yes,
       },
-      dependencies,
+      {
+        ...dependencies,
+        confirmPurge: extras.confirmPurge ?? (async () => false),
+        removeManagedDirectory: extras.removeManagedDirectory ?? removeManagedDirectory,
+      },
       options.signal,
     )
-    if (format === 'json') {
-      presentSuccess(result, presenter)
-    } else {
-      stdout([
-        'SearXNG ready',
-        `Profile: ${result.profile}`,
-        `Endpoint: ${result.endpoint}`,
-        'Validation: real search and provider search passed',
-        `Deployment: ${result.reused ? 'reused' : 'created or recovered'}`,
-        `Next: dsh --profile ${result.profile}`,
-        '',
-      ].join('\n'))
-    }
+    if (format === 'json') presentSuccess(result, presenter)
+    else stdout([
+      `Profile ${result.profile}: ${result.profileRemoved ? 'detached' : 'not attached'}`,
+      `Service: ${result.serviceRemoved ? 'removed' : 'retained'}`,
+      `Data: ${result.dataPurged ? 'purged' : 'retained'}`,
+      '',
+    ].join('\n'))
     return 0
   } catch (error) {
     presentError(error, presenter)

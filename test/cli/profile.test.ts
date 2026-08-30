@@ -46,6 +46,7 @@ class RecordingRunner implements CommandRunner {
       } catch {}
       manifest.dependencies ??= {}
       if (args.includes('add')) manifest.dependencies['dsh-searxng'] = '0.1.1'
+      if (args.includes('remove')) delete manifest.dependencies['dsh-searxng']
       await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
     }
     return response
@@ -96,6 +97,7 @@ describe('ProfileManager contract and discovery', () => {
       validate: async (_profile, _endpoint, callback) => { await callback({ baseURL: 'http://localhost:8080' }) },
       attach: async () => {},
       detach: async () => {},
+      uninstall: async () => {},
     }
     await expect(fake.inspect('web')).resolves.toMatchObject({ installed: false })
   })
@@ -276,6 +278,28 @@ describe('ProfileManager contract and discovery', () => {
   it.each(['../web', 'a/b', 'a\\b'])('rejects the unsafe profile name %s', async (profile) => {
     const { manager } = await fixture()
     await expect(manager.inspect(profile)).rejects.toMatchObject({ code: 'E_PROFILE_INVALID' })
+  })
+})
+
+describe('ProfileManager explicit uninstall', () => {
+  it('uses the standard DSH command and verifies removal from the manifest', async () => {
+    const test = await fixture({ packageJson: { dependencies: { 'dsh-searxng': '0.1.1', other: '1.0.0' } } })
+    await test.manager.uninstall('web')
+    expect(test.runner.calls).toContainEqual({ command: 'dsh', args: ['plugin', '--profile', 'web', 'remove', 'dsh-searxng'] })
+    expect(JSON.parse(await fs.readFile(join(test.dir, 'package.json'), 'utf8'))).toMatchObject({ dependencies: { other: '1.0.0' } })
+  })
+
+  it('fails when the command reports success without removing the plugin', async () => {
+    const runner = new RecordingRunner()
+    runner.simulatePluginEffects = false
+    const test = await fixture({ packageJson: { dependencies: { 'dsh-searxng': '0.1.1' } }, runner })
+    await expect(test.manager.uninstall('web')).rejects.toMatchObject({ code: 'E_PROFILE_WRITE' })
+  })
+
+  it('is a command-free no-op when the plugin is already absent', async () => {
+    const test = await fixture({ packageJson: { dependencies: { other: '1.0.0' } } })
+    await test.manager.uninstall('web')
+    expect(test.runner.calls).toEqual([])
   })
 })
 

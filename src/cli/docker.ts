@@ -12,6 +12,13 @@ export interface DockerAdapter {
   restart(identity: ManagedIdentity, signal?: AbortSignal): Promise<void>
   down(identity: ManagedIdentity, volumes: boolean, signal?: AbortSignal): Promise<void>
   logs(identity: ManagedIdentity, tail: number, signal?: AbortSignal): Promise<string>
+  deploymentStatus(identity: ManagedIdentity, signal?: AbortSignal): Promise<DockerDeploymentStatus>
+}
+
+export interface DockerDeploymentStatus {
+  ownership: 'absent' | 'owned'
+  container: 'absent' | 'running' | 'stopped'
+  composePath?: string
 }
 
 export interface CliDockerAdapterOptions {
@@ -196,6 +203,34 @@ export class CliDockerAdapter implements DockerAdapter {
     return anyOwned ? 'owned' : 'absent'
   }
 
+  async deploymentStatus(identity: ManagedIdentity, signal?: AbortSignal): Promise<DockerDeploymentStatus> {
+    validateIdentity(identity)
+    signal?.throwIfAborted()
+    const container = await this.inspectContainer(identity, signal)
+    const network = await this.inspectResource(identity, 'network', signal)
+    const volume = await this.inspectResource(identity, 'volume', signal)
+    const ownership = container === undefined && network === 'absent' && volume === 'absent' ? 'absent' : 'owned'
+    if (container === undefined) return { ownership, container: 'absent' }
+    const config = container.Config
+    const labels = config !== null && typeof config === 'object' && !Array.isArray(config)
+      ? (config as Record<string, unknown>).Labels
+      : undefined
+    if (labels === null || typeof labels !== 'object' || Array.isArray(labels)) throw foreignResource()
+    const composePath = (labels as Record<string, unknown>)['com.docker.compose.project.config_files']
+    const project = (labels as Record<string, unknown>)['com.docker.compose.project']
+    if (typeof composePath !== 'string' || composePath.includes(',') || project !== identity.projectName) throw foreignResource()
+    try { validateIdentity({ ...identity, composePath }) } catch { throw foreignResource() }
+    const state = container.State
+    if (state === null || typeof state !== 'object' || Array.isArray(state) || typeof (state as Record<string, unknown>).Running !== 'boolean') {
+      throw foreignResource()
+    }
+    return {
+      ownership,
+      container: (state as Record<string, unknown>).Running ? 'running' : 'stopped',
+      composePath,
+    }
+  }
+
   async up(identity: ManagedIdentity, signal?: AbortSignal): Promise<void> {
     await this.inspectOwnership(identity, signal)
     await this.runCompose(identity, ['up', '--detach'], 'up', signal)
@@ -277,6 +312,30 @@ export class CliDockerAdapter implements DockerAdapter {
     const labels = resourceLabels(parsed[0], kind)
     if (labels === undefined || !hasExpectedLabels(labels, identity.homeId)) throw foreignResource()
     return 'owned'
+  }
+
+  private async inspectContainer(identity: ManagedIdentity, signal?: AbortSignal): Promise<Record<string, unknown> | undefined> {
+    let result: CommandResult
+    try {
+      result = await this.runner.run('docker', ['container', 'inspect', identity.containerName], { signal })
+      signal?.throwIfAborted()
+    } catch (error) {
+      cancellation(error, signal)
+      throw operationFailed('inspect')
+    }
+    if (result.exitCode !== 0) {
+      if (absentMessage('container', `${result.stdout}\n${result.stderr}`)) return undefined
+      throw operationFailed('inspect')
+    }
+    let parsed: unknown
+    try { parsed = JSON.parse(result.stdout) } catch { throw foreignResource() }
+    if (!Array.isArray(parsed) || parsed.length !== 1 || parsed[0] === null || typeof parsed[0] !== 'object' || Array.isArray(parsed[0])) {
+      throw foreignResource()
+    }
+    const record = parsed[0] as Record<string, unknown>
+    const labels = resourceLabels(record, 'container')
+    if (labels === undefined || !hasExpectedLabels(labels, identity.homeId)) throw foreignResource()
+    return record
   }
 
   private async runCompose(

@@ -40,6 +40,14 @@ const ownedLabels = {
 const ownedContainerInspect = JSON.stringify([{ Config: { Labels: ownedLabels } }])
 const ownedNetworkInspect = JSON.stringify([{ Labels: ownedLabels }])
 const ownedVolumeInspect = JSON.stringify([{ Labels: ownedLabels }])
+const deploymentContainerInspect = JSON.stringify([{
+  Config: { Labels: {
+    ...ownedLabels,
+    'com.docker.compose.project': identity.projectName,
+    'com.docker.compose.project.config_files': identity.composePath,
+  } },
+  State: { Running: true },
+}])
 const ownedResourceResults = (): CommandResult[] => [ok(ownedContainerInspect), ok(ownedNetworkInspect), ok(ownedVolumeInspect)]
 const absentResourceResults = (): CommandResult[] => [
   failed('Error: No such container'),
@@ -95,6 +103,28 @@ describe('CliDockerAdapter preflight', () => {
     aborted.name = 'AbortError'
     const adapter = new CliDockerAdapter(new FakeRunner(aborted))
     await expect(adapter.preflight()).rejects.toBe(aborted)
+  })
+})
+
+describe('CliDockerAdapter deployment status', () => {
+  it('returns the trusted Compose path and container state from owned labels', async () => {
+    const adapter = new CliDockerAdapter(new FakeRunner(ok(deploymentContainerInspect), ok(ownedNetworkInspect), ok(ownedVolumeInspect)))
+    await expect(adapter.deploymentStatus(identity)).resolves.toEqual({
+      ownership: 'owned', container: 'running', composePath: identity.composePath,
+    })
+  })
+
+  it('rejects an untrusted Compose path before removal can use it', async () => {
+    const unsafe = JSON.stringify([{
+      Config: { Labels: {
+        ...ownedLabels,
+        'com.docker.compose.project': identity.projectName,
+        'com.docker.compose.project.config_files': '/tmp/foreign/compose.yml',
+      } },
+      State: { Running: true },
+    }])
+    const adapter = new CliDockerAdapter(new FakeRunner(ok(unsafe), ok(ownedNetworkInspect), ok(ownedVolumeInspect)))
+    await expectCode(adapter.deploymentStatus(identity), 'E_RESOURCE_FOREIGN')
   })
 })
 

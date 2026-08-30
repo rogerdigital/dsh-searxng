@@ -33,6 +33,7 @@ export interface ProbeResult {
 }
 
 export interface SearxngProbe {
+  http(options: ProbeOptions, signal?: AbortSignal): Promise<void>
   readiness(options: ProbeOptions, signal?: AbortSignal): Promise<void>
   realSearch(options: ProbeOptions, signal?: AbortSignal): Promise<ProbeResult>
   providerSearch(options: SearxngSearchProviderOptions, signal?: AbortSignal): Promise<ProbeResult>
@@ -69,6 +70,26 @@ export class DefaultSearxngProbe implements SearxngProbe {
 
   constructor(options: DefaultSearxngProbeOptions = {}) {
     this.providerFactory = options.providerFactory ?? ((providerOptions) => new SearxngSearchProvider(providerOptions))
+  }
+
+  async http(options: ProbeOptions, signal?: AbortSignal): Promise<void> {
+    const endpoint = validateEndpoint(options.baseURL)
+    const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw searchFailed('Probe timeout must be a positive safe integer')
+    const timeout = AbortSignal.timeout(timeoutMs)
+    const requestSignal = signal === undefined ? timeout : AbortSignal.any([signal, timeout])
+    try {
+      const response = await (options.fetch ?? globalThis.fetch)(endpoint, {
+        headers: options.authHeader === undefined ? {} : { authorization: options.authHeader },
+        signal: requestSignal,
+      })
+      classifyStatus(response.status)
+      if (!response.ok) throw searchFailed('SearXNG HTTP endpoint returned an error')
+    } catch (error) {
+      rethrowCancellation(error, signal)
+      if (error instanceof CliError) throw error
+      throw searchFailed('SearXNG HTTP endpoint is unavailable')
+    }
   }
 
   async readiness(options: ProbeOptions, signal?: AbortSignal): Promise<void> {

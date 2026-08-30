@@ -20,6 +20,32 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+describe('SearXNG HTTP diagnostics', () => {
+  it('checks the configured endpoint with authentication', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('ok', { status: 200 }))
+    await new DefaultSearxngProbe().http({ baseURL: BASE, authHeader: 'Bearer private', fetch: fetchMock })
+    expect(fetchMock).toHaveBeenCalledWith(BASE, expect.objectContaining({
+      headers: { authorization: 'Bearer private' },
+      signal: expect.any(AbortSignal),
+    }))
+  })
+
+  it.each([[401, 'E_AUTH_FAILED'], [403, 'E_JSON_DISABLED'], [429, 'E_RATE_LIMITED']] as const)(
+    'classifies HTTP diagnostic status %i as %s', async (status, code) => {
+      const probe = new DefaultSearxngProbe()
+      await expect(probe.http({ baseURL: BASE, fetch: vi.fn().mockResolvedValue(new Response('', { status })) }))
+        .rejects.toMatchObject({ code })
+    },
+  )
+
+  it('preserves caller cancellation', async () => {
+    const controller = new AbortController()
+    const cancellation = new DOMException('cancelled', 'AbortError')
+    const fetchMock = vi.fn().mockImplementation(async () => { controller.abort(cancellation); throw cancellation })
+    await expect(new DefaultSearxngProbe().http({ baseURL: BASE, fetch: fetchMock }, controller.signal)).rejects.toBe(cancellation)
+  })
+})
+
 describe('probeSearxng', () => {
   it('preserves a fetch AbortError instead of reporting a search failure', async () => {
     const cancellation = new DOMException('cancelled request', 'AbortError')

@@ -36,6 +36,7 @@ export interface ProfileManager {
     signal?: AbortSignal,
   ): Promise<void>
   detach(profile: string, signal?: AbortSignal): Promise<void>
+  uninstall(profile: string, signal?: AbortSignal): Promise<void>
 }
 
 export interface ProfileAttachmentConfig {
@@ -744,6 +745,29 @@ export class NodeProfileManager implements ProfileManager {
           rollbackFailures,
         },
       )
+    }
+  }
+
+  async uninstall(profile: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
+    const name = resolvedProfileName(profile)
+    const packagePath = join(this.resolveProfileDirectory(name), 'package.json')
+    if (!await this.readInstalled(packagePath)) return
+    let result
+    try {
+      result = await this.commandRunner.run(
+        this.dshCommand,
+        ['plugin', '--profile', name, 'remove', PLUGIN_NAME],
+        { signal },
+      )
+      signal?.throwIfAborted()
+    } catch (error) {
+      const cancellation = cancellationFrom(error, signal)
+      if (cancellation !== undefined) throw cancellation
+      throw profileWriteError('Unable to remove dsh-searxng from the DSH profile')
+    }
+    if (result.exitCode !== 0 || await this.readInstalled(packagePath)) {
+      throw profileWriteError('Unable to remove dsh-searxng from the DSH profile')
     }
   }
 
