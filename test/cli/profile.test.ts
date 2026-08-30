@@ -78,6 +78,7 @@ describe('ProfileManager contract and discovery', () => {
     const fake: ProfileManager = {
       inspect: async () => ({ installed: false, patchPath: '/profile/cordis.patch.yml' }),
       preview: async (_profile, endpoint) => ({ installed: false, attached: false, config: { baseURL: endpoint } }),
+      validate: async (_profile, _endpoint, callback) => { await callback({ baseURL: 'http://localhost:8080' }) },
       attach: async () => {},
       detach: async () => {},
     }
@@ -134,6 +135,62 @@ describe('ProfileManager contract and discovery', () => {
       patch: `${correct}- id: web-search-searxng\n  config:\n    baseURL: http://user.invalid\n`,
     })
     await expect(overridden.manager.preview('web', 'http://localhost:8080')).resolves.toMatchObject({ attached: false })
+  })
+
+  it('validates an existing attachment without changing its bytes or inode', async () => {
+    const patch = `# dsh-searxng managed attachment
+- id: web-search-searxng
+  config:
+    baseURL: http://localhost:8080
+    language: zh-CN
+`
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.1' } },
+      patch,
+    })
+    const before = await fs.lstat(patchPath)
+    await expect(manager.validate('web', 'http://localhost:8080', async (config) => {
+      expect(config).toEqual({ baseURL: 'http://localhost:8080', language: 'zh-CN' })
+    })).resolves.toBeUndefined()
+    const after = await fs.lstat(patchPath)
+    expect(after.ino).toBe(before.ino)
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(patch)
+  })
+
+  it('rejects a different-byte replacement during read-only attachment validation', async () => {
+    const patch = `# dsh-searxng managed attachment
+- id: web-search-searxng
+  config:
+    baseURL: http://localhost:8080
+`
+    const concurrent = '# replaced during provider validation\n- id: editor\n'
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.1' } },
+      patch,
+    })
+    await expect(manager.validate('web', 'http://localhost:8080', async () => {
+      await fs.writeFile(patchPath, concurrent)
+    })).rejects.toMatchObject({ code: 'E_PROFILE_CONCURRENT_MODIFICATION' })
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(concurrent)
+  })
+
+  it('rejects a same-byte inode replacement during read-only attachment validation', async () => {
+    const patch = `# dsh-searxng managed attachment
+- id: web-search-searxng
+  config:
+    baseURL: http://localhost:8080
+`
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.1' } },
+      patch,
+    })
+    const before = await fs.lstat(patchPath)
+    await expect(manager.validate('web', 'http://localhost:8080', async () => {
+      const replacement = `${patchPath}.replacement`
+      await fs.writeFile(replacement, patch)
+      await fs.rename(replacement, patchPath)
+    })).rejects.toMatchObject({ code: 'E_PROFILE_CONCURRENT_MODIFICATION' })
+    expect((await fs.lstat(patchPath)).ino).not.toBe(before.ino)
   })
 
   it('resolves an empty profile to the official web profile layout', async () => {

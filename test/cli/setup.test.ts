@@ -38,6 +38,7 @@ interface HarnessOptions {
   profileAttached?: boolean
   profileConfig?: Partial<ProfileAttachmentConfig>
   postAttachError?: unknown
+  validatePostcheckError?: unknown
   writeBehaviors?: ReadonlyArray<'success' | 'fail-before' | 'fail-after'>
 }
 
@@ -169,6 +170,11 @@ function harness(options: HarnessOptions = {}) {
         config: { baseURL: endpoint, ...options.profileConfig },
       }
     }),
+    validate: vi.fn(async (_profile, endpoint, callback) => {
+      events.push('profile-validate')
+      await callback({ baseURL: endpoint, ...options.profileConfig })
+      if (options.validatePostcheckError !== undefined) throw options.validatePostcheckError
+    }),
     attach: vi.fn(async (_profile, endpoint, validate) => {
       events.push('profile-attach')
       const previous = profileEndpoint
@@ -296,6 +302,26 @@ describe('setup', () => {
     },
   )
 
+  it.each(['E_AUTH_FAILED', 'E_JSON_DISABLED', 'E_RATE_LIMITED', 'E_SEARCH_FAILED'] as const)(
+    'preserves deterministic %s after a timeout-triggered restart',
+    async (code) => {
+      const credential = 'Bearer restart-private-token'
+      const failure = new CliError(code, 'deterministic recovery failure', 'fix configuration')
+      const test = harness({
+        state: managedState(),
+        ownership: 'owned',
+        readinessFailures: 1,
+        realSearchError: failure,
+        profileConfig: { authHeader: credential },
+      })
+      const error = await setup({ profile: 'web', port: 8080 }, test.deps).catch((cause: unknown) => cause)
+      expect(error).toBe(failure)
+      expect(test.docker.restart).toHaveBeenCalledOnce()
+      expect(test.docker.down).not.toHaveBeenCalled()
+      expect(JSON.stringify((error as CliError).toJSON())).not.toContain(credential)
+    },
+  )
+
   it('is byte-level idempotent when managed state and the effective attachment are already correct', async () => {
     const initial = managedState()
     initial.profiles.web = { mode: 'managed', endpoint: ENDPOINT }
@@ -307,8 +333,22 @@ describe('setup', () => {
     expect(test.state()).toEqual(initial)
     expect(test.events).toEqual([
       'lock', 'environment', 'state-read', 'dsh-preflight', 'docker-preflight', 'ownership',
-      'profile-preview', 'readiness', 'real-search', 'provider-search', 'unlock',
+      'profile-preview', 'readiness', 'real-search', 'profile-validate', 'provider-search', 'unlock',
     ])
+  })
+
+  it('rejects a managed idempotent result after a different-byte attachment change during provider validation', async () => {
+    const initial = managedState()
+    initial.profiles.web = { mode: 'managed', endpoint: ENDPOINT }
+    const concurrent = new CliError(
+      'E_PROFILE_CONCURRENT_MODIFICATION',
+      'profile changed',
+      'retry setup',
+    )
+    const test = harness({ state: initial, ownership: 'owned', profileAttached: true, validatePostcheckError: concurrent })
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toBe(concurrent)
+    expect(test.profiles.attach).not.toHaveBeenCalled()
+    expect(test.deps.state.write).not.toHaveBeenCalled()
   })
 
   it('uses the effective profile auth and search config for raw and provider validation', async () => {
@@ -408,8 +448,74 @@ describe('setup', () => {
     expect(test.state()).toEqual(initial)
     expect(test.events).toEqual([
       'lock', 'environment', 'state-read', 'dsh-preflight', 'profile-preview',
-      'real-search', 'provider-search', 'unlock',
+      'real-search', 'profile-validate', 'provider-search', 'unlock',
     ])
+  })
+
+  it('rejects an external idempotent result after a same-byte inode replacement during provider validation', async () => {
+    const endpoint = 'https://search.example/path'
+    const initial: StateV1 = { schemaVersion: 1, profiles: { work: { mode: 'external', endpoint } } }
+    const concurrent = new CliError(
+      'E_PROFILE_CONCURRENT_MODIFICATION',
+      'profile changed',
+      'retry setup',
+    )
+    const test = harness({ state: initial, profileAttached: true, validatePostcheckError: concurrent })
+    await expect(setup({ profile: 'work', port: 8080, url: endpoint }, test.deps)).rejects.toBe(concurrent)
+    expect(test.profiles.attach).not.toHaveBeenCalled()
+    expect(test.deps.state.write).not.toHaveBeenCalled()
+  })
+
+  it('restores managed state when a state-only repair races with an attachment replacement', async () => {
+    const previous = managedState()
+    const concurrent = new CliError(
+      'E_PROFILE_CONCURRENT_MODIFICATION',
+      'profile changed',
+      'retry setup',
+    )
+    const test = harness({
+      state: previous,
+      ownership: 'owned',
+      profileAttached: true,
+      validatePostcheckError: concurrent,
+    })
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toBe(concurrent)
+    expect(test.profiles.attach).not.toHaveBeenCalled()
+    expect(test.writes).toHaveLength(2)
+    expect(test.state()).toEqual(previous)
+  })
+
+  it.each(['fail-before', 'fail-after'] as const)(
+    'restores previous state after a state-only repair %s write failure',
+    async (behavior) => {
+      const previous = managedState()
+      const test = harness({
+        state: previous,
+        ownership: 'owned',
+        profileAttached: true,
+        writeBehaviors: [behavior, 'success'],
+      })
+      await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toMatchObject({ code: 'E_INTERNAL' })
+      expect(test.profiles.attach).not.toHaveBeenCalled()
+      expect(test.state()).toEqual(previous)
+      expect(test.writes.at(-1)).toEqual(previous)
+    },
+  )
+
+  it('aggregates a state-only repair failure when restoring previous state also fails', async () => {
+    const previous = managedState()
+    const test = harness({
+      state: previous,
+      ownership: 'owned',
+      profileAttached: true,
+      writeBehaviors: ['fail-after', 'fail-before'],
+    })
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toMatchObject({
+      code: 'E_INTERNAL',
+      details: { rollbackFailures: ['state'] },
+    })
+    expect(test.profiles.attach).not.toHaveBeenCalled()
+    expect(test.docker.down).not.toHaveBeenCalled()
   })
 
   it('does not mistake an attached external profile with mismatched state for an idempotent setup', async () => {

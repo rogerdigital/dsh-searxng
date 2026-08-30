@@ -23,6 +23,12 @@ const MANAGED_MARKER = 'dsh-searxng managed attachment'
 export interface ProfileManager {
   inspect(profile: string, signal?: AbortSignal): Promise<{ installed: boolean; patchPath: string }>
   preview(profile: string, endpoint: string, signal?: AbortSignal): Promise<ProfileAttachmentPreview>
+  validate(
+    profile: string,
+    endpoint: string,
+    callback: (config: ProfileAttachmentConfig) => Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<void>
   attach(
     profile: string,
     endpoint: string,
@@ -135,6 +141,14 @@ function profileWriteError(
     message,
     'Check the DSH profile and retry',
     details,
+  )
+}
+
+function concurrentProfileModification(): CliError {
+  return new CliError(
+    'E_PROFILE_CONCURRENT_MODIFICATION',
+    'The DSH profile changed during validation',
+    'Review the profile change and retry setup',
   )
 }
 
@@ -427,6 +441,52 @@ export class NodeProfileManager implements ProfileManager {
     return { installed, attached, config: cloneProviderConfig(configFromAttachment(output)) }
   }
 
+  async validate(
+    profile: string,
+    endpoint: string,
+    callback: (config: ProfileAttachmentConfig) => Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    signal?.throwIfAborted()
+    const name = resolvedProfileName(profile)
+    const normalizedEndpoint = normalizeEndpoint(endpoint)
+    const dir = this.resolveProfileDirectory(name)
+    const installed = await this.readInstalled(join(dir, 'package.json'))
+    let snapshot: PatchSnapshot
+    try {
+      snapshot = await this.readPatchSnapshot(join(dir, 'cordis.patch.yml'))
+    } catch (error) {
+      if (error instanceof ProfileConflictError) throw concurrentProfileModification()
+      throw error
+    }
+    if (!installed || snapshot.bytes === undefined) throw concurrentProfileModification()
+    const parsed = parsePatch(snapshot.bytes)
+    if (!isCurrentManagedAttachment(parsed, normalizedEndpoint)) throw concurrentProfileModification()
+    const target = lastTarget(parsed)
+    if (target === undefined) throw concurrentProfileModification()
+    const config = cloneProviderConfig(providerConfig(configOf(parsed.document, target)))
+
+    let callbackFailed = false
+    let callbackError: unknown
+    try {
+      await callback(config)
+    } catch (error) {
+      callbackFailed = true
+      callbackError = error
+    }
+
+    let unchanged = false
+    try {
+      const after = await this.readPatchSnapshot(join(dir, 'cordis.patch.yml'))
+      unchanged = sameSnapshot(snapshot, after)
+    } catch {
+      unchanged = false
+    }
+    if (!unchanged) throw concurrentProfileModification()
+    if (callbackFailed) throw callbackError
+    signal?.throwIfAborted()
+  }
+
   async attach(
     profile: string,
     endpoint: string,
@@ -673,7 +733,7 @@ export class NodeProfileManager implements ProfileManager {
       if (error instanceof CliError) throw error
       throw profileWriteError('Unable to read the DSH profile patch')
     }
-    if (before.isSymbolicLink()) throw profileWriteError('The DSH profile patch is unsafe')
+    if (before.isSymbolicLink() || !before.isFile()) throw profileWriteError('The DSH profile patch is unsafe')
     try {
       const bytes = Buffer.from(await this.fileSystem.readFile(patchPath))
       const after = await this.fileSystem.lstat(patchPath)

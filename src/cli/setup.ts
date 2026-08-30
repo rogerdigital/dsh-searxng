@@ -155,26 +155,17 @@ function profileStateMatches(previous: StateV1, input: SetupInput, endpoint: str
   return current?.mode === mode && current.endpoint === endpoint
 }
 
-async function attachAndCommit(
-  input: SetupInput,
-  endpoint: string,
+async function withStateRestore(
   previous: StateV1,
-  next: StateV1,
   dependencies: SetupDependencies,
-  signal?: AbortSignal,
+  operation: (write: (next: StateV1) => Promise<void>) => Promise<void>,
 ): Promise<void> {
   let stateWriteAttempted = false
   try {
-    await dependencies.profiles.attach(
-      input.profile,
-      endpoint,
-      async (config) => {
-        await dependencies.searxng.providerSearch(config, signal)
-        stateWriteAttempted = true
-        await dependencies.state.write(next)
-      },
-      signal,
-    )
+    await operation(async (next) => {
+      stateWriteAttempted = true
+      await dependencies.state.write(next)
+    })
   } catch (primary) {
     if (!stateWriteAttempted) throw primary
     try {
@@ -184,6 +175,48 @@ async function attachAndCommit(
     }
     throw primary
   }
+}
+
+async function attachAndCommit(
+  input: SetupInput,
+  endpoint: string,
+  previous: StateV1,
+  next: StateV1,
+  dependencies: SetupDependencies,
+  signal?: AbortSignal,
+): Promise<void> {
+  await withStateRestore(previous, dependencies, async (write) => {
+    await dependencies.profiles.attach(
+      input.profile,
+      endpoint,
+      async (config) => {
+        await dependencies.searxng.providerSearch(config, signal)
+        await write(next)
+      },
+      signal,
+    )
+  })
+}
+
+async function validateAndCommit(
+  input: SetupInput,
+  endpoint: string,
+  previous: StateV1,
+  next: StateV1,
+  dependencies: SetupDependencies,
+  signal?: AbortSignal,
+): Promise<void> {
+  await withStateRestore(previous, dependencies, async (write) => {
+    await dependencies.profiles.validate(
+      input.profile,
+      endpoint,
+      async (config) => {
+        await dependencies.searxng.providerSearch(config, signal)
+        await write(next)
+      },
+      signal,
+    )
+  })
 }
 
 async function cleanupCreatedDeployment(
@@ -218,7 +251,12 @@ async function externalSetup(
   const preview = await dependencies.profiles.preview(input.profile, endpoint, signal)
   await dependencies.searxng.realSearch(preview.config, signal)
   if (preview.attached && profileStateMatches(previous, input, endpoint, 'external')) {
-    await dependencies.searxng.providerSearch(preview.config, signal)
+    await dependencies.profiles.validate(
+      input.profile,
+      endpoint,
+      async (config) => { await dependencies.searxng.providerSearch(config, signal) },
+      signal,
+    )
     return { profile: input.profile, endpoint, reused: true }
   }
   const next = externalState(previous, input, endpoint)
@@ -258,9 +296,15 @@ async function managedSetup(
       await dependencies.docker.restart(placeholderIdentity, signal)
       try {
         await dependencies.searxng.readiness(preview.config, signal)
-        await dependencies.searxng.realSearch(preview.config, signal)
       } catch (recoveryError) {
         if (isAbort(recoveryError, signal)) throw recoveryError
+        if (recoveryError instanceof CliError && recoveryError.code !== 'E_SEARXNG_START_TIMEOUT') throw recoveryError
+        throw managedRecoveryFailed()
+      }
+      try {
+        await dependencies.searxng.realSearch(preview.config, signal)
+      } catch (recoveryError) {
+        if (isAbort(recoveryError, signal) || recoveryError instanceof CliError) throw recoveryError
         throw managedRecoveryFailed()
       }
       const next = managedState(previous, input, endpoint, placeholderIdentity, dependencies)
@@ -270,13 +314,17 @@ async function managedSetup(
 
     await dependencies.searxng.realSearch(preview.config, signal)
     if (preview.attached && profileStateMatches(previous, input, endpoint, 'managed')) {
-      await dependencies.searxng.providerSearch(preview.config, signal)
+      await dependencies.profiles.validate(
+        input.profile,
+        endpoint,
+        async (config) => { await dependencies.searxng.providerSearch(config, signal) },
+        signal,
+      )
       return { profile: input.profile, endpoint, reused: true }
     }
     const next = managedState(previous, input, endpoint, placeholderIdentity, dependencies)
     if (preview.attached) {
-      await dependencies.searxng.providerSearch(preview.config, signal)
-      await dependencies.state.write(next)
+      await validateAndCommit(input, endpoint, previous, next, dependencies, signal)
     } else {
       await attachAndCommit(input, endpoint, previous, next, dependencies, signal)
     }
