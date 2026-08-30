@@ -21,13 +21,17 @@ services:
       - ALL
     cap_add:
       - CHOWN
+      - DAC_OVERRIDE
       - SETGID
       - SETUID
+    security_opt:
+      - no-new-privileges:true
     networks:
       - dsh-searxng
 
 volumes:
   searxng-cache:
+    name: "${DSH_SEARXNG_CACHE_VOLUME}"
     labels:
       io.dsh-searxng.managed: "true"
       io.dsh-searxng.home-id: "${DSH_SEARXNG_HOME_ID}"
@@ -36,6 +40,7 @@ volumes:
 
 networks:
   dsh-searxng:
+    name: "${DSH_SEARXNG_NETWORK}"
     labels:
       io.dsh-searxng.managed: "true"
       io.dsh-searxng.home-id: "${DSH_SEARXNG_HOME_ID}"

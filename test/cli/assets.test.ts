@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs'
-import { mkdtemp, open, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -21,7 +21,8 @@ describe('Docker assets', () => {
     const service = compose.services.searxng
     expect(service.ports).toEqual(['127.0.0.1:${DSH_SEARXNG_PORT}:8080'])
     expect(service.cap_drop).toEqual(['ALL'])
-    expect(service.cap_add).toEqual(['CHOWN', 'SETGID', 'SETUID'])
+    expect(service.cap_add).toEqual(['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETUID'])
+    expect(service.security_opt).toEqual(['no-new-privileges:true'])
     expect(service.volumes[0]).toEqual({
       type: 'bind',
       source: '${DSH_SEARXNG_SETTINGS_DIR}',
@@ -29,7 +30,9 @@ describe('Docker assets', () => {
     })
     expect(service.labels).toEqual(labels)
     expect(service.networks).toEqual(['dsh-searxng'])
+    expect(compose.volumes['searxng-cache'].name).toBe('${DSH_SEARXNG_CACHE_VOLUME}')
     expect(compose.volumes['searxng-cache'].labels).toEqual(labels)
+    expect(compose.networks['dsh-searxng'].name).toBe('${DSH_SEARXNG_NETWORK}')
     expect(compose.networks['dsh-searxng'].labels).toEqual(labels)
   })
 
@@ -74,6 +77,8 @@ describe('Docker assets', () => {
     expect(environment).toContain('DSH_SEARXNG_HOME_ID=0123456789abcdef\n')
     expect(environment).toContain('DSH_SEARXNG_PROJECT=dsh-searxng-0123456789abcdef\n')
     expect(environment).toContain('DSH_SEARXNG_CONTAINER=dsh-searxng-0123456789abcdef\n')
+    expect(environment).toContain('DSH_SEARXNG_NETWORK=dsh-searxng-0123456789abcdef-network\n')
+    expect(environment).toContain('DSH_SEARXNG_CACHE_VOLUME=dsh-searxng-0123456789abcdef-cache\n')
     expect(environment).toContain('DSH_SEARXNG_DEPLOYMENT_VERSION=1\n')
     expect(environment).toContain(`DSH_SEARXNG_SETTINGS_DIR=./${basename(bundleDir)}/searxng\n`)
     expect(environment).not.toContain('a:b#c')
@@ -139,6 +144,65 @@ describe('Docker assets', () => {
     expect((await readdir(stateDir)).filter((name) => name.startsWith('.staging-'))).toEqual([])
   })
 
+  it.skipIf(process.platform === 'win32').each([
+    'bundle-directory',
+    'settings-directory',
+    'environment-file',
+    'compose-file',
+    'settings-file',
+  ] as const)('refuses to follow a symlinked immutable %s', async (targetKind) => {
+    const { stateDir, renderer, input, rendered } = await renderedFixture('symlink-secret')
+    const bundleDir = dirname(rendered.composePath)
+    let original: string
+    let target: string
+    let type: 'dir' | 'file'
+    if (targetKind === 'bundle-directory') {
+      original = bundleDir
+      target = `${bundleDir}-target`
+      type = 'dir'
+    } else if (targetKind === 'settings-directory') {
+      original = join(bundleDir, 'searxng')
+      target = join(bundleDir, 'searxng-target')
+      type = 'dir'
+    } else if (targetKind === 'environment-file') {
+      original = join(bundleDir, '.env')
+      target = join(bundleDir, '.env-target')
+      type = 'file'
+    } else if (targetKind === 'compose-file') {
+      original = rendered.composePath
+      target = join(bundleDir, 'compose-target.yml')
+      type = 'file'
+    } else {
+      original = join(bundleDir, 'searxng', 'settings.yml')
+      target = join(bundleDir, 'searxng', 'settings-target.yml')
+      type = 'file'
+    }
+    await rename(original, target)
+    await symlink(target, original, type)
+
+    const error = await renderer.render(input).catch((caught: unknown) => caught)
+    expect(error).toMatchObject({ code: 'E_STATE_INVALID' })
+    const serialized = JSON.stringify((error as { toJSON(): unknown }).toJSON())
+    expect(serialized).not.toContain('symlink-secret')
+    expect(serialized).not.toContain(stateDir)
+  })
+
+  it.each(['bundle-file', 'settings-file', 'compose-directory'] as const)('rejects unexpected immutable bundle type %s', async (targetKind) => {
+    const { renderer, input, rendered } = await renderedFixture('type-secret')
+    const bundleDir = dirname(rendered.composePath)
+    if (targetKind === 'bundle-file') {
+      await rm(bundleDir, { recursive: true })
+      await writeFile(bundleDir, 'not a directory', { mode: 0o600 })
+    } else if (targetKind === 'settings-file') {
+      await rm(join(bundleDir, 'searxng'), { recursive: true })
+      await writeFile(join(bundleDir, 'searxng'), 'not a directory', { mode: 0o600 })
+    } else {
+      await rm(rendered.composePath)
+      await mkdir(rendered.composePath, { mode: 0o700 })
+    }
+    await expect(renderer.render(input)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+  })
+
   it.each([
     ['.env', 'writeFile'], ['.env', 'sync'], ['.env', 'close'],
     ['compose.yml', 'writeFile'], ['compose.yml', 'sync'], ['compose.yml', 'close'],
@@ -198,6 +262,26 @@ async function readBundle(composePath: string): Promise<string[]> {
     readFile(composePath, 'utf8'),
     readFile(join(bundleDir, 'searxng', 'settings.yml'), 'utf8'),
   ])
+}
+
+async function renderedFixture(secret: string): Promise<{
+  stateDir: string
+  renderer: FileAssetRenderer
+  input: { stateDir: string; identity: ManagedIdentity; image: string; port: number; secret: string }
+  rendered: { composePath: string; configurationSha256: string }
+}> {
+  const stateDir = await mkdtemp(join(tmpdir(), 'dsh-searxng-assets-verify-'))
+  const identity: ManagedIdentity = {
+    stateDir,
+    composePath: join(stateDir, 'compose.yml'),
+    homeId: '0123456789abcdef',
+    projectName: 'dsh-searxng-0123456789abcdef',
+    containerName: 'dsh-searxng-0123456789abcdef',
+  }
+  const renderer = new FileAssetRenderer({ assetRoot: new URL('../../assets/docker/', import.meta.url) })
+  const input = { stateDir, identity, image: SEARXNG_IMAGE, port: 8080, secret }
+  const rendered = await renderer.render(input)
+  return { stateDir, renderer, input, rendered }
 }
 
 async function publishedBundles(stateDir: string): Promise<string[]> {

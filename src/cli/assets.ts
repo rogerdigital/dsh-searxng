@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { chmod, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { chmod, lstat, mkdir, open, readFile, rename, rm } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { parse, stringify } from 'yaml'
@@ -30,15 +31,15 @@ export interface AssetRenderer {
 
 export interface AssetFileSystem {
   chmod: typeof chmod
+  lstat: typeof lstat
   mkdir: typeof mkdir
   open: typeof open
   readFile: typeof readFile
   rename: typeof rename
   rm: typeof rm
-  stat: typeof stat
 }
 
-const realFileSystem: AssetFileSystem = { chmod, mkdir, open, readFile, rename, rm, stat }
+const realFileSystem: AssetFileSystem = { chmod, lstat, mkdir, open, readFile, rename, rm }
 
 export interface FileAssetRendererOptions {
   assetRoot?: URL
@@ -106,6 +107,8 @@ function baseEnvironment(input: Parameters<AssetRenderer['render']>[0]): string 
     `DSH_SEARXNG_HOME_ID=${input.identity.homeId}`,
     `DSH_SEARXNG_PROJECT=${input.identity.projectName}`,
     `DSH_SEARXNG_CONTAINER=${input.identity.containerName}`,
+    `DSH_SEARXNG_NETWORK=${input.identity.projectName}-network`,
+    `DSH_SEARXNG_CACHE_VOLUME=${input.identity.projectName}-cache`,
     'DSH_SEARXNG_DEPLOYMENT_VERSION=1',
   ].join('\n')
 }
@@ -230,11 +233,11 @@ export class FileAssetRenderer implements AssetRenderer {
 
   private async verifyExistingBundle(bundleDir: string, contents: BundleContents): Promise<boolean> {
     let bundleStats
-    try { bundleStats = await this.fs.stat(bundleDir) } catch (error) {
+    try { bundleStats = await this.fs.lstat(bundleDir) } catch (error) {
       if (errorCode(error) === 'ENOENT') return false
       throw error
     }
-    if (!bundleStats.isDirectory()) throw invalidBundle('Managed configuration bundle is not a directory')
+    if (bundleStats.isSymbolicLink() || !bundleStats.isDirectory()) throw invalidBundle('Managed configuration bundle is not a directory')
 
     const expected = [
       [join(bundleDir, '.env'), contents.environment],
@@ -242,14 +245,14 @@ export class FileAssetRenderer implements AssetRenderer {
       [join(bundleDir, 'searxng', 'settings.yml'), contents.settings],
     ] as const
     try {
-      const settingsStats = await this.fs.stat(join(bundleDir, 'searxng'))
-      if (!settingsStats.isDirectory()) throw invalidBundle('Managed configuration settings path is invalid')
+      const settingsStats = await this.fs.lstat(join(bundleDir, 'searxng'))
+      if (settingsStats.isSymbolicLink() || !settingsStats.isDirectory()) throw invalidBundle('Managed configuration settings path is invalid')
       if (process.platform !== 'win32' && ((bundleStats.mode & 0o777) !== 0o700 || (settingsStats.mode & 0o777) !== 0o700)) {
         throw invalidBundle('Managed configuration directory permissions are invalid')
       }
       for (const [path, content] of expected) {
-        const [actual, fileStats] = await Promise.all([this.fs.readFile(path, 'utf8'), this.fs.stat(path)])
-        if (!fileStats.isFile() || actual !== content || (process.platform !== 'win32' && (fileStats.mode & 0o777) !== 0o600)) {
+        const actual = await this.readVerifiedFile(path)
+        if (actual !== content) {
           throw invalidBundle('Managed configuration bundle does not match its identity')
         }
       }
@@ -258,6 +261,31 @@ export class FileAssetRenderer implements AssetRenderer {
       throw invalidBundle('Managed configuration bundle is incomplete')
     }
     return true
+  }
+
+  private async readVerifiedFile(path: string): Promise<string> {
+    const pathStats = await this.fs.lstat(path)
+    if (
+      pathStats.isSymbolicLink() ||
+      !pathStats.isFile() ||
+      pathStats.nlink !== 1 ||
+      (process.platform !== 'win32' && (pathStats.mode & 0o777) !== 0o600)
+    ) throw invalidBundle('Managed configuration file type or permissions are invalid')
+
+    const noFollow = 'O_NOFOLLOW' in constants ? constants.O_NOFOLLOW : 0
+    const handle = await this.fs.open(path, constants.O_RDONLY | noFollow)
+    try {
+      const openedStats = await handle.stat()
+      if (
+        !openedStats.isFile() ||
+        openedStats.nlink !== 1 ||
+        openedStats.dev !== pathStats.dev ||
+        openedStats.ino !== pathStats.ino
+      ) throw invalidBundle('Managed configuration file changed during validation')
+      return await handle.readFile('utf8')
+    } finally {
+      await handle.close()
+    }
   }
 
   private async withdrawUnconfirmedBundle(bundleDir: string, stagingDir: string): Promise<void> {

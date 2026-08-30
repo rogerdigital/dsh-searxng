@@ -1,4 +1,4 @@
-import { dirname, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, normalize } from 'node:path'
 import { CliError, redact } from './errors.ts'
 import type { ManagedIdentity } from './assets.ts'
 import { ProcessExecutionError, type CommandResult, type CommandRunner } from './process.ts'
@@ -46,13 +46,63 @@ function composeMajor(version: string): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined
 }
 
-function isInspectRecord(value: unknown): value is { Config: { Labels: Record<string, string> } } {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
-  const config = (value as Record<string, unknown>).Config
-  if (config === null || typeof config !== 'object' || Array.isArray(config)) return false
-  const labels = (config as Record<string, unknown>).Labels
-  if (labels === null || typeof labels !== 'object' || Array.isArray(labels)) return false
-  return Object.values(labels as Record<string, unknown>).every((label) => typeof label === 'string')
+const RESOURCE_LABELS = {
+  managed: 'io.dsh-searxng.managed',
+  homeId: 'io.dsh-searxng.home-id',
+  schema: 'io.dsh-searxng.schema',
+  deploymentVersion: 'io.dsh-searxng.deployment-version',
+} as const
+
+type ResourceKind = 'container' | 'network' | 'volume'
+
+function invalidIdentity(): CliError {
+  return new CliError('E_USAGE', 'Managed Docker identity is invalid', 'Run setup again to regenerate managed deployment identity')
+}
+
+function validateIdentity(identity: ManagedIdentity): void {
+  if (!/^[a-f0-9]{16}$/.test(identity.homeId)) throw invalidIdentity()
+  const canonicalName = `dsh-searxng-${identity.homeId}`
+  if (identity.projectName !== canonicalName || identity.containerName !== canonicalName) throw invalidIdentity()
+  if (/[\u0000-\u001f\u007f]/.test(identity.stateDir) || /[\u0000-\u001f\u007f]/.test(identity.composePath)) throw invalidIdentity()
+  if (!isAbsolute(identity.stateDir) || normalize(identity.stateDir) !== identity.stateDir) throw invalidIdentity()
+  const bundleDir = dirname(identity.composePath)
+  if (
+    basename(identity.composePath) !== 'compose.yml' ||
+    dirname(bundleDir) !== identity.stateDir ||
+    !/^config-[a-f0-9]{64}$/.test(basename(bundleDir)) ||
+    join(bundleDir, 'compose.yml') !== identity.composePath
+  ) throw invalidIdentity()
+}
+
+function resourceName(identity: ManagedIdentity, kind: ResourceKind): string {
+  if (kind === 'container') return identity.containerName
+  return `${identity.projectName}-${kind === 'network' ? 'network' : 'cache'}`
+}
+
+function resourceLabels(value: unknown, kind: ResourceKind): Record<string, string> | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const labels = kind === 'container'
+    ? (record.Config !== null && typeof record.Config === 'object' && !Array.isArray(record.Config)
+        ? (record.Config as Record<string, unknown>).Labels
+        : undefined)
+    : record.Labels
+  if (labels === null || typeof labels !== 'object' || Array.isArray(labels)) return undefined
+  if (!Object.values(labels as Record<string, unknown>).every((label) => typeof label === 'string')) return undefined
+  return labels as Record<string, string>
+}
+
+function hasExpectedLabels(labels: Record<string, string>, homeId: string): boolean {
+  return labels[RESOURCE_LABELS.managed] === 'true' &&
+    labels[RESOURCE_LABELS.homeId] === homeId &&
+    labels[RESOURCE_LABELS.schema] === '1' &&
+    labels[RESOURCE_LABELS.deploymentVersion] === '1'
+}
+
+function absentMessage(kind: ResourceKind, output: string): boolean {
+  if (kind === 'container') return /no such (?:object|container)/i.test(output)
+  if (kind === 'network') return /(?:no such network|network .+ not found)/i.test(output)
+  return new RegExp(`no such ${kind}`, 'i').test(output)
 }
 
 function sanitizeLogText(value: string): string {
@@ -60,7 +110,9 @@ function sanitizeLogText(value: string): string {
     .replace(/("authorization"\s*:\s*")[^"]*(")/gi, '$1[REDACTED]$2')
     .replace(/(authorization\s*[:=]\s*)[^\r\n,;]+/gi, '$1[REDACTED]')
     .replace(/("(?:search(?:[_-]?query)|query)"\s*:\s*")(?:\\.|[^"\\])*(")/gi, '$1[REDACTED]$2')
-    .replace(/(^|[^a-z\d_-])((?:search(?:[_-]?query)|query)\s*[:=]\s*)[^\r\n]*/gim, '$1$2[REDACTED]')
+    .replace(/(^|[?&])((?:q|query|search(?:[_-]?query))=)[^&\s"']*/gim, '$1$2[REDACTED]')
+    .replace(/^(?![^\r\n]*&[a-z][\w-]*=)((?:search(?:[_-]?query)|query)\s*[:=]\s*)[^\r\n]*/gim, '$1[REDACTED]')
+    .replace(/([^a-z\d_?&-])((?:search(?:[_-]?query)|query)\s*[:=]\s*)[^\r\n]*/gim, '$1$2[REDACTED]')
     .replace(/((?:secret(?:[_-]?key)?|password|api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[:=]\s*)([^\s,;]+)/gi, '$1[REDACTED]')
     .replace(/("(?:secret(?:[_-]?key)?|password|api[_-]?key|access[_-]?token|refresh[_-]?token)"\s*:\s*")[^"]*(")/gi, '$1[REDACTED]$2')
 }
@@ -121,28 +173,14 @@ export class CliDockerAdapter implements DockerAdapter {
   }
 
   async inspectOwnership(identity: ManagedIdentity, signal?: AbortSignal): Promise<'absent' | 'owned'> {
+    validateIdentity(identity)
     signal?.throwIfAborted()
-    let result: CommandResult
-    try {
-      result = await this.runner.run('docker', ['container', 'inspect', identity.containerName], { signal })
-      signal?.throwIfAborted()
-    } catch (error) {
-      cancellation(error, signal)
-      throw operationFailed('inspect')
+    let anyOwned = false
+    for (const kind of ['container', 'network', 'volume'] as const) {
+      const ownership = await this.inspectResource(identity, kind, signal)
+      if (ownership === 'owned') anyOwned = true
     }
-    if (result.exitCode !== 0) {
-      if (/no such (?:object|container)/i.test(`${result.stdout}\n${result.stderr}`)) return 'absent'
-      throw operationFailed('inspect')
-    }
-
-    let parsed: unknown
-    try { parsed = JSON.parse(result.stdout) } catch { throw foreignResource() }
-    if (!Array.isArray(parsed) || parsed.length !== 1 || !isInspectRecord(parsed[0])) throw foreignResource()
-    const labels = parsed[0].Config.Labels
-    if (labels['io.dsh-searxng.managed'] !== 'true' || labels['io.dsh-searxng.home-id'] !== identity.homeId) {
-      throw foreignResource()
-    }
-    return 'owned'
+    return anyOwned ? 'owned' : 'absent'
   }
 
   async up(identity: ManagedIdentity, signal?: AbortSignal): Promise<void> {
@@ -180,6 +218,32 @@ export class CliDockerAdapter implements DockerAdapter {
       '--project-name', identity.projectName,
       ...operation,
     ]
+  }
+
+  private async inspectResource(
+    identity: ManagedIdentity,
+    kind: ResourceKind,
+    signal?: AbortSignal,
+  ): Promise<'absent' | 'owned'> {
+    let result: CommandResult
+    try {
+      result = await this.runner.run('docker', [kind, 'inspect', resourceName(identity, kind)], { signal })
+      signal?.throwIfAborted()
+    } catch (error) {
+      cancellation(error, signal)
+      throw operationFailed('inspect')
+    }
+    if (result.exitCode !== 0) {
+      if (absentMessage(kind, `${result.stdout}\n${result.stderr}`)) return 'absent'
+      throw operationFailed('inspect')
+    }
+
+    let parsed: unknown
+    try { parsed = JSON.parse(result.stdout) } catch { throw foreignResource() }
+    if (!Array.isArray(parsed) || parsed.length !== 1) throw foreignResource()
+    const labels = resourceLabels(parsed[0], kind)
+    if (labels === undefined || !hasExpectedLabels(labels, identity.homeId)) throw foreignResource()
+    return 'owned'
   }
 
   private async runCompose(
