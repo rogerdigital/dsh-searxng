@@ -36,6 +36,16 @@ interface ProbeAttemptResult {
 
 class TransientProbeError extends Error {}
 
+class MalformedProbeResponseError extends CliError {
+  constructor() {
+    super(
+      'E_SEARCH_FAILED',
+      'SearXNG returned a malformed search response',
+      'Check the SearXNG JSON API configuration and run dsh-searxng doctor',
+    )
+  }
+}
+
 export async function probeSearxng(options: ProbeOptions, signal?: AbortSignal): Promise<ProbeResult> {
   return runProbe(options, false, signal)
 }
@@ -46,6 +56,7 @@ export class DefaultSearxngProbe implements SearxngProbe {
       await runProbe({ ...options, attempts: options.attempts ?? DEFAULT_READINESS_ATTEMPTS }, true, signal)
     } catch (error) {
       if (error instanceof CliError && isImmediateFailure(error.code)) throw error
+      if (error instanceof MalformedProbeResponseError) throw error
       if (signal?.aborted) throw searchFailed('SearXNG readiness check was cancelled')
       throw new CliError(
         'E_SEARXNG_START_TIMEOUT',
@@ -95,11 +106,11 @@ async function runProbe(
       })
       classifyStatus(request.response.status)
       const results = parseResults(request.payload)
-      const validResults = results.filter(hasValidHttpUrl)
-      if (!allowEmptyResults && validResults.length === 0) {
+      if (!results.every(hasValidHttpUrl)) throw new MalformedProbeResponseError()
+      if (!allowEmptyResults && results.length === 0) {
         throw searchFailed('SearXNG returned no usable search result')
       }
-      return { endpoint, resultCount: validResults.length, elapsedMs: Math.max(0, Date.now() - startedAt) }
+      return { endpoint, resultCount: results.length, elapsedMs: Math.max(0, Date.now() - startedAt) }
     } catch (error) {
       lastError = toCliError(error, signal)
       if (lastError instanceof CliError && isImmediateFailure(lastError.code)) throw lastError
@@ -148,10 +159,10 @@ function classifyStatus(status: number): void {
 
 function parseResults(payload: unknown): unknown[] {
   if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw searchFailed('SearXNG returned an invalid JSON response')
+    throw new MalformedProbeResponseError()
   }
   const results = (payload as Record<string, unknown>).results
-  if (!Array.isArray(results)) throw searchFailed('SearXNG JSON response is missing results')
+  if (!Array.isArray(results)) throw new MalformedProbeResponseError()
   return results
 }
 

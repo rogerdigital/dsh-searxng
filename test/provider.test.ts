@@ -350,6 +350,39 @@ describe('SearxngSearchProvider', () => {
       expect(fetchMock).toHaveBeenCalledOnce()
     })
 
+    it.each([
+      { results: [null] },
+      { results: ['primitive'] },
+      { results: [{}] },
+      { results: [{ url: null }] },
+      { results: [{ url: '' }] },
+      { results: [{ url: 'not a URL' }] },
+      { results: [{ url: 'javascript:alert(1)' }] },
+      { results: [{ url: 'https://example.com', title: 42 }] },
+      { results: [{ url: 'https://example.com', content: {} }] },
+      { results: [{ url: 'https://example.com', publishedDate: false }] },
+      { results: [{ url: 'https://example.com', score: 'high' }] },
+      { results: [{ url: 'https://example.com' }, null] },
+    ])('rejects malformed result entries without leaking request data: $results', async ({ results }) => {
+      const query = 'private provider query'
+      const bodySecret = 'body-secret'
+      const credential = 'Bearer credential-secret'
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results, debug: bodySecret }))
+      vi.stubGlobal('fetch', fetchMock)
+
+      const error = await new SearxngSearchProvider({ baseURL: BASE, authHeader: credential })
+        .search({ query })
+        .then(() => undefined, (cause: unknown) => cause)
+
+      expect(error).toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      expect(error).toBeInstanceOf(WebError)
+      const visible = `${(error as Error).message}\n${JSON.stringify(error)}`
+      expect(visible).not.toContain(query)
+      expect(visible).not.toContain(bodySecret)
+      expect(visible).not.toContain(credential)
+      expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
     it('ignores Retry-After on a non-retryable rate limit', async () => {
       const fetchMock = vi.fn().mockResolvedValue(new Response('limited', {
         status: 429,

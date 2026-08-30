@@ -337,7 +337,30 @@ function isValidBaseUrl(baseURL: string): boolean {
 function isSearxngSearchResponse(value: unknown): value is SearxngSearchResponse {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
   const results = (value as Record<string, unknown>).results
-  return results === undefined || Array.isArray(results)
+  return results === undefined || (Array.isArray(results) && results.every(isSearxngResult))
+}
+
+function isSearxngResult(value: unknown): value is SearxngResult {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const result = value as Record<string, unknown>
+  if (!isValidResultUrl(result.url)) return false
+  if (!isOptionalNullableString(result.title)) return false
+  if (!isOptionalNullableString(result.content)) return false
+  if (!isOptionalNullableString(result.engine)) return false
+  if (!isOptionalNullableString(result.publishedDate)) return false
+  return result.score === undefined || result.score === null || (typeof result.score === 'number' && Number.isFinite(result.score))
+}
+
+function isValidResultUrl(value: unknown): value is string {
+  if (typeof value !== 'string' || value.trim().length === 0 || !URL.canParse(value)) return false
+  const url = new URL(value)
+  return (url.protocol === 'http:' || url.protocol === 'https:')
+    && url.username.length === 0
+    && url.password.length === 0
+}
+
+function isOptionalNullableString(value: unknown): value is string | null | undefined {
+  return value === undefined || value === null || typeof value === 'string'
 }
 
 /** True for a fetch/`AbortSignal` abort, surfaced as `WEB_ABORTED`. */

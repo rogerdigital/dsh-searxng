@@ -147,11 +147,38 @@ describe('DefaultSearxngProbe', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
-  it('does not retry a structurally invalid readiness response', async () => {
+  it('returns a stable malformed-response error without retrying invalid readiness results', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: 'invalid' }))
     const attempt = new DefaultSearxngProbe().readiness({ baseURL: BASE, attempts: 3, fetch: fetchMock })
-    await expect(attempt).rejects.toMatchObject({ code: 'E_SEARXNG_START_TIMEOUT' })
+    await expect(attempt).rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
     expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    { results: [null] },
+    { results: ['invalid'] },
+    { results: [{}] },
+    { results: [{ url: '' }] },
+    { results: [{ url: 'not a URL' }] },
+    { results: [{ url: 'ftp://example.com/file' }] },
+    { results: [{ url: 'https://example.com/ok' }, null] },
+  ])('rejects a non-empty malformed readiness result array: $results', async ({ results }) => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results }))
+    const error = await new DefaultSearxngProbe().readiness({ baseURL: BASE, attempts: 3, fetch: fetchMock })
+      .then(() => undefined, (cause: unknown) => cause)
+    expect(error).toMatchObject({ code: 'E_SEARCH_FAILED' })
+    expect((error as CliError).message).toMatch(/malformed/i)
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('rejects mixed valid and malformed final results', async () => {
+    const attempt = probeSearxng({
+      baseURL: BASE,
+      fetch: vi.fn().mockResolvedValue(jsonResponse({
+        results: [{ url: 'https://example.com/ok' }, { url: 'javascript:alert(1)' }],
+      })),
+    })
+    await expect(attempt).rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
   })
 
   it('cancels during the readiness retry delay without another request', async () => {
