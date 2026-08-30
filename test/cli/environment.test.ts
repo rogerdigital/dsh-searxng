@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from 'vitest'
-import { homedir as osHomedir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { EnvironmentService, homeId, managedDir, profileDir, resolveDshHome } from '../../src/cli/environment.ts'
@@ -8,15 +7,16 @@ describe('environment helpers', () => {
   it('resolves injected DSH_HOME or the injected home directory', () => {
     expect(resolveDshHome({ DSH_HOME: '/tmp/dsh' }, '/Users/test')).toBe('/tmp/dsh')
     expect(resolveDshHome({ DSH_HOME: 'relative' }, '/Users/test')).toBe(join(process.cwd(), 'relative'))
-    expect(resolveDshHome({ DSH_HOME: '~/relative' }, '/Users/test')).toBe(join(osHomedir(), 'relative'))
+    expect(resolveDshHome({ DSH_HOME: '~/relative' }, '/Users/test')).toBe('/Users/test/relative')
     expect(resolveDshHome({ DSH_HOME: '  ' }, '/Users/test')).toBe('/Users/test/.dsh')
     expect(resolveDshHome({}, '/Users/test')).toBe('/Users/test/.dsh')
   })
 
   it('derives profile and managed paths and rejects unsafe profiles', () => {
     expect(profileDir('/tmp/.dsh', 'web')).toBe(join('/tmp/.dsh', 'profiles', 'web'))
+    expect(profileDir('/tmp/.dsh', 'node_modules')).toBe(join('/tmp/.dsh', 'profiles', 'node_modules'))
     expect(managedDir('/tmp/.dsh')).toBe(join('/tmp/.dsh', 'dsh-searxng'))
-    for (const profile of ['', '.', '..', 'a/b', 'a\\b', 'node_modules', 'x/node_modules/y']) {
+    for (const profile of ['', '.', '..', 'a/b', 'a\\b']) {
       try { profileDir('/tmp/.dsh', profile); throw new Error('expected rejection') } catch (error) { expect(error).toMatchObject({ code: 'E_PROFILE_INVALID' }) }
     }
   })
@@ -32,7 +32,7 @@ describe('environment helpers', () => {
 
   it('resolves a profile and preflights dsh and port through injected dependencies', async () => {
     const service = new EnvironmentService({
-      env: { DSH_HOME: '/tmp/dsh' }, homedir: osHomedir(),
+      env: { DSH_HOME: '/tmp/dsh' }, homedir: '/Users/test',
       portChecker: async (port) => port !== 8080,
       commandRunner: { run: async () => ({ exitCode: 0, stdout: '', stderr: '' }) },
     })
@@ -55,5 +55,32 @@ describe('environment helpers', () => {
 
   it.each([{ exitCode: 127 }, { exitCode: 1 }])('reports missing or nonzero dsh with stable error', async (result) => {
     await expect(new EnvironmentService({ portChecker: async () => true, commandRunner: { run: async () => ({ ...result, stdout: '', stderr: '' }) } }).preflightManaged(8080)).rejects.toMatchObject({ code: 'E_DSH_MISSING', action: 'Install dsh and ensure it is on PATH' })
+  })
+
+  it('maps a thrown ENOENT from dsh --version to the stable missing-dsh error', async () => {
+    const missing = Object.assign(new Error('spawn dsh ENOENT'), { code: 'ENOENT' })
+    const service = new EnvironmentService({
+      portChecker: async () => true,
+      commandRunner: { run: async () => { throw missing } },
+    })
+
+    await expect(service.preflightManaged(8080)).rejects.toMatchObject({
+      code: 'E_DSH_MISSING',
+      action: 'Install dsh and ensure it is on PATH',
+    })
+  })
+
+  it('maps a port-checker failure to an actionable stable conflict error without invoking dsh', async () => {
+    const run = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }))
+    const service = new EnvironmentService({
+      portChecker: async () => { throw new Error('socket probe failed') },
+      commandRunner: { run },
+    })
+
+    await expect(service.preflightManaged(8080)).rejects.toMatchObject({
+      code: 'E_PORT_CONFLICT',
+      action: 'Choose another port or stop the process using it',
+    })
+    expect(run).not.toHaveBeenCalled()
   })
 })

@@ -1,12 +1,12 @@
 import { createHash } from 'node:crypto'
 import { homedir as defaultHomedir } from 'node:os'
-import { isAbsolute, join, normalize, resolve as resolvePath } from 'node:path'
+import { join, normalize, resolve as resolvePath } from 'node:path'
 import type { CommandRunner } from './process.ts'
 import { CliError } from './errors.ts'
 
 export function assertValidProfile(profile: string): string {
-  if (!profile || profile === '.' || profile === '..' || profile.includes('/') || profile.includes('\\') || profile === 'node_modules' || profile.split(/[\\/]/).includes('node_modules')) {
-    throw new CliError('E_PROFILE_INVALID', 'Profile must be a safe name', 'Choose a profile without path separators or reserved names')
+  if (!profile || profile === '.' || profile === '..' || profile.includes('/') || profile.includes('\\')) {
+    throw new CliError('E_PROFILE_INVALID', 'Profile must be a safe name', 'Choose a profile without path separators or dot segments')
   }
   return profile
 }
@@ -14,7 +14,7 @@ export function assertValidProfile(profile: string): string {
 export function resolveDshHome(env: NodeJS.ProcessEnv = process.env, homedir: string = defaultHomedir()): string {
   const configured = env.DSH_HOME?.trim()
   if (!configured) return normalize(resolvePath(homedir, '.dsh'))
-  const expanded = configured.replace(/^~(?=$|[\\/])/, defaultHomedir())
+  const expanded = configured.replace(/^~(?=$|[\\/])/, homedir)
   return normalize(resolvePath(expanded))
 }
 
