@@ -36,6 +36,17 @@ describe('parseCliArgs', () => {
     })
   })
 
+  it('keeps remove defaults explicit', () => {
+    expect(parseCliArgs(['remove'])).toEqual({
+      command: 'remove',
+      profile: 'web',
+      json: false,
+      service: false,
+      purgeData: false,
+      yes: false,
+    })
+  })
+
   it.each([
     ['unknown command', ['wat']],
     ['empty profile', ['setup', '--profile', '']],
