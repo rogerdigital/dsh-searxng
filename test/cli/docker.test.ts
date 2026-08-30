@@ -193,8 +193,8 @@ describe('CliDockerAdapter Compose operations', () => {
 
   it.each([
     ['query=needleAlpha needleBeta needleGamma needleDelta\nstatus=ok', ['status=ok']],
-    ['search_query: needleAlpha needleBeta needleGamma needleDelta, status=ok', ['status=ok']],
-    ['SEARCH-QUERY=needleAlpha: needleBeta? needleGamma! needleDelta; elapsed=12', ['elapsed=12']],
+    ['search_query: needleAlpha needleBeta needleGamma needleDelta, status=ok', []],
+    ['SEARCH-QUERY=needleAlpha: needleBeta? needleGamma! needleDelta; elapsed=12', []],
     ['SearchQuery: needleAlpha,needleBeta needleGamma needleDelta\nlevel=info', ['level=info']],
     ['{"query":"needleAlpha needleBeta needleGamma needleDelta","status":"ok"}', ['"status":"ok"']],
     ['{"search_query":"needleAlpha, needleBeta; needleGamma needleDelta","status":"ok"}', ['"status":"ok"']],
@@ -202,7 +202,7 @@ describe('CliDockerAdapter Compose operations', () => {
       'query=needleAlpha needleBeta\nstatus=ok\nsearch-query: needleGamma needleDelta\nlevel=info',
       ['status=ok', 'level=info'],
     ],
-  ])('redacts complete multi-word search values without hiding adjacent fields: %s', async (line, safeFields) => {
+  ])('redacts complete multi-word search values while preserving following records: %s', async (line, safeFields) => {
     const runner = new FakeRunner(ok(ownedInspect), ok(line))
     const logs = await new CliDockerAdapter(runner, { maxLogBytes: 4096 }).logs(identity, 10)
     for (const term of ['needleAlpha', 'needleBeta', 'needleGamma', 'needleDelta']) {
@@ -219,6 +219,16 @@ describe('CliDockerAdapter Compose operations', () => {
     for (const term of ['needleAlpha', 'needleBeta', 'needleGamma', 'needleDelta']) {
       expect(logs.toLowerCase()).not.toContain(term.toLowerCase())
     }
+  })
+
+  it.each([
+    ['query=private topic, site:example.com\nstatus=ok', ['private', 'topic', 'site', 'example.com']],
+    ['search_query=private topic; author:Alice\nstatus=ok', ['private', 'topic', 'author', 'Alice']],
+  ])('treats query-like operators as sensitive plain-text query content: %s', async (line, sensitiveTerms) => {
+    const runner = new FakeRunner(ok(ownedInspect), ok(line))
+    const logs = await new CliDockerAdapter(runner).logs(identity, 10)
+    for (const term of sensitiveTerms) expect(logs.toLowerCase()).not.toContain(term.toLowerCase())
+    expect(logs).toContain('status=ok')
   })
 
   it('passes bounded logs through the injected structural redactor', async () => {
