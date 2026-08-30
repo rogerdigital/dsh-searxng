@@ -1,0 +1,10 @@
+use_default_settings: true
+
+server:
+  secret_key: "__DSH_SEARXNG_SECRET__"
+  limiter: false
+
+search:
+  formats:
+    - html
+    - json
