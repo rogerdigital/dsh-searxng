@@ -385,7 +385,8 @@ export class NodeProfileManager implements ProfileManager {
     let rollbackExpected: PatchSnapshot | undefined
     let output: Buffer | undefined
     let failureStage: FailureStage = 'install'
-    let restoreOriginalAllowed = true
+    let rollbackTarget = original
+    let restoreRollbackTargetAllowed = true
 
     try {
       if (!installedBefore) {
@@ -398,9 +399,12 @@ export class NodeProfileManager implements ProfileManager {
       failureStage = 'write'
       const renderBase = await this.readPatchSnapshot(patchPath)
       rollbackExpected = renderBase
-      if (pluginAdded && original.exists && !sameSnapshot(original, renderBase)) {
-        restoreOriginalAllowed = false
-        throw new ProfileConflictError()
+      if (pluginAdded) {
+        if (original.exists && !sameSnapshot(original, renderBase)) {
+          restoreRollbackTargetAllowed = false
+          throw new ProfileConflictError()
+        }
+        if (!original.exists) rollbackTarget = renderBase
       }
       output = renderAttachment(parsePatch(renderBase.bytes ?? Buffer.from('[]\n')), normalizedEndpoint)
       // Portable best-effort CAS: within the trusted profile directory, compare
@@ -432,7 +436,7 @@ export class NodeProfileManager implements ProfileManager {
         try {
           rollbackExpected = await this.readPatchSnapshot(patchPath)
           if (!sameSnapshot(original, rollbackExpected)) {
-            restoreOriginalAllowed = false
+            restoreRollbackTargetAllowed = false
             effectivePrimaryError = new ProfileConflictError()
           }
         } catch (error) {
@@ -484,9 +488,9 @@ export class NodeProfileManager implements ProfileManager {
         }
       }
 
-      if (rollbackCurrent !== undefined && restoreOriginalAllowed) {
+      if (rollbackCurrent !== undefined && restoreRollbackTargetAllowed) {
         try {
-          await this.restoreSnapshot(patchPath, original, rollbackCurrent)
+          await this.restoreSnapshot(patchPath, rollbackTarget, rollbackCurrent)
         } catch (error) {
           rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
         }

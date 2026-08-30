@@ -352,6 +352,44 @@ describe('transactional attachment', () => {
     await expect(fs.lstat(patchPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
+  it('restores the exact successful-add initialization after validation fails', async () => {
+    const runner = new RecordingRunner()
+    const initialized = Buffer.from(`# initialized by dsh
+- id: unrelated
+  config:
+    keep: true # preserve comment
+- id: web-search-searxng
+  config:
+    baseURL: http://initialized.invalid/base/
+    providerOption: keep
+`)
+    const { manager, dir, patchPath } = await fixture({ runner })
+    runner.handler = async (_command, args) => {
+      if (args.includes('add')) {
+        await fs.writeFile(join(dir, 'package.json'), JSON.stringify({
+          dependencies: { 'dsh-searxng': '0.1.0' },
+        }))
+        await fs.writeFile(patchPath, initialized)
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {
+      const attached = await fs.readFile(patchPath, 'utf8')
+      expect(attached).toContain('# dsh-searxng managed attachment')
+      throw new Error('validation failed')
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { primaryFailure: 'validation', rollbackFailures: [] },
+    })
+
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'remove', 'dsh-searxng'],
+    ])
+    await expect(fs.readFile(patchPath)).resolves.toEqual(initialized)
+  })
+
   it('never removes a pre-existing plugin when validation fails', async () => {
     const { manager, runner } = await fixture({
       packageJson: { dependencies: { 'dsh-searxng': '^0.1.0' } },
