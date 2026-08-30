@@ -23,4 +23,5 @@ jobs:
       - uses: rogerdigital/dsh-vet/action@v0.2.0
         with:
           specifier: 'dsh-searxng'
+          version: '0.2.1'
           commit-report: true
