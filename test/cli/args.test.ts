@@ -22,14 +22,13 @@ describe('parseCliArgs', () => {
   })
 
   it.each(['status', 'doctor'])('parses %s with defaults', (command) => {
-    expect(parseCliArgs([command])).toEqual({ command, profile: 'web', port: 8080, json: false })
+    expect(parseCliArgs([command])).toEqual({ command, profile: 'web', json: false })
   })
 
   it('parses remove flags', () => {
     expect(parseCliArgs(['remove', '--service', '--purge-data', '--yes', '--json'])).toEqual({
       command: 'remove',
       profile: 'web',
-      port: 8080,
       json: true,
       service: true,
       purgeData: true,
@@ -46,6 +45,21 @@ describe('parseCliArgs', () => {
     ['port below range', ['setup', '--port', '0']],
     ['port above range', ['setup', '--port', '65536']],
     ['noninteger port', ['setup', '--port', '8080.5']],
+    ['status port', ['status', '--port', '8081']],
+    ['doctor port', ['doctor', '--port', '8081']],
+    ['remove port', ['remove', '--port', '8081']],
+    ['status URL', ['status', '--url', 'https://search.example']],
+    ['doctor URL', ['doctor', '--url', 'https://search.example']],
+    ['remove URL', ['remove', '--url', 'https://search.example']],
+    ['setup service', ['setup', '--service']],
+    ['setup purge-data', ['setup', '--purge-data']],
+    ['setup yes', ['setup', '--yes']],
+    ['status service', ['status', '--service']],
+    ['doctor service', ['doctor', '--service']],
+    ['status purge-data', ['status', '--purge-data']],
+    ['doctor purge-data', ['doctor', '--purge-data']],
+    ['status yes', ['status', '--yes']],
+    ['doctor yes', ['doctor', '--yes']],
     ['purge without service', ['remove', '--purge-data']],
   ] as const)('rejects %s', (_name, argv) => {
     expect(() => parseCliArgs(argv)).toThrow()

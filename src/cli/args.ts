@@ -11,13 +11,11 @@ export type CliCommand =
   | {
       command: 'status' | 'doctor'
       profile: string
-      port: number
       json: boolean
     }
   | {
       command: 'remove'
       profile: string
-      port: number
       json: boolean
       service: boolean
       purgeData: boolean
@@ -74,6 +72,10 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   }
   const cliCommand = command as CliCommand['command']
 
+  if (cliCommand !== 'setup' && parsed.values.port !== undefined) {
+    invalid('--port is only supported by setup')
+  }
+
   const profile = parseProfile(parsed.values.profile)
   const port = parsePort(parsed.values.port)
   const json = parsed.values.json ?? false
@@ -87,6 +89,6 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   if (cliCommand === 'remove' && purgeData && !service) invalid('--purge-data requires --service')
 
   if (cliCommand === 'setup') return { command: cliCommand, profile, ...(url === undefined ? {} : { url }), port, json }
-  if (cliCommand === 'remove') return { command: cliCommand, profile, port, json, service, purgeData, yes }
-  return { command: cliCommand, profile, port, json }
+  if (cliCommand === 'remove') return { command: cliCommand, profile, json, service, purgeData, yes }
+  return { command: cliCommand, profile, json }
 }
