@@ -7,7 +7,7 @@ export interface CommandRunner {
   run(command: string, args: readonly string[], options?: { cwd?: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal }): Promise<CommandResult>
 }
 
-export type ProcessFailureReason = 'spawn' | 'output-overflow' | 'abort' | 'process-cleanup'
+export type ProcessFailureReason = 'spawn' | 'output-overflow' | 'process-cleanup'
 export class ProcessExecutionError extends Error {
   readonly reason: ProcessFailureReason
   readonly cause?: unknown
@@ -22,6 +22,35 @@ export class ProcessExecutionError extends Error {
 export const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024
 export function signalExitCode(signal: NodeJS.Signals): number { return 128 + (osConstants.signals[signal] ?? 0) }
 
+export interface ProcessTerminationStrategy {
+  terminate(child: ChildProcess, force: boolean): void
+}
+
+const directChildTerminationStrategy: ProcessTerminationStrategy = {
+  terminate(child, force) {
+    child.kill(force ? 'SIGKILL' : 'SIGTERM')
+  },
+}
+
+export function createWindowsProcessTreeTerminationStrategy(spawnProcess: typeof spawn = spawn): ProcessTerminationStrategy {
+  return {
+    terminate(child, force) {
+      if (child.pid === undefined) return
+      const args = ['/PID', String(child.pid), '/T']
+      if (force) args.push('/F')
+      try {
+        const taskkill = spawnProcess('taskkill.exe', args, { shell: false, stdio: 'ignore', windowsHide: true })
+        const ignoreError = () => {}
+        taskkill.on('error', ignoreError)
+        taskkill.once('close', () => taskkill.removeListener('error', ignoreError))
+        taskkill.unref()
+      } catch {
+        // The runner's close timeout remains the source of termination truth.
+      }
+    },
+  }
+}
+
 function abortError(): Error {
   const error = new Error('The operation was aborted')
   error.name = 'AbortError'
@@ -31,9 +60,10 @@ function abortError(): Error {
 export class NodeProcessRunner implements CommandRunner {
   readonly maxOutputBytes: number
   private readonly spawnProcess: typeof spawn
+  private readonly terminationStrategy: ProcessTerminationStrategy
   readonly terminationGraceMs: number
   readonly terminationForceMs: number
-  constructor(options: { maxOutputBytes?: number; spawn?: typeof spawn; terminationGraceMs?: number; terminationForceMs?: number } = {}) {
+  constructor(options: { maxOutputBytes?: number; spawn?: typeof spawn; terminationStrategy?: ProcessTerminationStrategy; terminationGraceMs?: number; terminationForceMs?: number } = {}) {
     for (const [name, value] of Object.entries({
       maxOutputBytes: options.maxOutputBytes,
       terminationGraceMs: options.terminationGraceMs,
@@ -43,11 +73,12 @@ export class NodeProcessRunner implements CommandRunner {
     }
     this.maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES
     this.spawnProcess = options.spawn ?? spawn
-    this.terminationGraceMs = options.terminationGraceMs ?? 250
-    this.terminationForceMs = options.terminationForceMs ?? 1000
+    this.terminationStrategy = options.terminationStrategy ?? (process.platform === 'win32' ? createWindowsProcessTreeTerminationStrategy() : directChildTerminationStrategy)
+    this.terminationGraceMs = options.terminationGraceMs ?? 1000
+    this.terminationForceMs = options.terminationForceMs ?? 5000
   }
 
-  /** Termination signals are sent only to the direct child; no shell or descendant-process cleanup is implied. */
+  /** POSIX signals target only the direct child; Windows uses taskkill.exe to target the child process tree. */
   run(command: string, args: readonly string[], options: { cwd?: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal } = {}): Promise<CommandResult> {
     if (options.signal?.aborted) return Promise.reject(abortError())
     return new Promise((resolve, reject) => {
@@ -62,8 +93,9 @@ export class NodeProcessRunner implements CommandRunner {
       let terminationError: Error | undefined
       let graceTimer: ReturnType<typeof setTimeout> | undefined
       let forceTimer: ReturnType<typeof setTimeout> | undefined
-      let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0)
-      let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0)
+      const stdoutChunks: Buffer<ArrayBufferLike>[] = []
+      const stderrChunks: Buffer<ArrayBufferLike>[] = []
+      let outputBytes = 0
       const clearTerminationTimers = () => {
         if (graceTimer !== undefined) clearTimeout(graceTimer)
         if (forceTimer !== undefined) clearTimeout(forceTimer)
@@ -86,10 +118,31 @@ export class NodeProcessRunner implements CommandRunner {
       }
       const signalDirectChild = (signal: NodeJS.Signals) => {
         try {
-          child.kill(signal)
+          this.terminationStrategy.terminate(child, signal === 'SIGKILL')
         } catch {
           // A close event is still required to confirm termination.
         }
+      }
+      const releaseStream = (stream: { destroy?: () => unknown; unref?: () => unknown } | null | undefined) => {
+        try { stream?.destroy?.() } catch {}
+        try { stream?.unref?.() } catch {}
+      }
+      const rejectUnconfirmedCleanup = () => {
+        if (state !== 'terminating') return
+        state = 'settled'
+        cleanup()
+        const ignoreLateError = () => {}
+        const finishLateCleanup = () => {
+          child.removeListener('error', ignoreLateError)
+          child.removeListener('close', finishLateCleanup)
+        }
+        child.on('error', ignoreLateError)
+        child.once('close', finishLateCleanup)
+        releaseStream(child.stdin)
+        releaseStream(child.stdout)
+        releaseStream(child.stderr)
+        try { child.unref() } catch {}
+        reject(new ProcessExecutionError('process-cleanup', 'Unable to confirm command termination'))
       }
       const requestTermination = (error: Error) => {
         if (state !== 'running') return
@@ -111,18 +164,18 @@ export class NodeProcessRunner implements CommandRunner {
           if (state !== 'terminating') return
           forceTimer = setTimeout(() => {
             forceTimer = undefined
-            if (state !== 'terminating') return
-            settleRejected(new ProcessExecutionError('process-cleanup', 'Unable to confirm command termination'))
+            rejectUnconfirmedCleanup()
           }, this.terminationForceMs)
         }, this.terminationGraceMs)
       }
-      const append = (current: Buffer<ArrayBufferLike>, chunk: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => {
-        const nextSize = stdout.byteLength + stderr.byteLength + chunk.byteLength
+      const append = (chunks: Buffer<ArrayBufferLike>[], chunk: Buffer<ArrayBufferLike>) => {
+        const nextSize = outputBytes + chunk.byteLength
         if (nextSize > this.maxOutputBytes) throw new ProcessExecutionError('output-overflow', `Command output exceeded ${this.maxOutputBytes} bytes`)
-        return Buffer.concat([current, chunk])
+        outputBytes = nextSize
+        chunks.push(chunk)
       }
-      const onStdout = (chunk: Buffer | string) => { try { stdout = append(stdout, Buffer.from(chunk)) } catch (error) { requestTermination(error as Error) } }
-      const onStderr = (chunk: Buffer | string) => { try { stderr = append(stderr, Buffer.from(chunk)) } catch (error) { requestTermination(error as Error) } }
+      const onStdout = (chunk: Buffer | string) => { try { append(stdoutChunks, Buffer.from(chunk)) } catch (error) { requestTermination(error as Error) } }
+      const onStderr = (chunk: Buffer | string) => { try { append(stderrChunks, Buffer.from(chunk)) } catch (error) { requestTermination(error as Error) } }
       const onAbort = () => requestTermination(abortError())
       const onError = (_cause: Error) => {
         if (state === 'settled') {
@@ -144,7 +197,7 @@ export class NodeProcessRunner implements CommandRunner {
           return
         }
         const exitCode = code ?? (signal ? signalExitCode(signal) : 1)
-        resolve({ exitCode, stdout: stdout.toString(), stderr: stderr.toString() })
+        resolve({ exitCode, stdout: Buffer.concat(stdoutChunks).toString(), stderr: Buffer.concat(stderrChunks).toString() })
       }
       child.stdout?.on('data', onStdout)
       child.stderr?.on('data', onStderr)

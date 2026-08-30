@@ -8,27 +8,43 @@ describe('redact', () => {
     expect(input).toEqual({ authorization: 'Bearer abc', nested: [{ secret_key: 's', safe: 1 }], query: 'private' })
   })
   it('normalizes bounded separators and avoids unrelated words', () => {
-    expect(redact({ DSH_SEARXNG_SECRET: 'x', SECRET_KEY: 'y', AUTH_HEADER: 'z', API_KEY: 'a', access_token: 'b', cookie: 'c', SEARCH_QUERY: 'd', monkey: 'safe' })).toEqual({ DSH_SEARXNG_SECRET: '[REDACTED]', SECRET_KEY: '[REDACTED]', AUTH_HEADER: '[REDACTED]', API_KEY: '[REDACTED]', access_token: '[REDACTED]', cookie: '[REDACTED]', SEARCH_QUERY: '[REDACTED]', monkey: 'safe' })
+    expect(redact({ DSH_SEARXNG_SECRET: 'x', SECRET_KEY: 'y', AUTH_HEADER: 'z', API_KEY: 'a', access_token: 'b', cookie: 'c', SEARCH_QUERY: 'd', clientSecret: 'e', databasePassword: 'f', bearerToken: 'g', sessionCookie: 'h', monkey: 'safe', secretary: 'safe' })).toEqual({ DSH_SEARXNG_SECRET: '[REDACTED]', SECRET_KEY: '[REDACTED]', AUTH_HEADER: '[REDACTED]', API_KEY: '[REDACTED]', access_token: '[REDACTED]', cookie: '[REDACTED]', SEARCH_QUERY: '[REDACTED]', clientSecret: '[REDACTED]', databasePassword: '[REDACTED]', bearerToken: '[REDACTED]', sessionCookie: '[REDACTED]', monkey: 'safe', secretary: 'safe' })
   })
 
   it('does not serialize secrets hidden in Error objects or non-plain values', () => {
     class SecretHolder { value = 'hidden'; toJSON() { return { token: 'hidden' } } }
     const customError = new Error('safe'); customError.name = 'secret-error'
     const value = { cause: customError, date: new Date('2020-01-01'), regexp: /secret/, holder: new SecretHolder(), token: 'secret' }
-    const result = redact(value) as Record<string, unknown>
-    expect(result.token).toBe('[REDACTED]')
+    const result = redact(value)
+    expect(result).toEqual({ cause: '[REDACTED]', date: '[REDACTED]', regexp: '[REDACTED]', holder: '[REDACTED]', token: '[REDACTED]' })
     expect(JSON.stringify(result)).not.toContain('hidden')
-    expect(result.date).toBe('[REDACTED]')
-    expect(result.regexp).toBe('[REDACTED]')
-    expect(result.holder).toBe('[REDACTED]')
-    expect(result.cause).toBe('[REDACTED]')
   })
   it('does not invoke throwing getters or proxy reflection', () => {
     const value = Object.create(null) as Record<string, unknown>
-    Object.defineProperty(value, 'secret', { get() { throw new Error('getter-secret') } })
+    Object.defineProperty(value, 'secret', { enumerable: true, get() { throw new Error('getter-secret') } })
     expect(redact(value)).toEqual({ secret: '[REDACTED]' })
     const proxy = new Proxy({}, { ownKeys() { throw new Error('proxy-secret') } })
     expect(redact(proxy)).toBe('[REDACTED]')
+  })
+
+  it('returns a fixed placeholder for getPrototypeOf-throwing and revoked proxies', () => {
+    const prototypeProxy = new Proxy({}, { getPrototypeOf() { throw new Error('prototype-secret') } })
+    const revocable = Proxy.revocable({}, {})
+    revocable.revoke()
+
+    expect(() => redact(prototypeProxy)).not.toThrow()
+    expect(redact(prototypeProxy)).toBe('[REDACTED]')
+    expect(() => redact(revocable.proxy)).not.toThrow()
+    expect(redact(revocable.proxy)).toBe('[REDACTED]')
+  })
+
+  it('skips non-enumerable properties instead of serializing hidden values', () => {
+    const value = { visible: 'safe' }
+    Object.defineProperty(value, 'hidden', { enumerable: false, value: 'hidden-secret' })
+
+    const output = JSON.stringify(redact(value))
+    expect(output).toBe('{"visible":"safe"}')
+    expect(output).not.toContain('hidden-secret')
   })
 })
 

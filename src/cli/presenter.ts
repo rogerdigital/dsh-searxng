@@ -2,6 +2,7 @@ import { CliError, redact } from './errors.ts'
 
 type Writer = (text: string) => void
 export interface PresenterOptions { format: 'human' | 'json'; stdout: Writer; stderr: Writer }
+const SERIALIZATION_FALLBACK = '{"code":"E_INTERNAL","message":"Unable to serialize output","action":"Inspect the command output"}\n'
 
 function stableJson(value: unknown): string {
   if (value === undefined || typeof value === 'bigint') return 'null'
@@ -15,16 +16,26 @@ function stableJson(value: unknown): string {
 }
 
 export function presentSuccess(value: unknown, options: PresenterOptions): void {
-  if (options.format === 'json') { try { options.stdout(`${stableJson(redact(value))}\n`) } catch { options.stdout('{"code":"E_INTERNAL","message":"Unable to serialize output","action":"Inspect the command output"}\n') } }
-  else options.stdout('Success\n')
+  let output: string
+  try {
+    output = options.format === 'json' ? `${stableJson(redact(value))}\n` : 'Success\n'
+  } catch {
+    output = SERIALIZATION_FALLBACK
+  }
+  options.stdout(output)
 }
 
 export function presentError(error: unknown, options: PresenterOptions): void {
-  const envelope = error instanceof CliError
-    ? error.toJSON()
-    : { code: 'E_INTERNAL' as const, message: 'An unexpected error occurred', action: 'Inspect the command output', cause: redact(error) }
+  let output: string
   try {
-    if (options.format === 'json') options.stderr(`${stableJson(redact(envelope))}\n`)
-    else options.stderr(`${envelope.code}: ${redact(envelope.message)}\nNext: ${redact(envelope.action)}\n`)
-  } catch { options.stderr('{"code":"E_INTERNAL","message":"Unable to serialize output","action":"Inspect the command output"}\n') }
+    const envelope = error instanceof CliError
+      ? error.toJSON()
+      : { code: 'E_INTERNAL' as const, message: 'An unexpected error occurred', action: 'Inspect the command output', cause: redact(error) }
+    output = options.format === 'json'
+      ? `${stableJson(redact(envelope))}\n`
+      : `${envelope.code}: ${redact(envelope.message)}\nNext: ${redact(envelope.action)}\n`
+  } catch {
+    output = SERIALIZATION_FALLBACK
+  }
+  options.stderr(output)
 }

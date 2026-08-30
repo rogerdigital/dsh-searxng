@@ -9,6 +9,7 @@ function writers() {
 }
 
 describe('CLI presenters', () => {
+  const fallback = '{"code":"E_INTERNAL","message":"Unable to serialize output","action":"Inspect the command output"}\n'
   it('writes human success to stdout with one newline', () => {
     const io = writers()
     presentSuccess({ ok: true }, { format: 'human', stdout: io.out, stderr: io.err })
@@ -38,8 +39,8 @@ describe('CLI presenters', () => {
   })
 
   it('always emits parseable JSON for unexpected cyclic and unusual values', () => {
-    const io = writers(); const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic
-    presentSuccess({ undefined: undefined, bigint: BigInt(2), nan: NaN, cyclic, date: new Date('secret') }, { format: 'json', stdout: io.out, stderr: io.err })
+    const io = writers(); const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic; const sparse = new Array(2)
+    presentSuccess({ undefined: undefined, bigint: BigInt(2), nan: NaN, cyclic, date: new Date('secret'), sparse }, { format: 'json', stdout: io.out, stderr: io.err })
     expect(() => JSON.parse(io.stdout[0]!)).not.toThrow()
     const error = new Error('secret cause'); error.name = 'secret name'
     presentError(error, { format: 'json', stdout: io.out, stderr: io.err })
@@ -52,5 +53,38 @@ describe('CLI presenters', () => {
     presentSuccess(proxy, { format: 'json', stdout: io.out, stderr: io.err })
     expect(() => JSON.parse(io.stdout[0]!)).not.toThrow()
     expect(io.stdout[0]).not.toContain('secret')
+  })
+
+  it('safely presents getPrototypeOf-throwing proxies without exposing trap text', () => {
+    const proxy = new Proxy({}, { getPrototypeOf() { throw new Error('prototype-secret') } })
+    const success = writers()
+    const failure = writers()
+
+    presentSuccess(proxy, { format: 'json', stdout: success.out, stderr: success.err })
+    presentError(proxy, { format: 'json', stdout: failure.out, stderr: failure.err })
+
+    expect(success.stdout).toEqual(['"[REDACTED]"\n'])
+    expect(failure.stderr).toEqual([fallback])
+    expect(success.stdout[0]).not.toContain('prototype-secret')
+    expect(failure.stderr[0]).not.toContain('prototype-secret')
+    expect(() => JSON.parse(success.stdout[0]!)).not.toThrow()
+    expect(() => JSON.parse(failure.stderr[0]!)).not.toThrow()
+  })
+
+  it('safely presents revoked proxies without exposing proxy failures', () => {
+    const successProxy = Proxy.revocable({}, {})
+    const errorProxy = Proxy.revocable({}, {})
+    successProxy.revoke()
+    errorProxy.revoke()
+    const success = writers()
+    const failure = writers()
+
+    presentSuccess(successProxy.proxy, { format: 'json', stdout: success.out, stderr: success.err })
+    presentError(errorProxy.proxy, { format: 'json', stdout: failure.out, stderr: failure.err })
+
+    expect(success.stdout).toEqual(['"[REDACTED]"\n'])
+    expect(failure.stderr).toEqual([fallback])
+    expect(() => JSON.parse(success.stdout[0]!)).not.toThrow()
+    expect(() => JSON.parse(failure.stderr[0]!)).not.toThrow()
   })
 })
