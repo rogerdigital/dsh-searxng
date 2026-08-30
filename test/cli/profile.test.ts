@@ -442,6 +442,72 @@ describe('rollback and file safety', () => {
     })
   })
 
+  it('restores the original only after successful remove-side patch recreation', async () => {
+    const events: string[] = []
+    const runner = new RecordingRunner()
+    let patchPath = ''
+    const fileSystem: ProfileFileSystem = {
+      ...fs,
+      rename: async (...args: Parameters<typeof fs.rename>) => {
+        if (String(args[1]) === patchPath) events.push('write')
+        await fs.rename(...args)
+      },
+    }
+    const original = Buffer.from('# exact original\n[]\n')
+    const created = await fixture({ patch: original.toString(), runner, fileSystem })
+    patchPath = created.patchPath
+    runner.handler = async (_command, args) => {
+      if (args.includes('remove')) {
+        events.push('remove')
+        await fs.writeFile(patchPath, '# recreated by remove\n[]\n')
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await expect(created.manager.attach('web', 'http://localhost:8080', async () => {
+      events.push('validate')
+      throw new Error('validation failed')
+    })).rejects.toMatchObject({ code: 'E_PROFILE_WRITE' })
+
+    expect(events).toEqual(['write', 'validate', 'remove', 'write'])
+    await expect(fs.readFile(patchPath)).resolves.toEqual(original)
+  })
+
+  it('removes a patch recreated by successful plugin cleanup when the original was absent', async () => {
+    const runner = new RecordingRunner()
+    const { manager, patchPath } = await fixture({ runner })
+    runner.handler = async (_command, args) => {
+      if (args.includes('remove')) await fs.writeFile(patchPath, '# recreated by remove\n[]\n')
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {
+      throw new Error('validation failed')
+    })).rejects.toMatchObject({ code: 'E_PROFILE_WRITE' })
+    await expect(fs.lstat(patchPath)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('preserves a patch modified by failed plugin cleanup and reports the cleanup failure', async () => {
+    const runner = new RecordingRunner()
+    const partial = '# partial remove result\n- id: preserve-me\n'
+    const { manager, patchPath } = await fixture({ patch: '[]\n', runner })
+    runner.handler = async (_command, args) => {
+      if (args.includes('remove')) {
+        await fs.writeFile(patchPath, partial)
+        return { exitCode: 1, stdout: '', stderr: 'private cleanup failure' }
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {
+      throw new Error('validation failed')
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { rollbackFailures: expect.arrayContaining(['plugin']) },
+    })
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(partial)
+  })
+
   it('preserves command cancellation after confirming there was no install side effect', async () => {
     const runner = new RecordingRunner()
     const cancellation = new Error('cancel secret endpoint https://private.invalid?q=token')
@@ -625,6 +691,49 @@ describe('rollback and file safety', () => {
     })
     await expect(fs.readFile(patchPath)).resolves.toEqual(original)
     expect((await fs.readdir(dir)).filter((name) => name.includes('.tmp-'))).toEqual([])
+  })
+
+  it('preserves a same-byte foreign replacement made while post-rename directory fsync fails', async () => {
+    let replaceDuringDirectorySync = true
+    let patchPath = ''
+    let foreignInode: number | undefined
+    const fileSystem: ProfileFileSystem = {
+      ...fs,
+      open: async (...args: Parameters<typeof fs.open>) => {
+        const handle = await fs.open(...args)
+        if (args[1] === 'r' && replaceDuringDirectorySync) {
+          replaceDuringDirectorySync = false
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === 'sync') return async () => {
+                const committedBytes = await fs.readFile(patchPath)
+                const replacement = `${patchPath}.foreign`
+                await fs.writeFile(replacement, committedBytes)
+                await fs.rename(replacement, patchPath)
+                foreignInode = (await fs.lstat(patchPath)).ino
+                throw new Error('directory fsync failed after foreign replacement')
+              }
+              const value = Reflect.get(target, property, target) as unknown
+              return typeof value === 'function' ? value.bind(target) : value
+            },
+          })
+        }
+        return handle
+      },
+    }
+    const created = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.0' } },
+      patch: '[]\n',
+      fileSystem,
+    })
+    patchPath = created.patchPath
+
+    await expect(created.manager.attach('web', 'http://localhost:8080', async () => {})).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { rollbackFailures: ['patch-conflict'] },
+    })
+    expect((await fs.lstat(patchPath)).ino).toBe(foreignInode)
+    expect(await fs.readFile(patchPath, 'utf8')).toContain('dsh-searxng managed attachment')
   })
 
   it('writes user-only files and leaves no temporary artifacts', async () => {

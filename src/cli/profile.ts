@@ -71,6 +71,15 @@ class ProfileConflictError extends Error {
   }
 }
 
+class CommittedWriteError extends Error {
+  readonly committed: PatchSnapshot
+  constructor(committed: PatchSnapshot) {
+    super('committed-write-finalization-failed')
+    this.name = 'CommittedWriteError'
+    this.committed = committed
+  }
+}
+
 interface FileIdentity {
   readonly device: number | bigint
   readonly inode: number | bigint
@@ -385,10 +394,12 @@ export class NodeProfileManager implements ProfileManager {
       if (!sameSnapshot(renderBase, beforeCommit)) throw new ProfileConflictError()
 
       writeAttempted = true
-      await this.writeAtomic(patchPath, output, renderBase)
-      const written = await this.readPatchSnapshot(patchPath)
-      if (!sameBytes(written, output)) throw new ProfileConflictError()
-      rollbackExpected = written
+      try {
+        rollbackExpected = await this.writeAtomic(patchPath, output, renderBase)
+      } catch (error) {
+        if (error instanceof CommittedWriteError) rollbackExpected = error.committed
+        throw error
+      }
 
       failureStage = 'validation'
       await validate()
@@ -413,20 +424,44 @@ export class NodeProfileManager implements ProfileManager {
         }
       }
 
+      let rollbackCurrent: PatchSnapshot | undefined
       if ((pluginAdded || writeAttempted) && !patchRollbackBlocked) {
         try {
           const current = await this.readPatchSnapshot(patchPath)
-          const safeToRestore = rollbackExpected !== undefined && sameSnapshot(current, rollbackExpected)
-            || (failureStage === 'write' && writeAttempted && output !== undefined && sameBytes(current, output))
-          if (!safeToRestore) throw new ProfileConflictError()
-          await this.restoreSnapshot(patchPath, original, current)
+          if (rollbackExpected === undefined || !sameSnapshot(current, rollbackExpected)) {
+            throw new ProfileConflictError()
+          }
+          rollbackCurrent = current
         } catch (error) {
           rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
         }
       }
 
       if (pluginAdded) {
-        try { await this.runPlugin(name, 'remove') } catch { rollbackFailures.push('plugin') }
+        let pluginRemoved = false
+        try {
+          await this.runPlugin(name, 'remove')
+          pluginRemoved = true
+        } catch {
+          rollbackFailures.push('plugin')
+          rollbackCurrent = undefined
+        }
+        if (pluginRemoved && rollbackCurrent !== undefined) {
+          try {
+            rollbackCurrent = await this.readPatchSnapshot(patchPath)
+          } catch (error) {
+            rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
+            rollbackCurrent = undefined
+          }
+        }
+      }
+
+      if (rollbackCurrent !== undefined) {
+        try {
+          await this.restoreSnapshot(patchPath, original, rollbackCurrent)
+        } catch (error) {
+          rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
+        }
       }
 
       if (rollbackFailures.length === 0) {
@@ -466,24 +501,24 @@ export class NodeProfileManager implements ProfileManager {
     const output = renderDetachment(parsePatch(snapshot.bytes))
     if (output === undefined) return
     let writeAttempted = false
-    let writeCompleted = false
     let rollbackExpected = snapshot
     try {
       const beforeCommit = await this.readPatchSnapshot(patchPath)
       if (!sameSnapshot(snapshot, beforeCommit)) throw new ProfileConflictError()
       writeAttempted = true
-      await this.writeAtomic(patchPath, output, snapshot)
-      const written = await this.readPatchSnapshot(patchPath)
-      if (!sameBytes(written, output)) throw new ProfileConflictError()
-      rollbackExpected = written
-      writeCompleted = true
+      try {
+        rollbackExpected = await this.writeAtomic(patchPath, output, snapshot)
+      } catch (error) {
+        if (error instanceof CommittedWriteError) rollbackExpected = error.committed
+        throw error
+      }
       signal?.throwIfAborted()
     } catch (primaryError) {
       const rollbackFailures: string[] = []
       if (writeAttempted) {
         try {
           const current = await this.readPatchSnapshot(patchPath)
-          if (!sameSnapshot(current, rollbackExpected) && (writeCompleted || !sameBytes(current, output))) {
+          if (!sameSnapshot(current, rollbackExpected)) {
             throw new ProfileConflictError()
           }
           await this.restoreSnapshot(patchPath, snapshot, current)
@@ -576,7 +611,11 @@ export class NodeProfileManager implements ProfileManager {
     await this.syncDirectory(dirname(patchPath))
   }
 
-  private async writeAtomic(path: string, bytes: Buffer, expectedCurrent?: PatchSnapshot): Promise<void> {
+  private async writeAtomic(
+    path: string,
+    bytes: Buffer,
+    expectedCurrent?: PatchSnapshot,
+  ): Promise<PatchSnapshot> {
     const directory = dirname(path)
     await this.fileSystem.mkdir(directory, { recursive: true, mode: 0o700 })
     const temporaryPath = `${path}.tmp-${this.randomId()}`
@@ -593,7 +632,14 @@ export class NodeProfileManager implements ProfileManager {
         if (!sameSnapshot(beforeRename, expectedCurrent)) throw new ProfileConflictError()
       }
       await this.fileSystem.rename(temporaryPath, path)
-      await this.syncDirectory(directory)
+      const committed = await this.readPatchSnapshot(path)
+      if (!sameBytes(committed, bytes)) throw new ProfileConflictError()
+      try {
+        await this.syncDirectory(directory)
+      } catch {
+        throw new CommittedWriteError(committed)
+      }
+      return committed
     } catch (error) {
       if (handle !== undefined) {
         try { await handle.close() } catch {}
