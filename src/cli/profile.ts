@@ -135,11 +135,12 @@ function ioCode(error: unknown): string | undefined {
 function profileWriteError(
   message = 'Unable to update the DSH profile',
   details: Record<string, unknown> = {},
+  action = 'Check the DSH profile and retry',
 ): CliError {
   return new CliError(
     'E_PROFILE_WRITE',
     message,
-    'Check the DSH profile and retry',
+    action,
     details,
   )
 }
@@ -534,7 +535,7 @@ export class NodeProfileManager implements ProfileManager {
       renderAttachment(parsePatch(original.bytes), normalizedEndpoint)
     }
     let pluginAdded = false
-    let pluginOwnershipUncertain = false
+    let pluginResidualPossible = false
     let deferredAddError: unknown
     let writeAttempted = false
     let rollbackExpected: PatchSnapshot | undefined
@@ -552,7 +553,7 @@ export class NodeProfileManager implements ProfileManager {
         }
         let addError: unknown
         try {
-          await this.runPlugin(name, 'add', signal)
+          await this.addPlugin(name, signal)
         } catch (error) {
           addError = error
         }
@@ -560,18 +561,18 @@ export class NodeProfileManager implements ProfileManager {
         try {
           afterAdd = await this.readManifestSnapshot(packagePath)
         } catch {
-          pluginOwnershipUncertain = true
+          pluginResidualPossible = true
           throw concurrentProfileModification()
         }
         if (!this.installedFromManifestSnapshot(afterAdd)) {
           if (!sameSnapshot(beforeAdd, afterAdd)) {
-            pluginOwnershipUncertain = true
             throw concurrentProfileModification()
           }
           if (addError !== undefined) throw addError
           throw new OperationFailure('install')
         }
         pluginAdded = true
+        pluginResidualPossible = true
         manifestBaseline = afterAdd
         deferredAddError = addError
       }
@@ -629,6 +630,7 @@ export class NodeProfileManager implements ProfileManager {
       const rollbackFailures: string[] = []
       let patchRollbackBlocked = false
       let effectivePrimaryError = primaryError
+      if (pluginResidualPossible) rollbackFailures.push('plugin-residual')
 
       if (!installedBefore && !pluginAdded && failureStage === 'install') {
         try {
@@ -641,7 +643,6 @@ export class NodeProfileManager implements ProfileManager {
           rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
           patchRollbackBlocked = true
         }
-        if (pluginOwnershipUncertain) rollbackFailures.push('plugin-conflict')
       }
 
       let rollbackCurrent: PatchSnapshot | undefined
@@ -654,43 +655,6 @@ export class NodeProfileManager implements ProfileManager {
           rollbackCurrent = current
         } catch (error) {
           rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
-        }
-      }
-
-      if (pluginAdded) {
-        if (!await this.manifestMatches(packagePath, manifestBaseline)) {
-          rollbackFailures.push('plugin-conflict')
-        } else {
-          const beforeRemove = rollbackCurrent
-          let removeSucceeded = false
-          try {
-            await this.runPlugin(name, 'remove')
-            removeSucceeded = true
-          } catch {
-            rollbackFailures.push('plugin')
-          }
-          if (removeSucceeded) {
-            try {
-              const manifestAfterRemove = await this.readManifestSnapshot(packagePath)
-              if (this.installedFromManifestSnapshot(manifestAfterRemove)) rollbackFailures.push('plugin')
-            } catch {
-              rollbackFailures.push('plugin')
-            }
-          }
-          if (beforeRemove !== undefined) {
-            try {
-              const afterRemove = await this.readPatchSnapshot(patchPath)
-              if (!sameSnapshot(beforeRemove, afterRemove)) {
-                rollbackFailures.push('patch-conflict')
-                rollbackCurrent = undefined
-              } else {
-                rollbackCurrent = afterRemove
-              }
-            } catch (error) {
-              rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
-              rollbackCurrent = undefined
-            }
-          }
         }
       }
 
@@ -714,6 +678,9 @@ export class NodeProfileManager implements ProfileManager {
           primaryError: primaryErrorClass(effectivePrimaryError, failureStage, signal),
           rollbackFailures,
         },
+        rollbackFailures.includes('plugin-residual')
+          ? 'Run dsh-searxng setup again; it will reuse or reconcile the retained plugin package state'
+          : 'Check the DSH profile and retry',
       )
     }
   }
@@ -859,17 +826,16 @@ export class NodeProfileManager implements ProfileManager {
     }
   }
 
-  private async runPlugin(
+  private async addPlugin(
     profile: string,
-    operation: 'add' | 'remove',
     signal?: AbortSignal,
   ): Promise<void> {
     signal?.throwIfAborted()
     const result = await this.commandRunner.run(this.dshCommand, [
-      'plugin', '--profile', profile, operation, PLUGIN_NAME,
+      'plugin', '--profile', profile, 'add', PLUGIN_NAME,
     ], { signal })
     signal?.throwIfAborted()
-    if (result.exitCode !== 0) throw new OperationFailure(operation === 'add' ? 'install' : 'write')
+    if (result.exitCode !== 0) throw new OperationFailure('install')
   }
 
   private async restoreSnapshot(

@@ -523,7 +523,7 @@ Create temporary profiles with comments, unrelated entries, an empty `[]` patch,
 - attachment appends one last id-targeted patch and copies existing config keys before setting `baseURL`;
 - unrelated YAML nodes and comments survive;
 - multiple pre-existing id-target patches remain in their original order, and the last effective config is copied into the final managed patch before `baseURL` is replaced;
-- final validation failure restores the byte-identical original patch and removes the plugin only when this transaction added it;
+- final validation failure restores the byte-identical original patch, retains any plugin package installation as a diagnosed `plugin-residual`, and allows a repeated setup to reuse it;
 - detachment removes only the managed patch and reveals the user's original override.
 
 The managed patch carries an AST comment marker `dsh-searxng managed attachment`; removal identifies both the marker and `id`, never the marker alone.
@@ -548,7 +548,7 @@ export interface ProfileManager {
 
 Resolve the official layout as `<DSH_HOME>/profiles/<profile>/package.json` and `cordis.patch.yml`. Use `yaml.parseDocument` and mutate its AST so comments and unrelated nodes remain. The final managed patch must be last because DSH applies patches in list order and an id-targeted patch replaces the row's whole `config`.
 
-Before the first mutation, save the original bytes and whether the package was already installed. On failure, atomically restore the patch and run `dsh plugin --profile <profile> remove dsh-searxng` only when this transaction added it. If rollback fails, return `E_PROFILE_WRITE` containing both redacted failures.
+Before the first mutation, save the original bytes and whether the package was already installed. On failure, atomically restore only the patch state whose identity and bytes still prove ownership. Do not automatically remove the plugin package: DSH and its package manager do not participate in this transaction, so shared profile package ownership cannot be proven atomically. Retain it as `plugin-residual`, return a redacted `E_PROFILE_WRITE` with an instruction to rerun setup, and let the next setup reuse the installed plugin.
 
 - [ ] **Step 4: Run tests**
 

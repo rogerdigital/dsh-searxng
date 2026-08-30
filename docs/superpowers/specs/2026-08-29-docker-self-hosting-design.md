@@ -150,7 +150,7 @@ The command:
 8. Calls the JSON API with a real query.
 9. After the query passes, installs `dsh-searxng` through the standard DSH plugin command when needed and atomically applies the endpoint configuration.
 10. Runs the provider using the final configuration and executes a final real query.
-11. If final validation fails, restores the original profile and reverses the plugin addition when this setup invocation added it.
+11. If final validation fails, restores the atomically owned profile patch but retains any plugin package installation as a diagnosed `plugin-residual`; rerunning setup reuses it. Shared profile package state is never auto-removed because atomic ownership cannot be proven across external DSH/package-manager processes.
 12. Prints the profile, endpoint, successful test result, and the next `dsh` command.
 
 Running `setup` is explicit authorization for ordinary resource creation and the scoped profile update, so the normal path has no redundant confirmation. Setup stops before changes when it detects foreign resources, an occupied port, invalid existing YAML, or another conflict that cannot be resolved without user choice.
