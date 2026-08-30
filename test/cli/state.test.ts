@@ -73,6 +73,7 @@ async function lockArtifacts(root: string): Promise<string[]> {
   return (await readdir(root)).filter((name) =>
     name.startsWith('state.lock.owner-') ||
     name.startsWith('state.lock.claim-') ||
+    name.includes('.retired-') ||
     name === 'state.lock.transition',
   )
 }
@@ -84,9 +85,25 @@ async function expectAggregate(promise: Promise<unknown>, fragments: readonly st
   } catch (error) {
     expect(error).toBeInstanceOf(AggregateError)
     const aggregate = error as AggregateError
-    const messages = aggregate.errors.map((item) => item instanceof Error ? item.message : String(item)).join('\n')
+    const messages = errorMessages(aggregate).join('\n')
     for (const fragment of fragments) expect(messages).toContain(fragment)
     return aggregate
+  }
+}
+
+function errorMessages(error: unknown): string[] {
+  if (error instanceof AggregateError) {
+    return [error.message, ...error.errors.flatMap((item) => errorMessages(item))]
+  }
+  return [error instanceof Error ? error.message : String(error)]
+}
+
+async function expectRejectedWith(promise: Promise<unknown>, fragment: string): Promise<void> {
+  try {
+    await promise
+    throw new Error('expected rejection')
+  } catch (error) {
+    expect(errorMessages(error)).toContain(fragment)
   }
 }
 
@@ -411,7 +428,7 @@ describe('StateStore exclusive lock', () => {
     try {
       const store = new StateStore(root, {
         rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
-          if (path === transitionPath) throw new Error('transition cleanup failed')
+          if (path.includes('state.lock.transition.retired-')) throw new Error('transition cleanup failed')
           return rm(path, options)
         }) as typeof rm,
       })
@@ -438,6 +455,72 @@ describe('StateStore exclusive lock', () => {
       })
       await expect(readFile(transitionPath)).resolves.toEqual(foreign)
       expect((await lockArtifacts(root)).filter((name) => name.startsWith('state.lock.owner-'))).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves a replacement transition guard at the retirement boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const lockPath = join(root, 'state.lock')
+    const transitionPath = join(root, 'state.lock.transition')
+    const foreign = Buffer.from('replacement transition guard')
+    let replaced = false
+    let invoked = false
+    try {
+      const store = new StateStore(root, {
+        rename: (async (from: string, to: string) => {
+          if (from === transitionPath && to.includes('.retired-') && !replaced) {
+            await rm(from)
+            await writeFile(from, foreign, { mode: 0o600 })
+            replaced = true
+          }
+          return fsRename(from, to)
+        }) as typeof fsRename,
+      })
+
+      await expectRejectedWith(
+        store.withLock(async () => { invoked = true }),
+        'State lock transition guard was replaced before retirement',
+      )
+      expect(replaced).toBe(true)
+      expect(invoked).toBe(false)
+      await expect(readFile(transitionPath)).resolves.toEqual(foreign)
+      await expect(readFile(lockPath, 'utf8')).resolves.toContain('"identity"')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves a transition guard whose identity changes on the same inode at retirement', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const lockPath = join(root, 'state.lock')
+    const transitionPath = join(root, 'state.lock.transition')
+    const foreign = Buffer.from('mutated transition identity')
+    let originalInode: number | undefined
+    let mutatedInode: number | undefined
+    let invoked = false
+    try {
+      const store = new StateStore(root, {
+        rename: (async (from: string, to: string) => {
+          if (from === transitionPath && to.includes('.retired-') && originalInode === undefined) {
+            originalInode = (await stat(from)).ino
+            await writeFile(from, foreign)
+            mutatedInode = (await stat(from)).ino
+          }
+          return fsRename(from, to)
+        }) as typeof fsRename,
+      })
+
+      await expectRejectedWith(
+        store.withLock(async () => { invoked = true }),
+        'State lock transition guard was replaced before retirement',
+      )
+      expect(originalInode).toBeDefined()
+      expect(mutatedInode).toBe(originalInode)
+      expect(invoked).toBe(false)
+      await expect(readFile(transitionPath)).resolves.toEqual(foreign)
+      await expect(readFile(lockPath, 'utf8')).resolves.toContain('"identity"')
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -581,6 +664,108 @@ describe('StateStore exclusive lock', () => {
       await expect(store.withLock(async () => 'done')).resolves.toBe('done')
       await expect(readFile(lockPath)).resolves.toEqual(foreign)
       await expect(lockArtifacts(root)).resolves.toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves a same-identity foreign claim replaced at the retirement boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const lockPath = join(root, 'state.lock')
+    let replacement: Buffer | undefined
+    let replacementInode: number | undefined
+    try {
+      const store = new StateStore(root, {
+        rename: (async (from: string, to: string) => {
+          if (from.includes('state.lock.claim-') && to.includes('.retired-') && replacement === undefined) {
+            replacement = await readFile(from)
+            await rm(from)
+            await writeFile(from, replacement, { mode: 0o600 })
+            replacementInode = (await stat(from)).ino
+          }
+          return fsRename(from, to)
+        }) as typeof fsRename,
+      })
+
+      await expectRejectedWith(
+        store.withLock(async () => 'done'),
+        'Owned state lock claim was replaced before retirement',
+      )
+      expect(replacement).toBeDefined()
+      const claim = (await readdir(root)).find((name) => name.startsWith('state.lock.claim-'))
+      expect(claim).toBeDefined()
+      await expect(readFile(join(root, claim!))).resolves.toEqual(replacement)
+      expect((await stat(join(root, claim!))).ino).toBe(replacementInode)
+      await expect(readFile(lockPath)).resolves.toEqual(replacement)
+      expect((await stat(lockPath)).ino).not.toBe(replacementInode)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves a malformed foreign owner replaced at the retirement boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const lockPath = join(root, 'state.lock')
+    const foreign = Buffer.from('malformed replacement owner')
+    let ownerPath: string | undefined
+    try {
+      const store = new StateStore(root, {
+        rename: (async (from: string, to: string) => {
+          if (from.includes('state.lock.owner-') && to.includes('.retired-') && ownerPath === undefined) {
+            ownerPath = from
+            await rm(from)
+            await writeFile(from, foreign, { mode: 0o600 })
+          }
+          return fsRename(from, to)
+        }) as typeof fsRename,
+      })
+
+      await expectRejectedWith(
+        store.withLock(async () => 'done'),
+        'State lock owner was replaced before retirement',
+      )
+      expect(ownerPath).toBeDefined()
+      await expect(readFile(ownerPath!)).resolves.toEqual(foreign)
+      await expect(readFile(lockPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect((await lockArtifacts(root)).filter((name) => name.startsWith('state.lock.claim-'))).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves a replacement claim during foreign-claim restoration retirement', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const lockPath = join(root, 'state.lock')
+    const originalForeign = Buffer.from('original foreign canonical')
+    const cleanupReplacement = Buffer.from('malformed cleanup replacement')
+    let claimed = false
+    let replacedDuringCleanup = false
+    try {
+      const store = new StateStore(root, {
+        rename: (async (from: string, to: string) => {
+          if (from === lockPath && to.includes('state.lock.claim-') && !claimed) {
+            await rm(from)
+            await writeFile(from, originalForeign, { mode: 0o600 })
+            claimed = true
+          } else if (from.includes('state.lock.claim-') && to.includes('.retired-') && !replacedDuringCleanup) {
+            await rm(from)
+            await writeFile(from, cleanupReplacement, { mode: 0o600 })
+            replacedDuringCleanup = true
+          }
+          return fsRename(from, to)
+        }) as typeof fsRename,
+      })
+
+      await expectRejectedWith(
+        store.withLock(async () => 'done'),
+        'Restored foreign lock claim was replaced before retirement',
+      )
+      expect(claimed).toBe(true)
+      expect(replacedDuringCleanup).toBe(true)
+      await expect(readFile(lockPath)).resolves.toEqual(originalForeign)
+      const claim = (await readdir(root)).find((name) => name.startsWith('state.lock.claim-'))
+      expect(claim).toBeDefined()
+      await expect(readFile(join(root, claim!))).resolves.toEqual(cleanupReplacement)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
