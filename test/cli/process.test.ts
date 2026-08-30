@@ -1,10 +1,43 @@
+import type { ChildProcess } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { execPath } from 'node:process'
-import { describe, expect, it } from 'vitest'
+import { PassThrough } from 'node:stream'
+import spawn from 'cross-spawn'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { NodeProcessRunner, ProcessExecutionError, signalExitCode } from '../../src/cli/process.ts'
+
+interface FakeChild extends EventEmitter {
+  pid?: number
+  stdout: PassThrough
+  stderr: PassThrough
+  kill: ReturnType<typeof vi.fn>
+}
+
+function createFakeChild(pid: number | undefined): FakeChild {
+  const child = new EventEmitter() as FakeChild
+  child.pid = pid
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.kill = vi.fn(() => true)
+  return child
+}
+
+function asSpawn(child: FakeChild): typeof spawn {
+  return vi.fn(() => child as unknown as ChildProcess) as unknown as typeof spawn
+}
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 describe('NodeProcessRunner', () => {
   it.each([NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])('rejects invalid output limit %s', (maxOutputBytes) => {
     expect(() => new NodeProcessRunner({ maxOutputBytes })).toThrow()
+  })
+  it.each(['terminationGraceMs', 'terminationForceMs'] as const)('rejects invalid %s values', (option) => {
+    for (const value of [NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => new NodeProcessRunner({ [option]: value })).toThrow()
+    }
   })
   it('captures stdout from an argument-array command', async () => {
     await expect(new NodeProcessRunner().run(execPath, ['-e', "process.stdout.write('hello')"])).resolves.toEqual({ exitCode: 0, stdout: 'hello', stderr: '' })
@@ -21,16 +54,106 @@ describe('NodeProcessRunner', () => {
   it('enforces an aggregate stdout and stderr limit', async () => {
     await expect(new NodeProcessRunner({ maxOutputBytes: 10 }).run(execPath, ['-e', "process.stdout.write('123456'); process.stderr.write('123456')"])).rejects.toMatchObject({ reason: 'output-overflow' })
   })
-  it('escalates termination when a child ignores SIGTERM', async () => {
+  it('waits for close after abort escalates a SIGTERM-ignoring child to SIGKILL', async () => {
     if (process.platform === 'win32') return
+    let child: ChildProcess | undefined
+    let childClosed = false
+    let closeSignal: NodeJS.Signals | null = null
+    let markReady: (() => void) | undefined
+    const ready = new Promise<void>((resolve) => { markReady = resolve })
+    const observedSpawn = ((...args: Parameters<typeof spawn>) => {
+      child = spawn(...args)
+      child.stdout?.once('data', () => markReady?.())
+      child.once('close', (_code, signal) => {
+        childClosed = true
+        closeSignal = signal
+      })
+      return child
+    }) as typeof spawn
     const controller = new AbortController()
-    const pending = new NodeProcessRunner({ terminationGraceMs: 20, terminationTimeoutMs: 100 }).run(execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { signal: controller.signal })
-    controller.abort()
-    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    const pending = new NodeProcessRunner({ spawn: observedSpawn, terminationGraceMs: 20, terminationForceMs: 100 }).run(execPath, ['-e', "process.on('SIGTERM', () => {}); process.stdout.write('ready'); setInterval(() => {}, 1000)"], { signal: controller.signal })
+    try {
+      await ready
+      const pid = child?.pid
+      expect(pid).toBeTypeOf('number')
+      controller.abort()
+      const error = await pending.then(
+        () => new Error('expected abort rejection'),
+        (value) => {
+          expect(childClosed).toBe(true)
+          return value
+        },
+      )
+      expect(error).toMatchObject({ name: 'AbortError' })
+      expect(closeSignal).toBe('SIGKILL')
+      expect(() => process.kill(pid!, 0)).toThrow()
+    } finally {
+      child?.kill('SIGKILL')
+    }
   })
 
-  it('rejects when output exceeds the configured bounded buffer', async () => {
-    await expect(new NodeProcessRunner({ maxOutputBytes: 32 }).run(execPath, ['-e', "process.stdout.write('x'.repeat(1000))"])).rejects.toMatchObject({ name: 'ProcessExecutionError', reason: 'output-overflow' })
+  it('waits for close after output overflow escalates a SIGTERM-ignoring child to SIGKILL', async () => {
+    if (process.platform === 'win32') return
+    let child: ChildProcess | undefined
+    let childClosed = false
+    let closeSignal: NodeJS.Signals | null = null
+    const observedSpawn = ((...args: Parameters<typeof spawn>) => {
+      child = spawn(...args)
+      child.once('close', (_code, signal) => {
+        childClosed = true
+        closeSignal = signal
+      })
+      return child
+    }) as typeof spawn
+    const pending = new NodeProcessRunner({ maxOutputBytes: 32, spawn: observedSpawn, terminationGraceMs: 20, terminationForceMs: 100 }).run(execPath, ['-e', "process.on('SIGTERM', () => {}); process.stdout.write('x'.repeat(1000)); setInterval(() => {}, 1000)"])
+    try {
+      const pid = child?.pid
+      expect(pid).toBeTypeOf('number')
+      const error = await pending.then(
+        () => new Error('expected output overflow rejection'),
+        (value) => {
+          expect(childClosed).toBe(true)
+          return value
+        },
+      )
+      expect(error).toMatchObject({ name: 'ProcessExecutionError', reason: 'output-overflow' })
+      expect(closeSignal).toBe('SIGKILL')
+      expect(() => process.kill(pid!, 0)).toThrow()
+    } finally {
+      child?.kill('SIGKILL')
+    }
+  })
+
+  it('rejects safely after SIGTERM and SIGKILL cannot be confirmed by close', async () => {
+    vi.useFakeTimers()
+    const child = createFakeChild(12345)
+    const controller = new AbortController()
+    const pending = new NodeProcessRunner({ spawn: asSpawn(child), terminationGraceMs: 10, terminationForceMs: 20 }).run('command', ['--token', 'secret'], { signal: controller.signal })
+    let rejectionCount = 0
+    const observed = pending.then(
+      () => new Error('expected cleanup rejection'),
+      (error) => {
+        rejectionCount += 1
+        return error
+      },
+    )
+
+    controller.abort()
+    expect(child.kill).toHaveBeenNthCalledWith(1, 'SIGTERM')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(child.kill).toHaveBeenNthCalledWith(2, 'SIGKILL')
+    await vi.advanceTimersByTimeAsync(20)
+
+    const error = await observed
+    expect(error).toMatchObject({ name: 'ProcessExecutionError', reason: 'process-cleanup' })
+    expect(error.message).toBe('Unable to confirm command termination')
+    expect(JSON.stringify(error)).not.toContain('secret')
+    expect(rejectionCount).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(child.listenerCount('close')).toBe(0)
+    expect(child.listenerCount('error')).toBe(0)
+    expect(child.stdout.listenerCount('data')).toBe(0)
+    expect(child.stderr.listenerCount('data')).toBe(0)
   })
 
   it('rejects an already-aborted signal without spawning', async () => {
@@ -55,10 +178,31 @@ describe('NodeProcessRunner', () => {
   })
 
   it('handles missing command and immediate abort without killing the caller', async () => {
+    const child = createFakeChild(undefined)
     const controller = new AbortController()
-    const pending = new NodeProcessRunner().run('__definitely_missing_command__', ['secret'], { signal: controller.signal })
+    const pending = new NodeProcessRunner({ spawn: asSpawn(child) }).run('__definitely_missing_command__', ['secret'], { signal: controller.signal })
     controller.abort()
-    await expect(pending).rejects.toMatchObject({ name: expect.stringMatching(/AbortError|ProcessExecutionError/) })
+    const error = await pending.catch((value) => value)
+    child.emit('error', new Error('ENOENT: secret'))
+    expect(error).toMatchObject({ name: 'AbortError' })
+    expect(child.kill).not.toHaveBeenCalled()
+  })
+
+  it('cleans all listeners and timers after a normal close', async () => {
+    vi.useFakeTimers()
+    const child = createFakeChild(12345)
+    const controller = new AbortController()
+    const pending = new NodeProcessRunner({ spawn: asSpawn(child), terminationGraceMs: 10, terminationForceMs: 20 }).run('command', [], { signal: controller.signal })
+    child.stdout.write('hello')
+    child.emit('close', 0, null)
+
+    await expect(pending).resolves.toEqual({ exitCode: 0, stdout: 'hello', stderr: '' })
+    expect(vi.getTimerCount()).toBe(0)
+    expect(child.listenerCount('close')).toBe(0)
+    expect(child.listenerCount('error')).toBe(0)
+    expect(child.stdout.listenerCount('data')).toBe(0)
+    expect(child.stderr.listenerCount('data')).toBe(0)
+    expect(child.kill).not.toHaveBeenCalled()
   })
 
   it('maps a signal exit using the platform signal number', async () => {
