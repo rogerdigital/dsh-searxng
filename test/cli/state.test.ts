@@ -15,7 +15,11 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { StateStore, type StateV1 } from '../../src/cli/state.ts'
+import {
+  FileStateStore,
+  type StateStore as StateStoreContract,
+  type StateV1,
+} from '../../src/cli/state.ts'
 
 const valid: StateV1 = {
   schemaVersion: 1,
@@ -95,17 +99,29 @@ async function expectAggregate(promise: Promise<unknown>, fragments: readonly st
 }
 
 describe('StateStore schema', () => {
+  it('accepts a plain object as a StateStore', async () => {
+    const store: StateStoreContract = {
+      read: async () => valid,
+      write: async () => {},
+      withLock: async (operation) => operation(),
+    }
+
+    await expect(store.read()).resolves.toEqual(valid)
+    await expect(store.write(valid)).resolves.toBeUndefined()
+    await expect(store.withLock(async () => 42)).resolves.toBe(42)
+  })
+
   it('returns an in-memory empty state without creating its missing directory', async () => {
     const root = join(tmpdir(), `dsh-state-missing-${process.pid}-${Date.now()}`)
     await rm(root, { recursive: true, force: true })
-    await expect(new StateStore(root).read()).resolves.toEqual({ schemaVersion: 1, profiles: {} })
+    await expect(new FileStateStore(root).read()).resolves.toEqual({ schemaVersion: 1, profiles: {} })
     await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('round-trips the exact populated StateV1 schema with a user-only state file', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     try {
-      const store = new StateStore(root)
+      const store = new FileStateStore(root)
       await store.write(populated)
       await expect(store.read()).resolves.toEqual(populated)
       expect((await stat(join(root, 'state.json'))).mode & 0o777).toBe(0o600)
@@ -144,7 +160,7 @@ describe('StateStore schema', () => {
     const source = Buffer.from(` \n${JSON.stringify(value)}\n `)
     try {
       await writeFile(statePath, source)
-      await expect(new StateStore(root).read()).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+      await expect(new FileStateStore(root).read()).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
       await expect(readFile(statePath)).resolves.toEqual(source)
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -157,24 +173,52 @@ describe('StateStore schema', () => {
     const source = Buffer.from([0, 255, 123, 34, 120, 34, 58])
     try {
       await writeFile(statePath, source)
-      await expect(new StateStore(root).read()).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+      await expect(new FileStateStore(root).read()).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
       await expect(readFile(statePath)).resolves.toEqual(source)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  it.each(['EACCES', 'EISDIR'] as const)(
+    'reports state read I/O failure %s without invalid-state repair guidance or sensitive details',
+    async (code) => {
+      const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+      const secret = 'private-state-path-and-token'
+      const failure = Object.assign(new Error(secret), { code })
+      const store = new FileStateStore(root, { readFile: async () => { throw failure } })
+      try {
+        let reported: unknown
+        try {
+          await store.read()
+        } catch (error) {
+          reported = error
+        }
+        expect(reported).toMatchObject({
+          code: 'E_INTERNAL',
+          message: 'Unable to read state storage',
+          action: 'Check state storage permissions and file type, then retry',
+          details: {},
+        })
+        expect(JSON.stringify(reported)).not.toContain(secret)
+        expect(JSON.stringify(reported)).not.toContain('Repair or remove')
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
 })
 
 describe('StateStore atomic write', () => {
   async function preservesOriginalWhen(
-    createFacade: (root: string, statePath: string) => ConstructorParameters<typeof StateStore>[1],
+    createFacade: (root: string, statePath: string) => ConstructorParameters<typeof FileStateStore>[1],
   ): Promise<void> {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const statePath = join(root, 'state.json')
     const original = Buffer.from([0, 255, 1, 2, 3, 10])
     await writeFile(statePath, original, { mode: 0o600 })
     try {
-      await expect(new StateStore(root, createFacade(root, statePath)).write(valid)).rejects.toBeDefined()
+      await expect(new FileStateStore(root, createFacade(root, statePath)).write(valid)).rejects.toBeDefined()
       await expect(readFile(statePath)).resolves.toEqual(original)
       await expect(transactionArtifacts(root)).resolves.toEqual([])
     } finally {
@@ -243,7 +287,7 @@ describe('StateStore atomic write', () => {
     const statePath = join(root, 'state.json')
     let syncs = 0
     try {
-      const store = new StateStore(root, { open: injectedOpen((path, flags, handle) => {
+      const store = new FileStateStore(root, { open: injectedOpen((path, flags, handle) => {
         if (path !== root || flags !== constants.O_RDONLY) return handle
         return wrappedHandle(handle, { sync: async () => {
           syncs += 1
@@ -267,7 +311,7 @@ describe('StateStore atomic write', () => {
     await writeFile(statePath, original, { mode: 0o600 })
     let syncs = 0
     try {
-      const store = new StateStore(root, {
+      const store = new FileStateStore(root, {
         open: injectedOpen((path, flags, handle) => path === root && flags === constants.O_RDONLY
           ? wrappedHandle(handle, { sync: async () => {
             syncs += 1
@@ -298,7 +342,7 @@ describe('StateStore atomic write', () => {
     const original = Buffer.from('original state bytes')
     await writeFile(statePath, original, { mode: 0o600 })
     try {
-      const store = new StateStore(root, {
+      const store = new FileStateStore(root, {
         ...(marker === '.tmp-' ? {
           open: injectedOpen((path, _flags, handle) => path.includes('.tmp-')
             ? wrappedHandle(handle, { writeFile: async () => { throw new Error('temp write failed') } })
@@ -323,7 +367,7 @@ describe('StateStore exclusive lock', () => {
     const lockPath = join(root, 'state.lock')
     await chmod(root, 0o777)
     try {
-      await expect(new StateStore(root).withLock(async () => {
+      await expect(new FileStateStore(root).withLock(async () => {
         expect((await stat(root)).mode & 0o777).toBe(0o700)
         expect((await stat(lockPath)).mode & 0o777).toBe(0o600)
         const metadata = JSON.parse(await readFile(lockPath, 'utf8')) as Record<string, unknown>
@@ -341,7 +385,7 @@ describe('StateStore exclusive lock', () => {
 
   it('rejects a concurrent holder with wait-and-retry guidance and releases in finally', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const store = new StateStore(root)
+    const store = new FileStateStore(root)
     let finish!: () => void
     const held = new Promise<void>((resolve) => { finish = resolve })
     try {
@@ -365,7 +409,7 @@ describe('StateStore exclusive lock', () => {
     const foreign = Buffer.from('stale foreign lock')
     await writeFile(lockPath, foreign, { mode: 0o600 })
     try {
-      await expect(new StateStore(root).withLock(async () => undefined)).rejects.toMatchObject({
+      await expect(new FileStateStore(root).withLock(async () => undefined)).rejects.toMatchObject({
         code: 'E_STATE_INVALID', action: 'Wait and retry',
       })
       await expect(readFile(lockPath)).resolves.toEqual(foreign)
@@ -382,7 +426,7 @@ describe('StateStore exclusive lock', () => {
       const lockPath = join(root, 'state.lock')
       let foreign: Buffer | undefined
       try {
-        const store = new StateStore(root, {
+        const store = new FileStateStore(root, {
           rename: (async (from: string, to: string) => {
             if (from === lockPath && to.includes('state.lock.release-') && foreign === undefined) {
               foreign = kind === 'same-token foreign inode' ? await readFile(from) : Buffer.from('not-json')
@@ -408,7 +452,7 @@ describe('StateStore exclusive lock', () => {
     const conflict = Buffer.from('new canonical conflict')
     let replaced = false
     try {
-      const store = new StateStore(root, {
+      const store = new FileStateStore(root, {
         rename: (async (from: string, to: string) => {
           if (from === lockPath && to.includes('state.lock.release-') && !replaced) {
             await rm(from)
@@ -450,7 +494,7 @@ describe('StateStore exclusive lock', () => {
             } } : {}),
           })
         }) as typeof fsOpen
-        await expect(new StateStore(root, { open }).withLock(async () => 'done')).rejects.toBeDefined()
+        await expect(new FileStateStore(root, { open }).withLock(async () => 'done')).rejects.toBeDefined()
         await expect(readFile(lockPath, 'utf8')).resolves.toContain('"identity"')
         expect((await readdir(root)).some((name) => name.startsWith('state.lock.release-'))).toBe(true)
       } finally {
@@ -476,7 +520,7 @@ describe('StateStore exclusive lock', () => {
             } } : {}),
           })
         })
-        await expect(new StateStore(root, { open }).withLock(async () => undefined)).rejects.toBeDefined()
+        await expect(new FileStateStore(root, { open }).withLock(async () => undefined)).rejects.toBeDefined()
         await expect(lockArtifacts(root)).resolves.toEqual(failure === 'fstat' ? ['state.lock'] : [])
       } finally {
         await rm(root, { recursive: true, force: true })
@@ -496,7 +540,7 @@ describe('StateStore exclusive lock', () => {
           },
         })
       })
-      await expect(new StateStore(root, { open }).withLock(async () => undefined)).rejects.toThrow(
+      await expect(new FileStateStore(root, { open }).withLock(async () => undefined)).rejects.toThrow(
         'partial lock write failed',
       )
       await expect(lockArtifacts(root)).resolves.toEqual([])
@@ -521,7 +565,7 @@ describe('StateStore exclusive lock', () => {
           },
         })
       })
-      await expectAggregate(new StateStore(root, { open }).withLock(async () => undefined), [
+      await expectAggregate(new FileStateStore(root, { open }).withLock(async () => undefined), [
         'partial lock write failed',
         'Lock ownership changed during acquisition cleanup',
       ])
@@ -536,7 +580,7 @@ describe('StateStore exclusive lock', () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const lockPath = join(root, 'state.lock')
     try {
-      const renameFailure = new StateStore(root, { rename: (async (from: string, to: string) => {
+      const renameFailure = new FileStateStore(root, { rename: (async (from: string, to: string) => {
         if (from === lockPath && to.includes('state.lock.release-')) throw new Error('release rename failed')
         return fsRename(from, to)
       }) as typeof fsRename })
@@ -544,7 +588,7 @@ describe('StateStore exclusive lock', () => {
       await expect(readFile(lockPath, 'utf8')).resolves.toContain('"identity"')
       await rm(lockPath)
 
-      const removeFailure = new StateStore(root, { rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
+      const removeFailure = new FileStateStore(root, { rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
         if (path.includes('state.lock.release-')) throw new Error('release remove failed')
         return rm(path, options)
       }) as typeof rm })
@@ -558,7 +602,7 @@ describe('StateStore exclusive lock', () => {
   it('aggregates operation and release cleanup failures', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     try {
-      const store = new StateStore(root, { rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
+      const store = new FileStateStore(root, { rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
         if (path.includes('state.lock.release-')) throw new Error('release cleanup failed')
         return rm(path, options)
       }) as typeof rm })

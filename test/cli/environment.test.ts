@@ -1,7 +1,20 @@
 import { describe, expect, it, vi } from 'vitest'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
-import { EnvironmentService, homeId, managedDir, profileDir, resolveDshHome } from '../../src/cli/environment.ts'
+import {
+  NodeEnvironmentService,
+  homeId,
+  managedDir,
+  profileDir,
+  resolveDshHome,
+  type EnvironmentService,
+} from '../../src/cli/environment.ts'
+
+function abortError(message: string): Error {
+  const error = new Error(message)
+  error.name = 'AbortError'
+  return error
+}
 
 describe('environment helpers', () => {
   it('resolves injected DSH_HOME or the injected home directory', () => {
@@ -31,7 +44,7 @@ describe('environment helpers', () => {
   })
 
   it('resolves a profile and preflights dsh and port through injected dependencies', async () => {
-    const service = new EnvironmentService({
+    const service = new NodeEnvironmentService({
       env: { DSH_HOME: '/tmp/dsh' }, homedir: '/Users/test',
       portChecker: async (port) => port !== 8080,
       commandRunner: { run: async () => ({ exitCode: 0, stdout: '', stderr: '' }) },
@@ -41,25 +54,25 @@ describe('environment helpers', () => {
   })
 
   it('preflight invokes dsh --version exactly without shell options', async () => {
-    const run = vi.fn(async (...args: Parameters<NonNullable<ConstructorParameters<typeof EnvironmentService>[0]['commandRunner']['run']>>) => ({ exitCode: 0, stdout: '', stderr: '' }))
-    const service = new EnvironmentService({ portChecker: async () => true, commandRunner: { run } })
+    const run = vi.fn(async (...args: Parameters<NonNullable<ConstructorParameters<typeof NodeEnvironmentService>[0]['commandRunner']['run']>>) => ({ exitCode: 0, stdout: '', stderr: '' }))
+    const service = new NodeEnvironmentService({ portChecker: async () => true, commandRunner: { run } })
     await service.preflightManaged(8080)
     expect(run).toHaveBeenCalledWith('dsh', ['--version'], { signal: undefined })
   })
 
   it.each([0, 65536, -1, 1.5, Number.NaN])('rejects invalid preflight port %s with stable error', async (port) => {
     const run = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }))
-    await expect(new EnvironmentService({ portChecker: async () => true, commandRunner: { run } }).preflightManaged(port)).rejects.toMatchObject({ code: 'E_USAGE', action: 'Choose a valid port' })
+    await expect(new NodeEnvironmentService({ portChecker: async () => true, commandRunner: { run } }).preflightManaged(port)).rejects.toMatchObject({ code: 'E_USAGE', action: 'Choose a valid port' })
     expect(run).not.toHaveBeenCalled()
   })
 
   it.each([{ exitCode: 127 }, { exitCode: 1 }])('reports missing or nonzero dsh with stable error', async (result) => {
-    await expect(new EnvironmentService({ portChecker: async () => true, commandRunner: { run: async () => ({ ...result, stdout: '', stderr: '' }) } }).preflightManaged(8080)).rejects.toMatchObject({ code: 'E_DSH_MISSING', action: 'Install dsh and ensure it is on PATH' })
+    await expect(new NodeEnvironmentService({ portChecker: async () => true, commandRunner: { run: async () => ({ ...result, stdout: '', stderr: '' }) } }).preflightManaged(8080)).rejects.toMatchObject({ code: 'E_DSH_MISSING', action: 'Install dsh and ensure it is on PATH' })
   })
 
   it('maps a thrown ENOENT from dsh --version to the stable missing-dsh error', async () => {
     const missing = Object.assign(new Error('spawn dsh ENOENT'), { code: 'ENOENT' })
-    const service = new EnvironmentService({
+    const service = new NodeEnvironmentService({
       portChecker: async () => true,
       commandRunner: { run: async () => { throw missing } },
     })
@@ -72,7 +85,7 @@ describe('environment helpers', () => {
 
   it('maps a port-checker failure to an actionable stable conflict error without invoking dsh', async () => {
     const run = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }))
-    const service = new EnvironmentService({
+    const service = new NodeEnvironmentService({
       portChecker: async () => { throw new Error('socket probe failed') },
       commandRunner: { run },
     })
@@ -83,4 +96,83 @@ describe('environment helpers', () => {
     })
     expect(run).not.toHaveBeenCalled()
   })
+
+  it('accepts a plain object as an EnvironmentService', async () => {
+    const service: EnvironmentService = {
+      resolve: async (profile) => ({
+        dshHome: '/fake',
+        profileDir: `/fake/profiles/${profile}`,
+        managedDir: '/fake/dsh-searxng',
+        homeId: '0123456789abcdef',
+      }),
+      preflightManaged: async () => {},
+    }
+
+    await expect(service.resolve('web')).resolves.toMatchObject({ profileDir: '/fake/profiles/web' })
+    await expect(service.preflightManaged(8080)).resolves.toBeUndefined()
+  })
+
+  it('propagates an already-aborted signal unchanged without invoking dependencies', async () => {
+    const cancellation = abortError('cancelled before preflight')
+    const controller = new AbortController()
+    controller.abort(cancellation)
+    const portChecker = vi.fn(async () => true)
+    const run = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }))
+    const service = new NodeEnvironmentService({ portChecker, commandRunner: { run } })
+
+    await expect(service.preflightManaged(8080, controller.signal)).rejects.toBe(cancellation)
+    expect(portChecker).not.toHaveBeenCalled()
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it('propagates cancellation during the port checker unchanged without invoking dsh', async () => {
+    const cancellation = abortError('cancelled during port check')
+    const controller = new AbortController()
+    const run = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }))
+    const service = new NodeEnvironmentService({
+      portChecker: async () => {
+        controller.abort(cancellation)
+        return true
+      },
+      commandRunner: { run },
+    })
+
+    await expect(service.preflightManaged(8080, controller.signal)).rejects.toBe(cancellation)
+    expect(run).not.toHaveBeenCalled()
+  })
+
+  it('propagates cancellation during dsh --version unchanged', async () => {
+    const cancellation = abortError('cancelled during version check')
+    const controller = new AbortController()
+    const service = new NodeEnvironmentService({
+      portChecker: async () => true,
+      commandRunner: {
+        run: async () => {
+          controller.abort(cancellation)
+          return { exitCode: 0, stdout: '', stderr: '' }
+        },
+      },
+    })
+
+    await expect(service.preflightManaged(8080, controller.signal)).rejects.toBe(cancellation)
+  })
+
+  it.each(['port checker', 'dsh --version'] as const)(
+    'propagates an AbortError thrown by the %s unchanged without an aborted signal',
+    async (dependency) => {
+      const cancellation = abortError(`cancelled by ${dependency}`)
+      const service = new NodeEnvironmentService({
+        portChecker: dependency === 'port checker'
+          ? async () => { throw cancellation }
+          : async () => true,
+        commandRunner: {
+          run: dependency === 'dsh --version'
+            ? async () => { throw cancellation }
+            : async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+        },
+      })
+
+      await expect(service.preflightManaged(8080)).rejects.toBe(cancellation)
+    },
+  )
 })

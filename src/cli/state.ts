@@ -21,6 +21,12 @@ export interface StateV1 {
   profiles: Record<string, { mode: 'managed' | 'external'; endpoint: string }>
 }
 
+export interface StateStore {
+  read(): Promise<StateV1>
+  write(state: StateV1): Promise<void>
+  withLock<T>(operation: () => Promise<T>): Promise<T>
+}
+
 interface FsFacade {
   mkdir: typeof mkdir
   open: typeof open
@@ -42,6 +48,14 @@ const realFs: FsFacade = { mkdir, open, readFile, rename, rm, chmod, stat, link 
 
 function stateInvalid(message: string): CliError {
   return new CliError('E_STATE_INVALID', message, 'Repair or remove the state file')
+}
+
+function stateReadFailed(): CliError {
+  return new CliError(
+    'E_INTERNAL',
+    'Unable to read state storage',
+    'Check state storage permissions and file type, then retry',
+  )
 }
 
 function locked(): CliError {
@@ -156,7 +170,7 @@ function combinedError(primary: unknown, secondary: readonly unknown[], message:
   return new AggregateError([primary, ...secondary], message)
 }
 
-export class StateStore {
+export class FileStateStore implements StateStore {
   private readonly root: string
   private readonly fs: FsFacade
   private readonly statePath: string
@@ -175,7 +189,7 @@ export class StateStore {
       source = await this.fs.readFile(this.statePath, 'utf8')
     } catch (error) {
       if (errorCode(error) === 'ENOENT') return { schemaVersion: 1, profiles: {} }
-      throw stateInvalid('Unable to read state')
+      throw stateReadFailed()
     }
 
     let parsed: unknown
