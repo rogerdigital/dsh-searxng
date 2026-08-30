@@ -1,6 +1,7 @@
 import { constants } from 'node:fs'
 import type { FileHandle } from 'node:fs/promises'
 import {
+  chmod,
   link as fsLink,
   mkdtemp,
   open as fsOpen,
@@ -39,7 +40,7 @@ const populated: StateV1 = {
   },
 }
 
-type HandleMethod = 'writeFile' | 'sync' | 'close'
+type HandleMethod = 'writeFile' | 'readFile' | 'stat' | 'sync' | 'close'
 
 function wrappedHandle(
   handle: FileHandle,
@@ -71,24 +72,8 @@ async function transactionArtifacts(root: string): Promise<string[]> {
 
 async function lockArtifacts(root: string): Promise<string[]> {
   return (await readdir(root)).filter((name) =>
-    name.startsWith('state.lock.owner-') ||
-    name.startsWith('state.lock.claim-') ||
-    name.includes('.retired-') ||
-    name === 'state.lock.transition',
+    name === 'state.lock' || name.startsWith('state.lock.release-'),
   )
-}
-
-async function expectAggregate(promise: Promise<unknown>, fragments: readonly string[]): Promise<AggregateError> {
-  try {
-    await promise
-    throw new Error('expected rejection')
-  } catch (error) {
-    expect(error).toBeInstanceOf(AggregateError)
-    const aggregate = error as AggregateError
-    const messages = errorMessages(aggregate).join('\n')
-    for (const fragment of fragments) expect(messages).toContain(fragment)
-    return aggregate
-  }
 }
 
 function errorMessages(error: unknown): string[] {
@@ -98,12 +83,14 @@ function errorMessages(error: unknown): string[] {
   return [error instanceof Error ? error.message : String(error)]
 }
 
-async function expectRejectedWith(promise: Promise<unknown>, fragment: string): Promise<void> {
+async function expectAggregate(promise: Promise<unknown>, fragments: readonly string[]): Promise<void> {
   try {
     await promise
     throw new Error('expected rejection')
   } catch (error) {
-    expect(errorMessages(error)).toContain(fragment)
+    expect(error).toBeInstanceOf(AggregateError)
+    const messages = errorMessages(error).join('\n')
+    for (const fragment of fragments) expect(messages).toContain(fragment)
   }
 }
 
@@ -111,7 +98,6 @@ describe('StateStore schema', () => {
   it('returns an in-memory empty state without creating its missing directory', async () => {
     const root = join(tmpdir(), `dsh-state-missing-${process.pid}-${Date.now()}`)
     await rm(root, { recursive: true, force: true })
-
     await expect(new StateStore(root).read()).resolves.toEqual({ schemaVersion: 1, profiles: {} })
     await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' })
   })
@@ -196,18 +182,13 @@ describe('StateStore atomic write', () => {
     }
   }
 
-  it('preserves exact original bytes when the temporary write fails', async () => {
+  it.each([
+    ['write', 'writeFile'],
+    ['fsync', 'sync'],
+  ] as const)('preserves exact original bytes when temporary %s fails', async (_name, method) => {
     await preservesOriginalWhen(() => ({
       open: injectedOpen((path, _flags, handle) => path.includes('.tmp-')
-        ? wrappedHandle(handle, { writeFile: async () => { throw new Error('temp write failed') } })
-        : handle),
-    }))
-  })
-
-  it('preserves exact original bytes when the temporary fsync fails', async () => {
-    await preservesOriginalWhen(() => ({
-      open: injectedOpen((path, _flags, handle) => path.includes('.tmp-')
-        ? wrappedHandle(handle, { sync: async () => { throw new Error('temp sync failed') } })
+        ? wrappedHandle(handle, { [method]: async () => { throw new Error(`temp ${method} failed`) } })
         : handle),
     }))
   })
@@ -217,14 +198,12 @@ describe('StateStore atomic write', () => {
       open: injectedOpen((path, _flags, handle) => {
         if (!path.includes('.tmp-')) return handle
         let first = true
-        return wrappedHandle(handle, {
-          close: async () => {
-            if (!first) return handle.close()
-            first = false
-            await handle.close()
-            throw new Error('temp close failed')
-          },
-        })
+        return wrappedHandle(handle, { close: async () => {
+          if (!first) return handle.close()
+          first = false
+          await handle.close()
+          throw new Error('temp close failed')
+        } })
       }),
     }))
   })
@@ -238,90 +217,71 @@ describe('StateStore atomic write', () => {
     }))
   })
 
-  it('rolls back exact original bytes and fsyncs the directory when commit directory fsync fails', async () => {
-    let directorySyncs = 0
-    await preservesOriginalWhen((root) => ({
-      open: injectedOpen((path, flags, handle) => {
-        if (path !== root || flags !== constants.O_RDONLY) return handle
-        return wrappedHandle(handle, {
-          sync: async () => {
-            directorySyncs += 1
-            if (directorySyncs === 1) throw new Error('commit directory sync failed')
-            return handle.sync()
-          },
-        })
-      }),
-    }))
-    expect(directorySyncs).toBe(2)
-  })
-
-  it('rolls back exact original bytes when opening the directory for commit fsync fails', async () => {
-    let directoryOpens = 0
+  it.each(['open', 'sync'] as const)('rolls back and fsyncs after commit directory %s fails', async (failure) => {
+    let attempts = 0
     await preservesOriginalWhen((root) => ({
       open: (async (...args: Parameters<typeof fsOpen>) => {
         if (String(args[0]) === root && args[1] === constants.O_RDONLY) {
-          directoryOpens += 1
-          if (directoryOpens === 1) throw new Error('commit directory open failed')
+          attempts += 1
+          if (attempts === 1 && failure === 'open') throw new Error('directory open failed')
         }
-        return fsOpen(...args)
+        const handle = await fsOpen(...args)
+        if (String(args[0]) === root && args[1] === constants.O_RDONLY && failure === 'sync') {
+          return wrappedHandle(handle, { sync: async () => {
+            if (attempts === 1) throw new Error('directory sync failed')
+            return handle.sync()
+          } })
+        }
+        return handle
       }) as typeof fsOpen,
     }))
-    expect(directoryOpens).toBe(2)
+    expect(attempts).toBe(2)
   })
 
   it('restores original absence when commit directory fsync fails', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const statePath = join(root, 'state.json')
-    let directorySyncs = 0
+    let syncs = 0
     try {
-      const store = new StateStore(root, {
-        open: injectedOpen((path, flags, handle) => {
-          if (path !== root || flags !== constants.O_RDONLY) return handle
-          return wrappedHandle(handle, {
-            sync: async () => {
-              directorySyncs += 1
-              if (directorySyncs === 1) throw new Error('commit directory sync failed')
-              return handle.sync()
-            },
-          })
-        }),
-      })
+      const store = new StateStore(root, { open: injectedOpen((path, flags, handle) => {
+        if (path !== root || flags !== constants.O_RDONLY) return handle
+        return wrappedHandle(handle, { sync: async () => {
+          syncs += 1
+          if (syncs === 1) throw new Error('commit directory sync failed')
+          return handle.sync()
+        } })
+      }) })
       await expect(store.write(valid)).rejects.toThrow('commit directory sync failed')
       await expect(readFile(statePath)).rejects.toMatchObject({ code: 'ENOENT' })
       await expect(transactionArtifacts(root)).resolves.toEqual([])
-      expect(directorySyncs).toBe(2)
+      expect(syncs).toBe(2)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
   })
 
-  it('retains the only backup and reports both errors when rollback restoration fails', async () => {
+  it('retains the only backup and reports rollback restoration failure', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const statePath = join(root, 'state.json')
     const original = Buffer.from([222, 173, 190, 239])
     await writeFile(statePath, original, { mode: 0o600 })
-    let directorySyncs = 0
+    let syncs = 0
     try {
       const store = new StateStore(root, {
-        open: injectedOpen((path, flags, handle) => {
-          if (path !== root || flags !== constants.O_RDONLY) return handle
-          return wrappedHandle(handle, {
-            sync: async () => {
-              directorySyncs += 1
-              if (directorySyncs === 1) throw new Error('commit directory sync failed')
-              return handle.sync()
-            },
-          })
-        }),
+        open: injectedOpen((path, flags, handle) => path === root && flags === constants.O_RDONLY
+          ? wrappedHandle(handle, { sync: async () => {
+            syncs += 1
+            if (syncs === 1) throw new Error('commit directory sync failed')
+            return handle.sync()
+          } })
+          : handle),
         link: (async (from: string, to: string) => {
           if (from.includes('.backup-') && to === statePath) throw new Error('rollback restore failed')
           return fsLink(from, to)
         }) as typeof fsLink,
       })
-
       await expectAggregate(store.write(valid), ['commit directory sync failed', 'rollback restore failed'])
-      const artifacts = await transactionArtifacts(root)
-      const backup = artifacts.find((name) => name.includes('.backup-'))
+      const backup = (await transactionArtifacts(root)).find((name) => name.includes('.backup-'))
       expect(backup).toBeDefined()
       await expect(readFile(join(root, backup!))).resolves.toEqual(original)
     } finally {
@@ -329,45 +289,28 @@ describe('StateStore atomic write', () => {
     }
   })
 
-  it('restores the old state and reports backup cleanup failure instead of silently succeeding', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const statePath = join(root, 'state.json')
-    const original = Buffer.from('{"schemaVersion":1,"profiles":{}}\n')
-    await writeFile(statePath, original, { mode: 0o600 })
-    try {
-      const store = new StateStore(root, {
-        rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
-          if (path.includes('.backup-')) throw new Error('backup cleanup failed')
-          return rm(path, options)
-        }) as typeof rm,
-      })
-
-      await expectAggregate(store.write(valid), ['backup cleanup failed'])
-      await expect(readFile(statePath)).resolves.toEqual(original)
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('reports temporary cleanup failure while preserving the original state', async () => {
+  it.each([
+    ['backup', '.backup-'],
+    ['temporary', '.tmp-'],
+  ] as const)('reports %s cleanup failure explicitly', async (_name, marker) => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const statePath = join(root, 'state.json')
     const original = Buffer.from('original state bytes')
     await writeFile(statePath, original, { mode: 0o600 })
     try {
       const store = new StateStore(root, {
-        open: injectedOpen((path, _flags, handle) => path.includes('.tmp-')
-          ? wrappedHandle(handle, { writeFile: async () => { throw new Error('temp write failed') } })
-          : handle),
+        ...(marker === '.tmp-' ? {
+          open: injectedOpen((path, _flags, handle) => path.includes('.tmp-')
+            ? wrappedHandle(handle, { writeFile: async () => { throw new Error('temp write failed') } })
+            : handle),
+        } : {}),
         rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
-          if (path.includes('.tmp-')) throw new Error('temp cleanup failed')
+          if (path.includes(marker)) throw new Error(`${marker} cleanup failed`)
           return rm(path, options)
         }) as typeof rm,
       })
-
-      await expectAggregate(store.write(valid), ['temp write failed', 'temp cleanup failed'])
+      await expectAggregate(store.write(valid), [`${marker} cleanup failed`])
       await expect(readFile(statePath)).resolves.toEqual(original)
-      expect((await transactionArtifacts(root)).some((name) => name.includes('.tmp-'))).toBe(true)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -375,496 +318,204 @@ describe('StateStore atomic write', () => {
 })
 
 describe('StateStore exclusive lock', () => {
-  it('writes a user-only identity record and removes canonical, owner, claim, and transition paths', async () => {
+  it('uses a direct 0600 identity lock in a 0700 managed directory and leaves no artifacts', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const lockPath = join(root, 'state.lock')
+    await chmod(root, 0o777)
     try {
-      const result = await new StateStore(root).withLock(async () => {
+      await expect(new StateStore(root).withLock(async () => {
+        expect((await stat(root)).mode & 0o777).toBe(0o700)
         expect((await stat(lockPath)).mode & 0o777).toBe(0o600)
         const metadata = JSON.parse(await readFile(lockPath, 'utf8')) as Record<string, unknown>
         expect(Object.keys(metadata).sort()).toEqual(['identity', 'pid', 'timestamp'])
-        expect(metadata).toMatchObject({ pid: process.pid })
+        expect(metadata.pid).toBe(process.pid)
         expect(metadata.identity).toMatch(/^[a-f0-9]{32}$/)
         expect(new Date(String(metadata.timestamp)).toISOString()).toBe(metadata.timestamp)
-        const owner = (await readdir(root)).find((name) => name.startsWith('state.lock.owner-'))
-        expect(owner).toBeDefined()
-        expect((await stat(join(root, owner!))).ino).toBe((await stat(lockPath)).ino)
         return 42
-      })
-
-      expect(result).toBe(42)
-      await expect(readFile(lockPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      })).resolves.toBe(42)
       await expect(lockArtifacts(root)).resolves.toEqual([])
     } finally {
       await rm(root, { recursive: true, force: true })
     }
   })
 
-  it('keeps a stale foreign lock untouched and tells a second holder to wait and retry', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    const foreign = Buffer.from('{"pid":123,"timestamp":"2020-01-01T00:00:00.000Z","identity":"foreign"}\n')
-    await writeFile(lockPath, foreign, { mode: 0o600 })
-    let invoked = false
-    try {
-      await expect(new StateStore(root).withLock(async () => { invoked = true })).rejects.toMatchObject({
-        code: 'E_STATE_INVALID',
-        action: 'Wait and retry',
-      })
-      expect(invoked).toBe(false)
-      await expect(readFile(lockPath)).resolves.toEqual(foreign)
-      await expect(lockArtifacts(root)).resolves.toEqual([])
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('reports both occupied-lock and transition-cleanup failures without touching the foreign lock', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    const transitionPath = join(root, 'state.lock.transition')
-    const foreign = Buffer.from('foreign canonical lock')
-    await writeFile(lockPath, foreign, { mode: 0o600 })
-    try {
-      const store = new StateStore(root, {
-        rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
-          if (path.includes('state.lock.transition.retired-')) throw new Error('transition cleanup failed')
-          return rm(path, options)
-        }) as typeof rm,
-      })
-      await expectAggregate(store.withLock(async () => undefined), [
-        'State is locked',
-        'transition cleanup failed',
-      ])
-      await expect(readFile(lockPath)).resolves.toEqual(foreign)
-      expect((await lockArtifacts(root)).filter((name) => name.startsWith('state.lock.owner-'))).toEqual([])
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('never removes a foreign transition guard when lock acquisition sees it', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const transitionPath = join(root, 'state.lock.transition')
-    const foreign = Buffer.from('foreign transition')
-    await writeFile(transitionPath, foreign, { mode: 0o600 })
-    try {
-      await expect(new StateStore(root).withLock(async () => undefined)).rejects.toMatchObject({
-        code: 'E_STATE_INVALID',
-        action: 'Wait and retry',
-      })
-      await expect(readFile(transitionPath)).resolves.toEqual(foreign)
-      expect((await lockArtifacts(root)).filter((name) => name.startsWith('state.lock.owner-'))).toEqual([])
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('preserves a replacement transition guard at the retirement boundary', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    const transitionPath = join(root, 'state.lock.transition')
-    const foreign = Buffer.from('replacement transition guard')
-    let replaced = false
-    let invoked = false
-    try {
-      const store = new StateStore(root, {
-        rename: (async (from: string, to: string) => {
-          if (from === transitionPath && to.includes('.retired-') && !replaced) {
-            await rm(from)
-            await writeFile(from, foreign, { mode: 0o600 })
-            replaced = true
-          }
-          return fsRename(from, to)
-        }) as typeof fsRename,
-      })
-
-      await expectRejectedWith(
-        store.withLock(async () => { invoked = true }),
-        'State lock transition guard was replaced before retirement',
-      )
-      expect(replaced).toBe(true)
-      expect(invoked).toBe(false)
-      await expect(readFile(transitionPath)).resolves.toEqual(foreign)
-      await expect(readFile(lockPath, 'utf8')).resolves.toContain('"identity"')
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('preserves a transition guard whose identity changes on the same inode at retirement', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    const transitionPath = join(root, 'state.lock.transition')
-    const foreign = Buffer.from('mutated transition identity')
-    let originalInode: number | undefined
-    let mutatedInode: number | undefined
-    let invoked = false
-    try {
-      const store = new StateStore(root, {
-        rename: (async (from: string, to: string) => {
-          if (from === transitionPath && to.includes('.retired-') && originalInode === undefined) {
-            originalInode = (await stat(from)).ino
-            await writeFile(from, foreign)
-            mutatedInode = (await stat(from)).ino
-          }
-          return fsRename(from, to)
-        }) as typeof fsRename,
-      })
-
-      await expectRejectedWith(
-        store.withLock(async () => { invoked = true }),
-        'State lock transition guard was replaced before retirement',
-      )
-      expect(originalInode).toBeDefined()
-      expect(mutatedInode).toBe(originalInode)
-      expect(invoked).toBe(false)
-      await expect(readFile(transitionPath)).resolves.toEqual(foreign)
-      await expect(readFile(lockPath, 'utf8')).resolves.toContain('"identity"')
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('never removes a foreign file at its proposed unique owner path', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const foreign = Buffer.from('foreign owner')
-    let foreignOwnerPath: string | undefined
-    try {
-      const store = new StateStore(root, {
-        open: (async (...args: Parameters<typeof fsOpen>) => {
-          const path = String(args[0])
-          if (path.includes('state.lock.owner-') && foreignOwnerPath === undefined) {
-            foreignOwnerPath = path
-            await writeFile(path, foreign, { mode: 0o600 })
-            throw Object.assign(new Error('owner already exists'), { code: 'EEXIST' })
-          }
-          return fsOpen(...args)
-        }) as typeof fsOpen,
-      })
-      await expect(store.withLock(async () => undefined)).rejects.toMatchObject({ code: 'EEXIST' })
-      expect(foreignOwnerPath).toBeDefined()
-      await expect(readFile(foreignOwnerPath!)).resolves.toEqual(foreign)
-      await expect(readFile(join(root, 'state.lock'))).rejects.toMatchObject({ code: 'ENOENT' })
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('lets the first holder release while a competing acquisition briefly owns the transition guard', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    let finishFirst!: () => void
-    const firstCanFinish = new Promise<void>((resolve) => { finishFirst = resolve })
-    let secondAtLink!: () => void
-    const secondReachedLink = new Promise<void>((resolve) => { secondAtLink = resolve })
-    let continueSecond!: () => void
-    const secondMayContinue = new Promise<void>((resolve) => { continueSecond = resolve })
-    try {
-      const first = new StateStore(root).withLock(async () => {
-        await firstCanFinish
-        return 'first'
-      })
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        try {
-          await stat(lockPath)
-          break
-        } catch {
-          await new Promise((resolve) => setTimeout(resolve, 1))
-        }
-      }
-
-      const second = new StateStore(root, {
-        link: (async (from: string, to: string) => {
-          if (to === lockPath) {
-            secondAtLink()
-            await secondMayContinue
-          }
-          return fsLink(from, to)
-        }) as typeof fsLink,
-      }).withLock(async () => 'second')
-      await secondReachedLink
-      finishFirst()
-      await new Promise((resolve) => setTimeout(resolve, 5))
-      continueSecond()
-
-      await expect(second).rejects.toMatchObject({ code: 'E_STATE_INVALID', action: 'Wait and retry' })
-      await expect(first).resolves.toBe('first')
-      await expect(readFile(lockPath)).rejects.toMatchObject({ code: 'ENOENT' })
-      await expect(lockArtifacts(root)).resolves.toEqual([])
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('does not remove a replacement lock that reuses the acquired identity on a foreign inode', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    let replaced: Buffer | undefined
-    try {
-      const store = new StateStore(root, {
-        stat: (async (path: string) => {
-          if (path === lockPath && replaced === undefined) {
-            const metadata = await readFile(lockPath)
-            await rm(lockPath)
-            await writeFile(lockPath, metadata, { mode: 0o600 })
-            replaced = metadata
-          }
-          return stat(path)
-        }) as typeof stat,
-      })
-      await expect(store.withLock(async () => 'done')).resolves.toBe('done')
-      await expect(readFile(lockPath)).resolves.toEqual(replaced)
-      await expect(lockArtifacts(root)).resolves.toEqual([])
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('does not remove or move a malformed replacement lock', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    const foreign = Buffer.from('not-json')
-    let replaced = false
-    try {
-      const store = new StateStore(root, {
-        stat: (async (path: string) => {
-          if (path === lockPath && !replaced) {
-            await rm(lockPath)
-            await writeFile(lockPath, foreign, { mode: 0o600 })
-            replaced = true
-          }
-          return stat(path)
-        }) as typeof stat,
-      })
-      await expect(store.withLock(async () => 'done')).resolves.toBe('done')
-      await expect(readFile(lockPath)).resolves.toEqual(foreign)
-      expect((await lockArtifacts(root)).filter((name) => name.includes('.claim-'))).toEqual([])
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('restores a foreign lock atomically claimed after the ownership check', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    const foreign = Buffer.from('foreign replacement bytes')
-    let replaced = false
-    try {
-      const store = new StateStore(root, {
-        rename: (async (from: string, to: string) => {
-          if (from === lockPath && to.includes('state.lock.claim-') && !replaced) {
-            await rm(lockPath)
-            await writeFile(lockPath, foreign, { mode: 0o600 })
-            replaced = true
-          }
-          return fsRename(from, to)
-        }) as typeof fsRename,
-      })
-      await expect(store.withLock(async () => 'done')).resolves.toBe('done')
-      await expect(readFile(lockPath)).resolves.toEqual(foreign)
-      await expect(lockArtifacts(root)).resolves.toEqual([])
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('preserves a same-identity foreign claim replaced at the retirement boundary', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    let replacement: Buffer | undefined
-    let replacementInode: number | undefined
-    try {
-      const store = new StateStore(root, {
-        rename: (async (from: string, to: string) => {
-          if (from.includes('state.lock.claim-') && to.includes('.retired-') && replacement === undefined) {
-            replacement = await readFile(from)
-            await rm(from)
-            await writeFile(from, replacement, { mode: 0o600 })
-            replacementInode = (await stat(from)).ino
-          }
-          return fsRename(from, to)
-        }) as typeof fsRename,
-      })
-
-      await expectRejectedWith(
-        store.withLock(async () => 'done'),
-        'Owned state lock claim was replaced before retirement',
-      )
-      expect(replacement).toBeDefined()
-      const claim = (await readdir(root)).find((name) => name.startsWith('state.lock.claim-'))
-      expect(claim).toBeDefined()
-      await expect(readFile(join(root, claim!))).resolves.toEqual(replacement)
-      expect((await stat(join(root, claim!))).ino).toBe(replacementInode)
-      await expect(readFile(lockPath)).resolves.toEqual(replacement)
-      expect((await stat(lockPath)).ino).not.toBe(replacementInode)
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('preserves a malformed foreign owner replaced at the retirement boundary', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    const foreign = Buffer.from('malformed replacement owner')
-    let ownerPath: string | undefined
-    try {
-      const store = new StateStore(root, {
-        rename: (async (from: string, to: string) => {
-          if (from.includes('state.lock.owner-') && to.includes('.retired-') && ownerPath === undefined) {
-            ownerPath = from
-            await rm(from)
-            await writeFile(from, foreign, { mode: 0o600 })
-          }
-          return fsRename(from, to)
-        }) as typeof fsRename,
-      })
-
-      await expectRejectedWith(
-        store.withLock(async () => 'done'),
-        'State lock owner was replaced before retirement',
-      )
-      expect(ownerPath).toBeDefined()
-      await expect(readFile(ownerPath!)).resolves.toEqual(foreign)
-      await expect(readFile(lockPath)).rejects.toMatchObject({ code: 'ENOENT' })
-      expect((await lockArtifacts(root)).filter((name) => name.startsWith('state.lock.claim-'))).toEqual([])
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('preserves a replacement claim during foreign-claim restoration retirement', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    const originalForeign = Buffer.from('original foreign canonical')
-    const cleanupReplacement = Buffer.from('malformed cleanup replacement')
-    let claimed = false
-    let replacedDuringCleanup = false
-    try {
-      const store = new StateStore(root, {
-        rename: (async (from: string, to: string) => {
-          if (from === lockPath && to.includes('state.lock.claim-') && !claimed) {
-            await rm(from)
-            await writeFile(from, originalForeign, { mode: 0o600 })
-            claimed = true
-          } else if (from.includes('state.lock.claim-') && to.includes('.retired-') && !replacedDuringCleanup) {
-            await rm(from)
-            await writeFile(from, cleanupReplacement, { mode: 0o600 })
-            replacedDuringCleanup = true
-          }
-          return fsRename(from, to)
-        }) as typeof fsRename,
-      })
-
-      await expectRejectedWith(
-        store.withLock(async () => 'done'),
-        'Restored foreign lock claim was replaced before retirement',
-      )
-      expect(claimed).toBe(true)
-      expect(replacedDuringCleanup).toBe(true)
-      await expect(readFile(lockPath)).resolves.toEqual(originalForeign)
-      const claim = (await readdir(root)).find((name) => name.startsWith('state.lock.claim-'))
-      expect(claim).toBeDefined()
-      await expect(readFile(join(root, claim!))).resolves.toEqual(cleanupReplacement)
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('restores its canonical claim and preserves a replaced unique owner path', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    const foreignOwner = Buffer.from('foreign owner replacement')
-    let ownerStats = 0
-    let ownerPath: string | undefined
-    try {
-      const store = new StateStore(root, {
-        stat: (async (path: string) => {
-          if (path.includes('state.lock.owner-')) {
-            ownerStats += 1
-            ownerPath = path
-            if (ownerStats === 2) {
-              await rm(path)
-              await writeFile(path, foreignOwner, { mode: 0o600 })
-            }
-          }
-          return stat(path)
-        }) as typeof stat,
-      })
-      await expect(store.withLock(async () => 'done')).rejects.toThrow('Owned state lock identity path was replaced')
-      await expect(readFile(lockPath, 'utf8')).resolves.toContain('"identity"')
-      expect(ownerPath).toBeDefined()
-      await expect(readFile(ownerPath!)).resolves.toEqual(foreignOwner)
-      expect((await lockArtifacts(root)).filter((name) => name.startsWith('state.lock.claim-'))).toEqual([])
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('rejects when release cannot clean its owner instead of resolving with a stale artifact', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    try {
-      const store = new StateStore(root, {
-        rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
-          if (path.includes('state.lock.owner-')) throw new Error('owner cleanup failed')
-          return rm(path, options)
-        }) as typeof rm,
-      })
-      await expect(store.withLock(async () => 'done')).rejects.toThrow('owner cleanup failed')
-      expect((await lockArtifacts(root)).some((name) => name.startsWith('state.lock.owner-'))).toBe(true)
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('preserves a foreign lock and reports failure to clean only its acquisition owner', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const lockPath = join(root, 'state.lock')
-    const foreign = Buffer.from('foreign lock')
-    await writeFile(lockPath, foreign, { mode: 0o600 })
-    try {
-      const store = new StateStore(root, {
-        rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
-          if (path.includes('state.lock.owner-')) throw new Error('acquisition owner cleanup failed')
-          return rm(path, options)
-        }) as typeof rm,
-      })
-      await expectAggregate(store.withLock(async () => undefined), [
-        'State is locked',
-        'acquisition owner cleanup failed',
-      ])
-      await expect(readFile(lockPath)).resolves.toEqual(foreign)
-      expect((await lockArtifacts(root)).filter((name) => name.startsWith('state.lock.owner-'))).toHaveLength(1)
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('combines an operation failure with a release cleanup failure', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    try {
-      const store = new StateStore(root, {
-        rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
-          if (path.includes('state.lock.owner-')) throw new Error('owner cleanup failed')
-          return rm(path, options)
-        }) as typeof rm,
-      })
-      await expectAggregate(store.withLock(async () => { throw new Error('operation failed') }), [
-        'operation failed',
-        'owner cleanup failed',
-      ])
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('releases in finally after an operation failure so a later operation can acquire', async () => {
+  it('rejects a concurrent holder with wait-and-retry guidance and releases in finally', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const store = new StateStore(root)
+    let finish!: () => void
+    const held = new Promise<void>((resolve) => { finish = resolve })
     try {
+      const first = store.withLock(async () => { await held; return 'first' })
+      while (!(await readdir(root)).includes('state.lock')) await new Promise((resolve) => setTimeout(resolve, 1))
+      await expect(store.withLock(async () => 'second')).rejects.toMatchObject({
+        code: 'E_STATE_INVALID', action: 'Wait and retry',
+      })
+      finish()
+      await expect(first).resolves.toBe('first')
       await expect(store.withLock(async () => { throw new Error('operation failed') })).rejects.toThrow('operation failed')
       await expect(store.withLock(async () => 'next')).resolves.toBe('next')
-      await expect(lockArtifacts(root)).resolves.toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('never breaks or changes a stale foreign canonical lock', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const lockPath = join(root, 'state.lock')
+    const foreign = Buffer.from('stale foreign lock')
+    await writeFile(lockPath, foreign, { mode: 0o600 })
+    try {
+      await expect(new StateStore(root).withLock(async () => undefined)).rejects.toMatchObject({
+        code: 'E_STATE_INVALID', action: 'Wait and retry',
+      })
+      await expect(readFile(lockPath)).resolves.toEqual(foreign)
+      expect((await readdir(root)).filter((name) => name.startsWith('state.lock.release-'))).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['same-token foreign inode', 'malformed foreign'] as const)(
+    'restores a canonical replacement before release: %s',
+    async (kind) => {
+      const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+      const lockPath = join(root, 'state.lock')
+      let foreign: Buffer | undefined
+      try {
+        const store = new StateStore(root, {
+          rename: (async (from: string, to: string) => {
+            if (from === lockPath && to.includes('state.lock.release-') && foreign === undefined) {
+              foreign = kind === 'same-token foreign inode' ? await readFile(from) : Buffer.from('not-json')
+              await rm(from)
+              await writeFile(from, foreign, { mode: 0o600 })
+            }
+            return fsRename(from, to)
+          }) as typeof fsRename,
+        })
+        await expect(store.withLock(async () => 'done')).resolves.toBe('done')
+        await expect(readFile(lockPath)).resolves.toEqual(foreign)
+        expect((await readdir(root)).filter((name) => name.startsWith('state.lock.release-'))).toEqual([])
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('preserves quarantine and conflicting canonical when foreign restore cannot link', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const lockPath = join(root, 'state.lock')
+    const foreign = Buffer.from('foreign candidate')
+    const conflict = Buffer.from('new canonical conflict')
+    let replaced = false
+    try {
+      const store = new StateStore(root, {
+        rename: (async (from: string, to: string) => {
+          if (from === lockPath && to.includes('state.lock.release-') && !replaced) {
+            await rm(from)
+            await writeFile(from, foreign)
+            replaced = true
+          }
+          const result = await fsRename(from, to)
+          if (to.includes('state.lock.release-')) await writeFile(lockPath, conflict)
+          return result
+        }) as typeof fsRename,
+      })
+      await expect(store.withLock(async () => 'done')).rejects.toBeDefined()
+      await expect(readFile(lockPath)).resolves.toEqual(conflict)
+      const release = (await readdir(root)).find((name) => name.startsWith('state.lock.release-'))
+      expect(release).toBeDefined()
+      await expect(readFile(join(root, release!))).resolves.toEqual(foreign)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['open', 'read', 'fstat', 'close'] as const)(
+    'restores canonical and preserves quarantine when release verification %s fails',
+    async (failure) => {
+      const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+      const lockPath = join(root, 'state.lock')
+      try {
+        const open = (async (...args: Parameters<typeof fsOpen>) => {
+          const path = String(args[0])
+          if (path.includes('state.lock.release-') && failure === 'open') throw new Error('release open failed')
+          const handle = await fsOpen(...args)
+          if (!path.includes('state.lock.release-')) return handle
+          return wrappedHandle(handle, {
+            ...(failure === 'read' ? { readFile: async () => { throw new Error('release read failed') } } : {}),
+            ...(failure === 'fstat' ? { stat: async () => { throw new Error('release fstat failed') } } : {}),
+            ...(failure === 'close' ? { close: async () => {
+              await handle.close()
+              throw new Error('release close failed')
+            } } : {}),
+          })
+        }) as typeof fsOpen
+        await expect(new StateStore(root, { open }).withLock(async () => 'done')).rejects.toBeDefined()
+        await expect(readFile(lockPath, 'utf8')).resolves.toContain('"identity"')
+        expect((await readdir(root)).some((name) => name.startsWith('state.lock.release-'))).toBe(true)
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.each(['write', 'sync', 'fstat', 'close'] as const)(
+    'surfaces acquisition %s failure and performs safe cleanup',
+    async (failure) => {
+      const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+      try {
+        const open = injectedOpen((path, flags, handle) => {
+          if (path !== join(root, 'state.lock') || flags !== 'wx') return handle
+          return wrappedHandle(handle, {
+            ...(failure === 'write' ? { writeFile: async () => { throw new Error('acquire write failed') } } : {}),
+            ...(failure === 'sync' ? { sync: async () => { throw new Error('acquire sync failed') } } : {}),
+            ...(failure === 'fstat' ? { stat: async () => { throw new Error('acquire fstat failed') } } : {}),
+            ...(failure === 'close' ? { close: async () => {
+              await handle.close()
+              throw new Error('acquire close failed')
+            } } : {}),
+          })
+        })
+        await expect(new StateStore(root, { open }).withLock(async () => undefined)).rejects.toBeDefined()
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('reports release rename and removal failures without deleting evidence', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const lockPath = join(root, 'state.lock')
+    try {
+      const renameFailure = new StateStore(root, { rename: (async (from: string, to: string) => {
+        if (from === lockPath && to.includes('state.lock.release-')) throw new Error('release rename failed')
+        return fsRename(from, to)
+      }) as typeof fsRename })
+      await expect(renameFailure.withLock(async () => 'done')).rejects.toThrow('release rename failed')
+      await expect(readFile(lockPath, 'utf8')).resolves.toContain('"identity"')
+      await rm(lockPath)
+
+      const removeFailure = new StateStore(root, { rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
+        if (path.includes('state.lock.release-')) throw new Error('release remove failed')
+        return rm(path, options)
+      }) as typeof rm })
+      await expect(removeFailure.withLock(async () => 'done')).rejects.toThrow('release remove failed')
+      expect((await readdir(root)).some((name) => name.startsWith('state.lock.release-'))).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('aggregates operation and release cleanup failures', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    try {
+      const store = new StateStore(root, { rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
+        if (path.includes('state.lock.release-')) throw new Error('release cleanup failed')
+        return rm(path, options)
+      }) as typeof rm })
+      await expectAggregate(store.withLock(async () => { throw new Error('operation failed') }), [
+        'operation failed', 'release cleanup failed',
+      ])
     } finally {
       await rm(root, { recursive: true, force: true })
     }

@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import { constants } from 'node:fs'
 import { chmod, link, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
@@ -32,15 +32,10 @@ interface FsFacade {
   link: typeof link
 }
 
-interface FileIdentity {
-  dev: number
-  ino: number
-  contentSha256: string
-}
-
-interface OwnedPath {
-  path: string
-  identity: FileIdentity
+interface LockOwnership {
+  token: string
+  dev?: number
+  ino?: number
 }
 
 const realFs: FsFacade = { mkdir, open, readFile, rename, rm, chmod, stat, link }
@@ -161,31 +156,17 @@ function combinedError(primary: unknown, secondary: readonly unknown[], message:
   return new AggregateError([primary, ...secondary], message)
 }
 
-function sameFile(first: FileIdentity, second: FileIdentity): boolean {
-  return (
-    first.dev === second.dev &&
-    first.ino === second.ino &&
-    first.contentSha256 === second.contentSha256
-  )
-}
-
-function contentSha256(contents: string | Buffer): string {
-  return createHash('sha256').update(contents).digest('hex')
-}
-
 export class StateStore {
   private readonly root: string
   private readonly fs: FsFacade
   private readonly statePath: string
   private readonly lockPath: string
-  private readonly transitionPath: string
 
   constructor(managedDirectory: string, fsFacade: Partial<FsFacade> = {}) {
     this.root = managedDirectory
     this.fs = { ...realFs, ...fsFacade }
     this.statePath = join(managedDirectory, 'state.json')
     this.lockPath = join(managedDirectory, 'state.lock')
-    this.transitionPath = join(managedDirectory, 'state.lock.transition')
   }
 
   async read(): Promise<StateV1> {
@@ -266,53 +247,8 @@ export class StateStore {
 
   async withLock<T>(operation: () => Promise<T>): Promise<T> {
     await this.fs.mkdir(this.root, { recursive: true, mode: 0o700 })
-    const identity = randomBytes(16).toString('hex')
-    const ownerPath = join(this.root, `state.lock.owner-${identity}`)
-    const metadata = `${JSON.stringify({ pid: process.pid, timestamp: new Date().toISOString(), identity })}\n`
-
-    const owner = await this.createOwnedFile(ownerPath, metadata)
-    let acquired = false
-    try {
-      const transition = await this.acquireTransition(identity)
-      let acquisitionError: unknown
-      try {
-        await this.fs.link(owner.path, this.lockPath)
-        acquired = true
-      } catch (error) {
-        acquisitionError = errorCode(error) === 'EEXIST' ? locked() : error
-      }
-      let transitionError: unknown
-      try {
-        await this.releaseTransition(transition)
-      } catch (error) {
-        transitionError = error
-      }
-      if (acquisitionError !== undefined && transitionError !== undefined) {
-        throw new AggregateError(
-          [acquisitionError, transitionError],
-          'State lock acquisition and transition cleanup both failed',
-        )
-      }
-      if (acquisitionError !== undefined) throw acquisitionError
-      if (transitionError !== undefined) throw transitionError
-    } catch (error) {
-      const primary = errorCode(error) === 'EEXIST' ? locked() : error
-      const cleanupErrors: unknown[] = []
-      if (acquired) {
-        try {
-          await this.releaseLock(identity, owner)
-        } catch (cleanupError) {
-          cleanupErrors.push(cleanupError)
-        }
-      } else {
-        try {
-          await this.retireOwnedPath(owner, 'State lock owner')
-        } catch (cleanupError) {
-          cleanupErrors.push(cleanupError)
-        }
-      }
-      throw combinedError(primary, cleanupErrors, 'State lock acquisition failed and cleanup was incomplete')
-    }
+    await this.fs.chmod(this.root, 0o700)
+    const ownership = await this.acquireLock()
 
     let result: T | undefined
     let operationError: unknown
@@ -326,7 +262,7 @@ export class StateStore {
 
     let releaseError: unknown
     try {
-      await this.releaseLock(identity, owner)
+      await this.releaseLock(ownership)
     } catch (error) {
       releaseError = error
     }
@@ -410,22 +346,109 @@ export class StateStore {
     }
   }
 
-  private async createOwnedFile(path: string, contents: string): Promise<OwnedPath> {
+  private async acquireLock(): Promise<LockOwnership> {
+    const token = randomBytes(16).toString('hex')
+    const metadata = `${JSON.stringify({ pid: process.pid, timestamp: new Date().toISOString(), identity: token })}\n`
     let handle: FileHandle | undefined
-    let owned: OwnedPath | undefined
+    let created = false
+    let ownership: LockOwnership = { token }
     try {
-      handle = await this.fs.open(path, 'wx', 0o600)
-      const identity = await handle.stat()
-      owned = {
-        path,
-        identity: { dev: identity.dev, ino: identity.ino, contentSha256: contentSha256(contents) },
-      }
-      await handle.writeFile(contents, 'utf8')
+      handle = await this.fs.open(this.lockPath, 'wx', 0o600)
+      created = true
+      await handle.writeFile(metadata, 'utf8')
       await handle.sync()
+      const identity = await handle.stat()
+      ownership = { token, dev: identity.dev, ino: identity.ino }
       await handle.chmod(0o600)
       await handle.close()
       handle = undefined
-      return owned
+      return ownership
+    } catch (primary) {
+      if (!created && errorCode(primary) === 'EEXIST') throw locked()
+      const cleanupErrors: unknown[] = []
+      if (handle !== undefined) {
+        try {
+          await handle.close()
+        } catch (error) {
+          cleanupErrors.push(error)
+        }
+      }
+      if (created) {
+        try {
+          await this.quarantineLock(ownership, true, ownership.dev === undefined)
+        } catch (error) {
+          cleanupErrors.push(error)
+        }
+      }
+      throw combinedError(primary, cleanupErrors, 'State lock acquisition failed and cleanup was incomplete')
+    }
+  }
+
+  private async releaseLock(ownership: LockOwnership): Promise<void> {
+    await this.quarantineLock(ownership, false, false)
+  }
+
+  /**
+   * Node has no portable conditional unlink-by-inode. The 0700 managed directory
+   * and unpredictable quarantine name are the local trust boundary: this covers
+   * cooperating CLI processes, accidental canonical replacement, and ordinary
+   * filesystem errors, but not same-UID/root attackers racing private paths or
+   * hostile filesystems that violate atomic rename/link semantics.
+   */
+  private async quarantineLock(
+    expected: LockOwnership,
+    foreignIsError: boolean,
+    allowTokenOnly: boolean,
+  ): Promise<void> {
+    const quarantinePath = join(this.root, `state.lock.release-${randomBytes(16).toString('hex')}`)
+    await this.fs.rename(this.lockPath, quarantinePath)
+
+    let snapshot: LockOwnership
+    try {
+      snapshot = await this.inspectQuarantine(quarantinePath)
+    } catch (verificationError) {
+      const recoveryErrors: unknown[] = []
+      try {
+        await this.fs.link(quarantinePath, this.lockPath)
+      } catch (error) {
+        recoveryErrors.push(error)
+      }
+      throw combinedError(
+        verificationError,
+        recoveryErrors,
+        'Lock quarantine verification failed and recovery was incomplete',
+      )
+    }
+
+    const tokenMatches = snapshot.token === expected.token
+    const inodeMatches = expected.dev === snapshot.dev && expected.ino === snapshot.ino
+    const owned = tokenMatches && (allowTokenOnly || inodeMatches)
+    if (owned) {
+      await this.fs.rm(quarantinePath)
+      return
+    }
+
+    await this.fs.link(quarantinePath, this.lockPath)
+    await this.fs.rm(quarantinePath)
+    if (foreignIsError) throw new Error('Lock ownership changed during acquisition cleanup')
+  }
+
+  private async inspectQuarantine(path: string): Promise<LockOwnership> {
+    let handle: FileHandle | undefined
+    try {
+      handle = await this.fs.open(path, 'r')
+      const identity = await handle.stat()
+      const source = await handle.readFile('utf8')
+      await handle.close()
+      handle = undefined
+      let token = ''
+      try {
+        const parsed = JSON.parse(source) as { identity?: unknown }
+        if (typeof parsed.identity === 'string') token = parsed.identity
+      } catch {
+        // Malformed content is a foreign lock, not a verification I/O failure.
+      }
+      return { token, dev: identity.dev, ino: identity.ino }
     } catch (primary) {
       const cleanupErrors: unknown[] = []
       if (handle !== undefined) {
@@ -435,175 +458,7 @@ export class StateStore {
           cleanupErrors.push(error)
         }
       }
-      if (owned !== undefined) {
-        try {
-          await this.retireOwnedPath(owned, 'Partially created exclusive file')
-        } catch (error) {
-          cleanupErrors.push(error)
-        }
-      }
-      throw combinedError(primary, cleanupErrors, 'Exclusive file creation failed and cleanup was incomplete')
-    }
-  }
-
-  private async acquireTransition(identity: string, retry = false): Promise<OwnedPath> {
-    const attempts = retry ? 50 : 1
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-      try {
-        return await this.createOwnedFile(this.transitionPath, `${identity}\n`)
-      } catch (error) {
-        if (!retry || errorCode(error) !== 'EEXIST' || attempt === attempts - 1) throw error
-        await new Promise((resolve) => setTimeout(resolve, 2))
-      }
-    }
-    throw new Error('Transition acquisition attempts exhausted')
-  }
-
-  private async releaseTransition(transition: OwnedPath): Promise<void> {
-    await this.retireOwnedPath(transition, 'State lock transition guard')
-  }
-
-  private async releaseLock(identity: string, owner: OwnedPath): Promise<void> {
-    const transition = await this.acquireTransition(identity, true)
-    let primary: unknown
-    try {
-      await this.releaseLockWhileGuarded(identity, owner)
-    } catch (error) {
-      primary = error
-    }
-    try {
-      await this.releaseTransition(transition)
-    } catch (error) {
-      if (primary !== undefined) {
-        throw new AggregateError([primary, error], 'State lock release and transition cleanup both failed')
-      }
-      throw error
-    }
-    if (primary !== undefined) throw primary
-  }
-
-  private async releaseLockWhileGuarded(identity: string, owner: OwnedPath): Promise<void> {
-    let currentOwner: OwnedPath
-    try {
-      currentOwner = await this.snapshotOwnedPath(owner.path)
-    } catch (error) {
-      if (errorCode(error) === 'ENOENT') throw new Error('Owned state lock identity is missing')
-      throw error
-    }
-    if (!sameFile(owner.identity, currentOwner.identity)) throw new Error('Owned state lock identity path was replaced')
-
-    let canonical: OwnedPath
-    try {
-      canonical = await this.snapshotOwnedPath(this.lockPath)
-    } catch (error) {
-      if (errorCode(error) === 'ENOENT') {
-        await this.retireOwnedPath(owner, 'State lock owner')
-        return
-      }
-      throw error
-    }
-
-    if (!sameFile(owner.identity, canonical.identity)) {
-      await this.retireOwnedPath(owner, 'State lock owner')
-      return
-    }
-
-    const claimPath = join(this.root, `state.lock.claim-${identity}`)
-    await this.fs.rename(this.lockPath, claimPath)
-    const claim = await this.snapshotOwnedPath(claimPath)
-    const ownerAfterClaim = await this.snapshotOwnedPath(owner.path)
-    if (!sameFile(owner.identity, ownerAfterClaim.identity)) {
-      await this.restoreForeignClaim(claim)
-      throw new Error('Owned state lock identity path was replaced')
-    }
-    if (!sameFile(claim.identity, owner.identity)) {
-      await this.restoreForeignClaim(claim)
-      await this.retireOwnedPath(owner, 'State lock owner')
-      return
-    }
-
-    try {
-      await this.retireOwnedPath(claim, 'Owned state lock claim')
-    } catch (error) {
-      try {
-        await this.restoreOwnedCanonical(owner)
-      } catch (restoreError) {
-        throw new AggregateError([error, restoreError], 'Owned lock claim cleanup and restoration both failed')
-      }
-      throw error
-    }
-    await this.retireOwnedPath(owner, 'State lock owner')
-  }
-
-  private async restoreOwnedCanonical(owner: OwnedPath): Promise<void> {
-    try {
-      await this.fs.link(owner.path, this.lockPath)
-    } catch (error) {
-      if (errorCode(error) !== 'EEXIST') throw error
-    }
-    const canonical = await this.snapshotOwnedPath(this.lockPath)
-    if (!sameFile(owner.identity, canonical.identity)) {
-      throw new Error('Owned canonical lock could not be restored without overwriting a foreign lock')
-    }
-  }
-
-  private async restoreForeignClaim(claim: OwnedPath): Promise<void> {
-    try {
-      await this.fs.link(claim.path, this.lockPath)
-    } catch (error) {
-      if (errorCode(error) !== 'EEXIST') throw error
-      const canonical = await this.snapshotOwnedPath(this.lockPath)
-      if (!sameFile(claim.identity, canonical.identity)) {
-        throw new AggregateError([error], 'A foreign lock claim could not be restored without overwriting another lock')
-      }
-    }
-    await this.retireOwnedPath(claim, 'Restored foreign lock claim')
-  }
-
-  private async retireOwnedPath(owned: OwnedPath, description: string): Promise<void> {
-    const retirementPath = `${owned.path}.retired-${randomBytes(16).toString('hex')}`
-    await this.fs.rename(owned.path, retirementPath)
-    const retired = await this.snapshotOwnedPath(retirementPath)
-    if (!sameFile(owned.identity, retired.identity)) {
-      const replacementError = new Error(`${description} was replaced before retirement`)
-      try {
-        await this.restoreRetiredPath(retired, owned.path)
-      } catch (restoreError) {
-        throw new AggregateError(
-          [replacementError, restoreError],
-          `${description} replacement was quarantined but could not be restored`,
-        )
-      }
-      throw replacementError
-    }
-    await this.fs.rm(retirementPath)
-  }
-
-  private async restoreRetiredPath(retired: OwnedPath, publicPath: string): Promise<void> {
-    try {
-      await this.fs.link(retired.path, publicPath)
-    } catch (error) {
-      if (errorCode(error) !== 'EEXIST') throw error
-      const current = await this.snapshotOwnedPath(publicPath)
-      if (!sameFile(retired.identity, current.identity)) {
-        throw new AggregateError([error], 'Retired replacement cannot be restored without overwriting another file')
-      }
-    }
-    await this.fs.rm(retired.path)
-  }
-
-  private async snapshotOwnedPath(path: string): Promise<OwnedPath> {
-    const [identity, contents] = await Promise.all([
-      this.fs.stat(path),
-      this.fs.readFile(path),
-    ])
-    return {
-      path,
-      identity: {
-        dev: identity.dev,
-        ino: identity.ino,
-        contentSha256: contentSha256(contents),
-      },
+      throw combinedError(primary, cleanupErrors, 'Lock quarantine inspection failed')
     }
   }
 }
