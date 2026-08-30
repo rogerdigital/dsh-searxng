@@ -598,6 +598,59 @@ describe('rollback and file safety', () => {
     expect(runner.calls.at(-1)?.args).toEqual(['plugin', '--profile', 'web', 'remove', 'dsh-searxng'])
   })
 
+  it('preserves an existing patch changed by a failed add even when the manifest stays uninstalled', async () => {
+    const runner = new RecordingRunner()
+    const original = '# original before failed add\n- id: original\n'
+    const changed = '# changed by failed add\n- id: changed\n'
+    const { manager, patchPath } = await fixture({ patch: original, runner })
+    runner.handler = async (_command, args) => {
+      if (args.includes('add')) {
+        await fs.writeFile(patchPath, changed)
+        return { exitCode: 1, stdout: '', stderr: 'unsafe process output' }
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {})).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: {
+        primaryFailure: 'install',
+        primaryError: 'profile-conflict',
+      },
+    })
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+    ])
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(changed)
+  })
+
+  it('preserves a patch created before add aborts when the manifest stays uninstalled', async () => {
+    const runner = new RecordingRunner()
+    const cancellation = new Error('cancelled')
+    cancellation.name = 'AbortError'
+    const changed = '# created by aborted add\n- id: changed\n'
+    const { manager, patchPath } = await fixture({ runner })
+    runner.handler = async (_command, args) => {
+      if (args.includes('add')) {
+        await fs.writeFile(patchPath, changed)
+        throw cancellation
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {})).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: {
+        primaryFailure: 'install',
+        primaryError: 'profile-conflict',
+      },
+    })
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+    ])
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(changed)
+  })
+
   it('preserves a patch initialized by the add command', async () => {
     const runner = new RecordingRunner()
     const { manager, dir, patchPath } = await fixture({ runner })

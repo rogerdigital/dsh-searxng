@@ -430,21 +430,19 @@ export class NodeProfileManager implements ProfileManager {
 
       if (!installedBefore && !pluginAdded && failureStage === 'install') {
         try {
+          rollbackExpected = await this.readPatchSnapshot(patchPath)
+          if (!sameSnapshot(original, rollbackExpected)) {
+            restoreOriginalAllowed = false
+            effectivePrimaryError = new ProfileConflictError()
+          }
+        } catch (error) {
+          rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
+          patchRollbackBlocked = true
+        }
+        try {
           pluginAdded = await this.readInstalled(packagePath)
         } catch {
           rollbackFailures.push('plugin-inspect')
-        }
-        if (pluginAdded) {
-          try {
-            rollbackExpected = await this.readPatchSnapshot(patchPath)
-            if (original.exists && !sameSnapshot(original, rollbackExpected)) {
-              restoreOriginalAllowed = false
-              effectivePrimaryError = new ProfileConflictError()
-            }
-          } catch (error) {
-            rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
-            patchRollbackBlocked = true
-          }
         }
       }
 
