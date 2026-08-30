@@ -1,0 +1,23 @@
+# dsh-vet pre-install security audit: report artifact on every run, findings
+# comment on PRs, and a committed report + grade badge on main (D3: the badge
+# reads .dsh-vet/badge.json from this repository — no badge service).
+name: dsh-vet
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rogerdigital/dsh-vet/action@main # pin to @v0.2.0 once released
+        with:
+          specifier: '.'
+          commit-report: true
