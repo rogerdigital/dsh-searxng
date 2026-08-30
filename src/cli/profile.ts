@@ -534,6 +534,8 @@ export class NodeProfileManager implements ProfileManager {
       renderAttachment(parsePatch(original.bytes), normalizedEndpoint)
     }
     let pluginAdded = false
+    let pluginOwnershipUncertain = false
+    let deferredAddError: unknown
     let writeAttempted = false
     let rollbackExpected: PatchSnapshot | undefined
     let output: Buffer | undefined
@@ -544,15 +546,37 @@ export class NodeProfileManager implements ProfileManager {
     try {
       if (!installedBefore) {
         failureStage = 'install'
-        await this.runPlugin(name, 'add', signal)
-        const afterAdd = await this.readManifestSnapshot(packagePath)
-        if (!this.installedFromManifestSnapshot(afterAdd)) throw new OperationFailure('install')
+        const beforeAdd = await this.readManifestSnapshot(packagePath)
+        if (!sameSnapshot(manifestBefore, beforeAdd) || this.installedFromManifestSnapshot(beforeAdd)) {
+          throw concurrentProfileModification()
+        }
+        let addError: unknown
+        try {
+          await this.runPlugin(name, 'add', signal)
+        } catch (error) {
+          addError = error
+        }
+        let afterAdd: PatchSnapshot
+        try {
+          afterAdd = await this.readManifestSnapshot(packagePath)
+        } catch {
+          pluginOwnershipUncertain = true
+          throw concurrentProfileModification()
+        }
+        if (!this.installedFromManifestSnapshot(afterAdd)) {
+          if (!sameSnapshot(beforeAdd, afterAdd)) {
+            pluginOwnershipUncertain = true
+            throw concurrentProfileModification()
+          }
+          if (addError !== undefined) throw addError
+          throw new OperationFailure('install')
+        }
         pluginAdded = true
         manifestBaseline = afterAdd
+        deferredAddError = addError
       }
 
       signal?.throwIfAborted()
-      failureStage = 'write'
       const renderBase = await this.readPatchSnapshot(patchPath)
       if (!await this.manifestMatches(packagePath, manifestBaseline)) {
         throw concurrentProfileModification()
@@ -565,6 +589,8 @@ export class NodeProfileManager implements ProfileManager {
         }
         if (!original.exists) rollbackTarget = renderBase
       }
+      if (deferredAddError !== undefined) throw deferredAddError
+      failureStage = 'write'
       output = renderAttachment(parsePatch(renderBase.bytes ?? Buffer.from('[]\n')), normalizedEndpoint)
       // Portable best-effort CAS: within the trusted profile directory, compare
       // bytes plus file identity immediately before the atomic rename.
@@ -615,12 +641,7 @@ export class NodeProfileManager implements ProfileManager {
           rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
           patchRollbackBlocked = true
         }
-        try {
-          const afterInstallFailure = await this.readManifestSnapshot(packagePath)
-          pluginAdded = this.installedFromManifestSnapshot(afterInstallFailure)
-        } catch {
-          rollbackFailures.push('plugin-inspect')
-        }
+        if (pluginOwnershipUncertain) rollbackFailures.push('plugin-conflict')
       }
 
       let rollbackCurrent: PatchSnapshot | undefined
@@ -637,26 +658,38 @@ export class NodeProfileManager implements ProfileManager {
       }
 
       if (pluginAdded) {
-        const beforeRemove = rollbackCurrent
-        let pluginRemoved = false
-        try {
-          await this.runPlugin(name, 'remove')
-          pluginRemoved = true
-        } catch {
-          rollbackFailures.push('plugin')
-        }
-        if (beforeRemove !== undefined) {
+        if (!await this.manifestMatches(packagePath, manifestBaseline)) {
+          rollbackFailures.push('plugin-conflict')
+        } else {
+          const beforeRemove = rollbackCurrent
+          let removeSucceeded = false
           try {
-            const afterRemove = await this.readPatchSnapshot(patchPath)
-            if (!sameSnapshot(beforeRemove, afterRemove)) {
-              rollbackFailures.push('patch-conflict')
-              rollbackCurrent = undefined
-            } else {
-              rollbackCurrent = pluginRemoved ? afterRemove : undefined
+            await this.runPlugin(name, 'remove')
+            removeSucceeded = true
+          } catch {
+            rollbackFailures.push('plugin')
+          }
+          if (removeSucceeded) {
+            try {
+              const manifestAfterRemove = await this.readManifestSnapshot(packagePath)
+              if (this.installedFromManifestSnapshot(manifestAfterRemove)) rollbackFailures.push('plugin')
+            } catch {
+              rollbackFailures.push('plugin')
             }
-          } catch (error) {
-            rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
-            rollbackCurrent = undefined
+          }
+          if (beforeRemove !== undefined) {
+            try {
+              const afterRemove = await this.readPatchSnapshot(patchPath)
+              if (!sameSnapshot(beforeRemove, afterRemove)) {
+                rollbackFailures.push('patch-conflict')
+                rollbackCurrent = undefined
+              } else {
+                rollbackCurrent = afterRemove
+              }
+            } catch (error) {
+              rollbackFailures.push(error instanceof ProfileConflictError ? 'patch-conflict' : 'patch')
+              rollbackCurrent = undefined
+            }
           }
         }
       }

@@ -281,6 +281,35 @@ describe('ProfileManager contract and discovery', () => {
 })
 
 describe('transactional attachment', () => {
+  it('does not run add or remove when another process installs the plugin before the add boundary', async () => {
+    const uninstalled = `${JSON.stringify({ dependencies: {} }, null, 2)}\n`
+    const installed = `${JSON.stringify({ dependencies: { 'dsh-searxng': '9.9.9' } }, null, 2)}\n`
+    let manifestPath = ''
+    let patchPath = ''
+    let injected = false
+    const fileSystem: ProfileFileSystem = {
+      ...fs,
+      readFile: (async (...args: Parameters<typeof fs.readFile>) => {
+        const source = await fs.readFile(...args)
+        if (String(args[0]) === patchPath && !injected) {
+          injected = true
+          await fs.writeFile(manifestPath, installed)
+        }
+        return source
+      }) as typeof fs.readFile,
+    }
+    const created = await fixture({ packageJson: uninstalled, patch: '[]\n', fileSystem })
+    manifestPath = join(created.dir, 'package.json')
+    patchPath = created.patchPath
+
+    await expect(created.manager.attach('web', 'http://localhost:8080', async () => {}))
+      .rejects.toMatchObject({ code: 'E_PROFILE_CONCURRENT_MODIFICATION' })
+
+    expect(created.runner.calls).toEqual([])
+    await expect(fs.readFile(manifestPath, 'utf8')).resolves.toBe(installed)
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe('[]\n')
+  })
+
   it('fails before validation when plugin add reports success without installing the manifest dependency', async () => {
     const runner = new RecordingRunner()
     runner.simulatePluginEffects = false
@@ -300,6 +329,47 @@ describe('transactional attachment', () => {
       ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
     ])
     await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(original)
+  })
+
+  it('does not claim or remove a plugin when the post-add manifest ownership snapshot is unstable', async () => {
+    const installed = `${JSON.stringify({ dependencies: { 'dsh-searxng': '0.1.1' } }, null, 2)}\n`
+    const runner = new RecordingRunner()
+    runner.simulatePluginEffects = false
+    let manifestPath = ''
+    let manifestReads = 0
+    const fileSystem: ProfileFileSystem = {
+      ...fs,
+      readFile: (async (...args: Parameters<typeof fs.readFile>) => {
+        const source = await fs.readFile(...args)
+        if (String(args[0]) === manifestPath) {
+          manifestReads += 1
+          if (manifestReads === 3) {
+            const replacement = `${manifestPath}.replacement`
+            await fs.writeFile(replacement, source)
+            await fs.rename(replacement, manifestPath)
+          }
+        }
+        return source
+      }) as typeof fs.readFile,
+    }
+    const created = await fixture({ packageJson: { dependencies: {} }, patch: '[]\n', runner, fileSystem })
+    manifestPath = join(created.dir, 'package.json')
+    runner.handler = async (_command, args) => {
+      if (args.includes('add')) await fs.writeFile(manifestPath, installed)
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await expect(created.manager.attach('web', 'http://localhost:8080', async () => {})).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: {
+        primaryError: 'E_PROFILE_CONCURRENT_MODIFICATION',
+        rollbackFailures: ['plugin-conflict'],
+      },
+    })
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+    ])
+    await expect(fs.readFile(manifestPath, 'utf8')).resolves.toBe(installed)
   })
 
   it('rejects manifest dependency removal during attachment validation without removing a pre-existing plugin', async () => {
@@ -591,6 +661,67 @@ describe('transactional attachment', () => {
       { command: 'dsh', args: ['plugin', '--profile', 'web', 'remove', 'dsh-searxng'] },
     ])
     await expect(fs.readFile(patchPath)).resolves.toEqual(original)
+    await expect(manager.inspect('web')).resolves.toMatchObject({ installed: false })
+  })
+
+  it('reports rollback failure when remove returns zero without unregistering the added plugin', async () => {
+    const runner = new RecordingRunner()
+    runner.simulatePluginEffects = false
+    const original = '# original\n[]\n'
+    const created = await fixture({ packageJson: { dependencies: {} }, patch: original, runner })
+    const manifestPath = join(created.dir, 'package.json')
+    runner.handler = async (_command, args) => {
+      if (args.includes('add')) {
+        await fs.writeFile(manifestPath, `${JSON.stringify({ dependencies: { 'dsh-searxng': '0.1.1' } }, null, 2)}\n`)
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await expect(created.manager.attach('web', 'http://localhost:8080', async () => {
+      throw new Error('validation failure')
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { primaryFailure: 'validation', rollbackFailures: ['plugin'] },
+    })
+
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'remove', 'dsh-searxng'],
+    ])
+    await expect(created.manager.inspect('web')).resolves.toMatchObject({ installed: true })
+    await expect(fs.readFile(created.patchPath, 'utf8')).resolves.toBe(original)
+  })
+
+  it.each([
+    ['version', { dependencies: { 'dsh-searxng': '2.0.0' } }],
+    ['registration source', { dependencies: {}, dsh: { profile: { bundles: ['dsh-searxng'] } } }],
+  ])('does not remove a transaction-added plugin after validation changes its %s', async (_change, concurrentManifest) => {
+    const runner = new RecordingRunner()
+    runner.simulatePluginEffects = false
+    const created = await fixture({ packageJson: { dependencies: {} }, patch: '[]\n', runner })
+    const manifestPath = join(created.dir, 'package.json')
+    runner.handler = async (_command, args) => {
+      if (args.includes('add')) {
+        await fs.writeFile(manifestPath, `${JSON.stringify({ dependencies: { 'dsh-searxng': '0.1.1' } }, null, 2)}\n`)
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    await expect(created.manager.attach('web', 'http://localhost:8080', async () => {
+      await fs.writeFile(manifestPath, `${JSON.stringify(concurrentManifest, null, 2)}\n`)
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: {
+        primaryError: 'E_PROFILE_CONCURRENT_MODIFICATION',
+        rollbackFailures: ['plugin-conflict'],
+      },
+    })
+
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+    ])
+    await expect(fs.readFile(manifestPath, 'utf8')).resolves.toBe(`${JSON.stringify(concurrentManifest, null, 2)}\n`)
+    await expect(fs.readFile(created.patchPath, 'utf8')).resolves.toBe('[]\n')
   })
 
   it('rethrows a safe validation CliError unchanged after successful rollback', async () => {
