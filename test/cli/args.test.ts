@@ -21,6 +21,17 @@ describe('parseCliArgs', () => {
     })
   })
 
+  it('accepts an absolute HTTP(S) URL with a subpath', () => {
+    expect(parseCliArgs(['setup', '--url', 'https://search.example/searxng'])).toMatchObject({
+      command: 'setup',
+      url: 'https://search.example/searxng',
+    })
+  })
+
+  it.each([1, 65535])('accepts setup port boundary %s', (port) => {
+    expect(parseCliArgs(['setup', '--port', String(port)])).toMatchObject({ command: 'setup', port })
+  })
+
   it.each(['status', 'doctor'])('parses %s with defaults', (command) => {
     expect(parseCliArgs([command])).toEqual({ command, profile: 'web', json: false })
   })
@@ -53,9 +64,18 @@ describe('parseCliArgs', () => {
     ['slash profile', ['setup', '--profile', 'a/b']],
     ['backslash profile', ['setup', '--profile', 'a\\b']],
     ['dot-segment profile', ['setup', '--profile', 'a/../b']],
+    ['dot profile', ['setup', '--profile', '.']],
+    ['dot-dot profile', ['setup', '--profile', '..']],
     ['port below range', ['setup', '--port', '0']],
     ['port above range', ['setup', '--port', '65536']],
     ['noninteger port', ['setup', '--port', '8080.5']],
+    ['URL without scheme', ['setup', '--url', 'search.example']],
+    ['non-http URL', ['setup', '--url', 'ftp://search.example']],
+    ['URL with query', ['setup', '--url', 'https://search.example/?q=1']],
+    ['URL with fragment', ['setup', '--url', 'https://search.example/#top']],
+    ['URL with username', ['setup', '--url', 'https://user@search.example']],
+    ['URL with password', ['setup', '--url', 'https://:secret@search.example']],
+    ['remove yes without purge-data', ['remove', '--yes']],
     ['status port', ['status', '--port', '8081']],
     ['doctor port', ['doctor', '--port', '8081']],
     ['remove port', ['remove', '--port', '8081']],

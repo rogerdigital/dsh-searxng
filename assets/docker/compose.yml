@@ -9,6 +9,7 @@ services:
       io.dsh-searxng.managed: "true"
       io.dsh-searxng.home-id: "${DSH_SEARXNG_HOME_ID}"
       io.dsh-searxng.schema: "1"
+      io.dsh-searxng.deployment-version: "${DSH_SEARXNG_DEPLOYMENT_VERSION}"
     volumes:
       - ./searxng:/etc/searxng
       - searxng-cache:/var/cache/searxng
@@ -18,9 +19,21 @@ services:
       - CHOWN
       - SETGID
       - SETUID
+    networks:
+      - dsh-searxng
 
 volumes:
   searxng-cache:
     labels:
       io.dsh-searxng.managed: "true"
       io.dsh-searxng.home-id: "${DSH_SEARXNG_HOME_ID}"
+      io.dsh-searxng.schema: "1"
+      io.dsh-searxng.deployment-version: "${DSH_SEARXNG_DEPLOYMENT_VERSION}"
+
+networks:
+  dsh-searxng:
+    labels:
+      io.dsh-searxng.managed: "true"
+      io.dsh-searxng.home-id: "${DSH_SEARXNG_HOME_ID}"
+      io.dsh-searxng.schema: "1"
+      io.dsh-searxng.deployment-version: "${DSH_SEARXNG_DEPLOYMENT_VERSION}"

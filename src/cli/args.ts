@@ -60,7 +60,15 @@ function parseUrl(value: string | undefined): string | undefined {
   } catch {
     invalid('url must be an absolute HTTP(S) URL')
   }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') invalid('url must be an absolute HTTP(S) URL')
+  if (
+    (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+    url.search ||
+    url.hash ||
+    url.username ||
+    url.password
+  ) {
+    invalid('url must be an absolute HTTP(S) URL without query, fragment, or credentials')
+  }
   return value
 }
 
@@ -87,6 +95,7 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   if (cliCommand !== 'setup' && url !== undefined) invalid('--url is only supported by setup')
   if (cliCommand !== 'remove' && (service || purgeData || yes)) invalid('remove flags are only supported by remove')
   if (cliCommand === 'remove' && purgeData && !service) invalid('--purge-data requires --service')
+  if (cliCommand === 'remove' && yes && !purgeData) invalid('--yes requires --purge-data')
 
   if (cliCommand === 'setup') return { command: cliCommand, profile, ...(url === undefined ? {} : { url }), port, json }
   if (cliCommand === 'remove') return { command: cliCommand, profile, json, service, purgeData, yes }
