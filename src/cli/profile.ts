@@ -149,6 +149,11 @@ function sameIdentity(left?: FileIdentity, right?: FileIdentity): boolean {
     left.modifiedMs === right.modifiedMs && left.changedMs === right.changedMs
 }
 
+function sameFileAcrossRename(left: FileIdentity, right: FileIdentity): boolean {
+  return left.device === right.device && left.inode === right.inode && left.size === right.size &&
+    left.modifiedMs === right.modifiedMs
+}
+
 function sameSnapshot(left: PatchSnapshot, right: PatchSnapshot): boolean {
   if (left.exists !== right.exists) return false
   if (!left.exists) return true
@@ -625,15 +630,35 @@ export class NodeProfileManager implements ProfileManager {
       await handle.writeFile(bytes)
       await handle.chmod(0o600)
       await handle.sync()
-      await handle.close()
-      handle = undefined
+      const staged: PatchSnapshot = {
+        exists: true,
+        bytes: Buffer.from(bytes),
+        identity: fileIdentity(await handle.stat()),
+      }
       if (expectedCurrent !== undefined) {
         const beforeRename = await this.readPatchSnapshot(path)
         if (!sameSnapshot(beforeRename, expectedCurrent)) throw new ProfileConflictError()
       }
       await this.fileSystem.rename(temporaryPath, path)
+      const renamedIdentity = fileIdentity(await handle.stat())
+      // macOS advances ctime during rename. Prove continuity with the stable
+      // fields, then use this same open handle's post-rename identity for the
+      // exact target comparison below, including the updated ctime.
+      if (staged.identity === undefined || !sameFileAcrossRename(staged.identity, renamedIdentity)) {
+        throw new ProfileConflictError()
+      }
+      let closeFailed = false
+      try {
+        await handle.close()
+        handle = undefined
+      } catch {
+        closeFailed = true
+      }
       const committed = await this.readPatchSnapshot(path)
-      if (!sameBytes(committed, bytes)) throw new ProfileConflictError()
+      if (!sameBytes(committed, bytes) || !sameIdentity(committed.identity, renamedIdentity)) {
+        throw new ProfileConflictError()
+      }
+      if (closeFailed) throw new CommittedWriteError(committed)
       try {
         await this.syncDirectory(directory)
       } catch {

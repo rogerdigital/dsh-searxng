@@ -736,6 +736,43 @@ describe('rollback and file safety', () => {
     expect(await fs.readFile(patchPath, 'utf8')).toContain('dsh-searxng managed attachment')
   })
 
+  it('rejects and preserves a same-byte foreign replacement made immediately after rename', async () => {
+    let replaceAfterRename = true
+    let patchPath = ''
+    let foreignInode: number | undefined
+    const fileSystem: ProfileFileSystem = {
+      ...fs,
+      rename: async (...args: Parameters<typeof fs.rename>) => {
+        await fs.rename(...args)
+        if (String(args[1]) === patchPath && replaceAfterRename) {
+          replaceAfterRename = false
+          const committedBytes = await fs.readFile(patchPath)
+          const replacement = `${patchPath}.foreign-after-rename`
+          await fs.writeFile(replacement, committedBytes)
+          await fs.rename(replacement, patchPath)
+          foreignInode = (await fs.lstat(patchPath)).ino
+        }
+      },
+    }
+    const created = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.0' } },
+      patch: '[]\n',
+      fileSystem,
+    })
+    patchPath = created.patchPath
+    let validations = 0
+
+    await expect(created.manager.attach('web', 'http://localhost:8080', async () => {
+      validations += 1
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { primaryError: 'profile-conflict', rollbackFailures: ['patch-conflict'] },
+    })
+    expect(validations).toBe(0)
+    expect((await fs.lstat(patchPath)).ino).toBe(foreignInode)
+    expect(await fs.readFile(patchPath, 'utf8')).toContain('dsh-searxng managed attachment')
+  })
+
   it('writes user-only files and leaves no temporary artifacts', async () => {
     const { manager, dir, patchPath } = await fixture({ patch: '[]\n' })
     await manager.attach('web', 'http://localhost:8080', async () => {})
@@ -779,6 +816,41 @@ describe('detachment', () => {
     expect(output).toContain('http://user.invalid')
     expect(output).not.toContain('http://managed.invalid')
     expect(runner.calls).toEqual([])
+  })
+
+  it('rejects and preserves a same-byte foreign replacement immediately after detach rename', async () => {
+    const patch = `# dsh-searxng managed attachment
+- id: web-search-searxng
+  config: { baseURL: http://managed.invalid }
+- id: user
+  config: { keep: true }
+`
+    let replaceAfterRename = true
+    let patchPath = ''
+    let foreignInode: number | undefined
+    const fileSystem: ProfileFileSystem = {
+      ...fs,
+      rename: async (...args: Parameters<typeof fs.rename>) => {
+        await fs.rename(...args)
+        if (String(args[1]) === patchPath && replaceAfterRename) {
+          replaceAfterRename = false
+          const detachedBytes = await fs.readFile(patchPath)
+          const replacement = `${patchPath}.foreign-detach`
+          await fs.writeFile(replacement, detachedBytes)
+          await fs.rename(replacement, patchPath)
+          foreignInode = (await fs.lstat(patchPath)).ino
+        }
+      },
+    }
+    const created = await fixture({ patch, fileSystem })
+    patchPath = created.patchPath
+
+    await expect(created.manager.detach('web')).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { primaryError: 'profile-conflict', rollbackFailures: ['patch-conflict'] },
+    })
+    expect((await fs.lstat(patchPath)).ino).toBe(foreignInode)
+    expect(ids(await fs.readFile(patchPath, 'utf8'))).toEqual(['user'])
   })
 })
 
