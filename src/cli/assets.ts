@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { chmod, mkdir, open, readFile, rename, rm } from 'node:fs/promises'
+import { chmod, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import { parse, stringify } from 'yaml'
 import { CliError } from './errors.ts'
 
@@ -28,20 +28,27 @@ export interface AssetRenderer {
   }): Promise<{ composePath: string; configurationSha256: string }>
 }
 
-interface AssetFileSystem {
+export interface AssetFileSystem {
   chmod: typeof chmod
   mkdir: typeof mkdir
   open: typeof open
   readFile: typeof readFile
   rename: typeof rename
   rm: typeof rm
+  stat: typeof stat
 }
 
-const realFileSystem: AssetFileSystem = { chmod, mkdir, open, readFile, rename, rm }
+const realFileSystem: AssetFileSystem = { chmod, mkdir, open, readFile, rename, rm, stat }
 
 export interface FileAssetRendererOptions {
   assetRoot?: URL
   fileSystem?: Partial<AssetFileSystem>
+}
+
+interface BundleContents {
+  environment: string
+  compose: string
+  settings: string
 }
 
 function invalidAssets(message: string): CliError {
@@ -52,13 +59,28 @@ function invalidInput(message: string): CliError {
   return new CliError('E_USAGE', message, 'Use a valid managed deployment configuration')
 }
 
+function invalidBundle(message: string): CliError {
+  return new CliError('E_STATE_INVALID', message, 'Remove the damaged managed configuration bundle and retry')
+}
+
+function errorCode(error: unknown): string | undefined {
+  return error !== null && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code)
+    : undefined
+}
+
 function isEnvironmentValue(value: string): boolean {
   return value.length > 0 && !/[\r\n\0]/.test(value)
 }
 
+function isContained(parent: string, child: string): boolean {
+  const path = relative(resolve(parent), resolve(child))
+  return path.length > 0 && !path.startsWith('..') && !isAbsolute(path)
+}
+
 function validateInput(input: Parameters<AssetRenderer['render']>[0]): void {
   if (resolve(input.stateDir) !== resolve(input.identity.stateDir)) throw invalidInput('State directory does not match managed identity')
-  if (resolve(dirname(input.identity.composePath)) !== resolve(input.stateDir)) throw invalidInput('Compose file must be inside the state directory')
+  if (!isContained(input.stateDir, input.identity.composePath)) throw invalidInput('Compose file must be inside the state directory')
   if (!/^[a-f0-9]{16}$/.test(input.identity.homeId)) throw invalidInput('Managed home identity is invalid')
   if (!Number.isSafeInteger(input.port) || input.port < 1 || input.port > 65535) throw invalidInput('Port must be between 1 and 65535')
   if (!isEnvironmentValue(input.image)) throw invalidInput('Image reference is invalid')
@@ -69,24 +91,15 @@ function validateInput(input: Parameters<AssetRenderer['render']>[0]): void {
 
 function renderSettings(template: string, secret: string): string {
   let parsed: unknown
-  try {
-    parsed = parse(template)
-  } catch {
-    throw invalidAssets('Packaged SearXNG settings are invalid')
-  }
+  try { parsed = parse(template) } catch { throw invalidAssets('Packaged SearXNG settings are invalid') }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw invalidAssets('Packaged SearXNG settings are invalid')
   const settings = parsed as Record<string, unknown>
   const server = settings.server
   if (server === null || typeof server !== 'object' || Array.isArray(server)) throw invalidAssets('Packaged SearXNG settings are invalid')
-
-  const rendered = {
-    ...settings,
-    server: { ...(server as Record<string, unknown>), secret_key: secret },
-  }
-  return stringify(rendered)
+  return stringify({ ...settings, server: { ...(server as Record<string, unknown>), secret_key: secret } })
 }
 
-function renderEnvironment(input: Parameters<AssetRenderer['render']>[0]): string {
+function baseEnvironment(input: Parameters<AssetRenderer['render']>[0]): string {
   return [
     `DSH_SEARXNG_IMAGE=${input.image}`,
     `DSH_SEARXNG_PORT=${input.port}`,
@@ -94,7 +107,6 @@ function renderEnvironment(input: Parameters<AssetRenderer['render']>[0]): strin
     `DSH_SEARXNG_PROJECT=${input.identity.projectName}`,
     `DSH_SEARXNG_CONTAINER=${input.identity.containerName}`,
     'DSH_SEARXNG_DEPLOYMENT_VERSION=1',
-    '',
   ].join('\n')
 }
 
@@ -104,6 +116,10 @@ function configurationHash(environment: string, compose: string, settings: strin
     .update('compose\0').update(compose)
     .update('settings\0').update(settings)
     .digest('hex')
+}
+
+function finalEnvironment(base: string, bundleName: string): string {
+  return `${base}\nDSH_SEARXNG_SETTINGS_DIR=./${bundleName}/searxng\n`
 }
 
 export class FileAssetRenderer implements AssetRenderer {
@@ -117,7 +133,6 @@ export class FileAssetRenderer implements AssetRenderer {
 
   async render(input: Parameters<AssetRenderer['render']>[0]): Promise<{ composePath: string; configurationSha256: string }> {
     validateInput(input)
-
     let compose: string
     let template: string
     try {
@@ -130,18 +145,58 @@ export class FileAssetRenderer implements AssetRenderer {
     }
 
     const settings = renderSettings(template, input.secret)
-    const environment = renderEnvironment(input)
-    const settingsDirectory = join(input.stateDir, 'searxng')
+    const environmentBase = baseEnvironment(input)
+    const configurationSha256 = configurationHash(environmentBase, compose, settings)
+    const bundleName = `config-${configurationSha256}`
+    const bundleDir = join(input.stateDir, bundleName)
+    const composePath = join(bundleDir, 'compose.yml')
+    const contents: BundleContents = {
+      environment: finalEnvironment(environmentBase, bundleName),
+      compose,
+      settings,
+    }
+
     await this.ensurePrivateDirectory(input.stateDir)
-    await this.ensurePrivateDirectory(settingsDirectory)
+    if (await this.verifyExistingBundle(bundleDir, contents)) return { composePath, configurationSha256 }
 
-    await this.atomicWrite(join(input.stateDir, '.env'), environment)
-    await this.atomicWrite(input.identity.composePath, compose)
-    await this.atomicWrite(join(settingsDirectory, 'settings.yml'), settings)
+    const stagingDir = join(input.stateDir, `.staging-${process.pid}-${randomBytes(8).toString('hex')}`)
+    let published = false
+    try {
+      await this.fs.mkdir(stagingDir, { mode: 0o700 })
+      await this.fs.chmod(stagingDir, 0o700)
+      const settingsDir = join(stagingDir, 'searxng')
+      await this.fs.mkdir(settingsDir, { mode: 0o700 })
+      await this.fs.chmod(settingsDir, 0o700)
 
-    return {
-      composePath: input.identity.composePath,
-      configurationSha256: configurationHash(environment, compose, settings),
+      await this.writePrivateFile(join(stagingDir, '.env'), contents.environment)
+      await this.writePrivateFile(join(stagingDir, 'compose.yml'), contents.compose)
+      await this.writePrivateFile(join(settingsDir, 'settings.yml'), contents.settings)
+      await this.syncDirectory(settingsDir)
+      await this.syncDirectory(stagingDir)
+
+      try {
+        await this.fs.rename(stagingDir, bundleDir)
+      } catch (error) {
+        if (errorCode(error) === 'EEXIST' || errorCode(error) === 'ENOTEMPTY') {
+          await this.fs.rm(stagingDir, { recursive: true, force: true })
+          if (await this.verifyExistingBundle(bundleDir, contents)) return { composePath, configurationSha256 }
+        }
+        throw error
+      }
+      published = true
+      try {
+        await this.syncDirectory(input.stateDir)
+      } catch (error) {
+        await this.withdrawUnconfirmedBundle(bundleDir, stagingDir)
+        published = false
+        throw error
+      }
+      return { composePath, configurationSha256 }
+    } catch (error) {
+      if (!published) {
+        try { await this.fs.rm(stagingDir, { recursive: true, force: true }) } catch {}
+      }
+      throw error
     }
   }
 
@@ -150,24 +205,67 @@ export class FileAssetRenderer implements AssetRenderer {
     await this.fs.chmod(path, 0o700)
   }
 
-  private async atomicWrite(path: string, contents: string): Promise<void> {
-    const temporaryPath = `${path}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`
+  private async writePrivateFile(path: string, contents: string): Promise<void> {
     let handle: FileHandle | undefined
     try {
-      handle = await this.fs.open(temporaryPath, 'wx', 0o600)
+      handle = await this.fs.open(path, 'wx', 0o600)
       await handle.writeFile(contents, 'utf8')
       await handle.sync()
       await handle.close()
       handle = undefined
-      await this.fs.chmod(temporaryPath, 0o600)
-      await this.fs.rename(temporaryPath, path)
       await this.fs.chmod(path, 0o600)
     } catch (error) {
       if (handle !== undefined) {
         try { await handle.close() } catch {}
       }
-      try { await this.fs.rm(temporaryPath, { force: true }) } catch {}
       throw error
+    }
+  }
+
+  private async syncDirectory(path: string): Promise<void> {
+    if (process.platform === 'win32') return
+    const handle = await this.fs.open(path, 'r')
+    try { await handle.sync() } finally { await handle.close() }
+  }
+
+  private async verifyExistingBundle(bundleDir: string, contents: BundleContents): Promise<boolean> {
+    let bundleStats
+    try { bundleStats = await this.fs.stat(bundleDir) } catch (error) {
+      if (errorCode(error) === 'ENOENT') return false
+      throw error
+    }
+    if (!bundleStats.isDirectory()) throw invalidBundle('Managed configuration bundle is not a directory')
+
+    const expected = [
+      [join(bundleDir, '.env'), contents.environment],
+      [join(bundleDir, 'compose.yml'), contents.compose],
+      [join(bundleDir, 'searxng', 'settings.yml'), contents.settings],
+    ] as const
+    try {
+      const settingsStats = await this.fs.stat(join(bundleDir, 'searxng'))
+      if (!settingsStats.isDirectory()) throw invalidBundle('Managed configuration settings path is invalid')
+      if (process.platform !== 'win32' && ((bundleStats.mode & 0o777) !== 0o700 || (settingsStats.mode & 0o777) !== 0o700)) {
+        throw invalidBundle('Managed configuration directory permissions are invalid')
+      }
+      for (const [path, content] of expected) {
+        const [actual, fileStats] = await Promise.all([this.fs.readFile(path, 'utf8'), this.fs.stat(path)])
+        if (!fileStats.isFile() || actual !== content || (process.platform !== 'win32' && (fileStats.mode & 0o777) !== 0o600)) {
+          throw invalidBundle('Managed configuration bundle does not match its identity')
+        }
+      }
+    } catch (error) {
+      if (error instanceof CliError) throw error
+      throw invalidBundle('Managed configuration bundle is incomplete')
+    }
+    return true
+  }
+
+  private async withdrawUnconfirmedBundle(bundleDir: string, stagingDir: string): Promise<void> {
+    try {
+      await this.fs.rename(bundleDir, stagingDir)
+      await this.fs.rm(stagingDir, { recursive: true, force: true })
+    } catch (cleanupError) {
+      throw new AggregateError([cleanupError], 'Configuration publish was not durable and recovery was incomplete')
     }
   }
 }

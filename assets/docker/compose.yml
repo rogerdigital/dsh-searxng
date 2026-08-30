@@ -11,8 +11,12 @@ services:
       io.dsh-searxng.schema: "1"
       io.dsh-searxng.deployment-version: "${DSH_SEARXNG_DEPLOYMENT_VERSION}"
     volumes:
-      - ./searxng:/etc/searxng
-      - searxng-cache:/var/cache/searxng
+      - type: bind
+        source: "${DSH_SEARXNG_SETTINGS_DIR}"
+        target: /etc/searxng
+      - type: volume
+        source: searxng-cache
+        target: /var/cache/searxng
     cap_drop:
       - ALL
     cap_add:

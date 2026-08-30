@@ -35,9 +35,14 @@ const ownedInspect = JSON.stringify([{ Config: { Labels: {
 const composePrefix = [
   'compose',
   '--project-directory', identity.stateDir,
+  '--env-file', joinForTest(identity.composePath, '.env'),
   '-f', identity.composePath,
   '--project-name', identity.projectName,
 ]
+
+function joinForTest(composePath: string, file: string): string {
+  return `${composePath.slice(0, composePath.lastIndexOf('/'))}/${file}`
+}
 
 async function expectCode(promise: Promise<unknown>, code: CliError['code']): Promise<void> {
   await expect(promise).rejects.toMatchObject({ code })
@@ -169,6 +174,21 @@ describe('CliDockerAdapter Compose operations', () => {
       command: 'docker',
       args: [...composePrefix, 'logs', '--no-color', '--tail', '50', 'searxng'],
     })
+  })
+
+  it.each([
+    'Authorization: Bearer test-token-123',
+    'authorization=BEARER test-token-123',
+    'AUTHORIZATION: bearer test-token-123',
+    '{"Authorization":"Bearer test-token-123"}',
+  ])('redacts the complete bearer credential in %s', async (line) => {
+    for (const maxLogBytes of [1024, 32]) {
+      const runner = new FakeRunner(ok(ownedInspect), ok(`${line}\n${'x'.repeat(100)}`))
+      const logs = await new CliDockerAdapter(runner, { maxLogBytes }).logs(identity, 10)
+      expect(logs).not.toContain('test-token-123')
+      expect(logs.toLowerCase()).not.toContain('bearer test-token-123')
+      expect(Buffer.byteLength(logs)).toBeLessThanOrEqual(maxLogBytes)
+    }
   })
 
   it('passes bounded logs through the injected structural redactor', async () => {

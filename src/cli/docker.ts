@@ -1,3 +1,4 @@
+import { dirname, join } from 'node:path'
 import { CliError, redact } from './errors.ts'
 import type { ManagedIdentity } from './assets.ts'
 import { ProcessExecutionError, type CommandResult, type CommandRunner } from './process.ts'
@@ -56,8 +57,10 @@ function isInspectRecord(value: unknown): value is { Config: { Labels: Record<st
 
 function sanitizeLogText(value: string): string {
   return value
-    .replace(/((?:authorization|secret(?:[_-]?key)?|password|api[_-]?key|access[_-]?token|refresh[_-]?token|query)\s*[:=]\s*)([^\s,;]+)/gi, '$1[REDACTED]')
-    .replace(/("(?:authorization|secret(?:[_-]?key)?|password|api[_-]?key|access[_-]?token|refresh[_-]?token|query)"\s*:\s*")[^"]*(")/gi, '$1[REDACTED]$2')
+    .replace(/("authorization"\s*:\s*")[^"]*(")/gi, '$1[REDACTED]$2')
+    .replace(/(authorization\s*[:=]\s*)[^\r\n,;]+/gi, '$1[REDACTED]')
+    .replace(/((?:secret(?:[_-]?key)?|password|api[_-]?key|access[_-]?token|refresh[_-]?token|query)\s*[:=]\s*)([^\s,;]+)/gi, '$1[REDACTED]')
+    .replace(/("(?:secret(?:[_-]?key)?|password|api[_-]?key|access[_-]?token|refresh[_-]?token|query)"\s*:\s*")[^"]*(")/gi, '$1[REDACTED]$2')
 }
 
 function capUtf8(value: string, limit: number): string {
@@ -170,6 +173,7 @@ export class CliDockerAdapter implements DockerAdapter {
     return [
       'compose',
       '--project-directory', identity.stateDir,
+      '--env-file', join(dirname(identity.composePath), '.env'),
       '-f', identity.composePath,
       '--project-name', identity.projectName,
       ...operation,
