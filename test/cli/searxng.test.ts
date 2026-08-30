@@ -21,6 +21,13 @@ afterEach(() => {
 })
 
 describe('probeSearxng', () => {
+  it('preserves a fetch AbortError instead of reporting a search failure', async () => {
+    const cancellation = new DOMException('cancelled request', 'AbortError')
+    const fetchMock = vi.fn().mockRejectedValue(cancellation)
+
+    await expect(probeSearxng({ baseURL: BASE, fetch: fetchMock })).rejects.toMatchObject({ name: 'AbortError' })
+  })
+
   it('returns only safe summary data after a real result', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
       query: PROBE_QUERY,
@@ -213,7 +220,7 @@ describe('DefaultSearxngProbe', () => {
     await expect(attempt).resolves.toBeUndefined()
   })
 
-  it('cancels during the readiness retry delay without another request', async () => {
+  it('preserves cancellation during the readiness retry delay without another request', async () => {
     vi.useFakeTimers()
     const controller = new AbortController()
     const fetchMock = vi.fn().mockRejectedValue(new TypeError('offline'))
@@ -221,7 +228,7 @@ describe('DefaultSearxngProbe', () => {
       { baseURL: BASE, attempts: 3, fetch: fetchMock },
       controller.signal,
     )
-    const expectation = expect(attempt).rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
+    const expectation = expect(attempt).rejects.toMatchObject({ name: 'AbortError' })
     await vi.advanceTimersByTimeAsync(0)
     controller.abort()
     await expectation
@@ -232,6 +239,19 @@ describe('DefaultSearxngProbe', () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ results: [{ url: 'https://example.com/a' }] }))
     const probe = new DefaultSearxngProbe()
     await expect(probe.realSearch({ baseURL: BASE, fetch: fetchMock })).resolves.toMatchObject({ resultCount: 1 })
+  })
+
+  it('preserves cancellation from realSearch requests', async () => {
+    const controller = new AbortController()
+    const cancellation = new Error('cancelled real search')
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+    }))
+    const attempt = new DefaultSearxngProbe().realSearch({ baseURL: BASE, fetch: fetchMock }, controller.signal)
+
+    controller.abort(cancellation)
+
+    await expect(attempt).rejects.toBe(cancellation)
   })
 
   it('validates through SearxngSearchProvider with the exact effective profile config', async () => {
@@ -250,6 +270,15 @@ describe('DefaultSearxngProbe', () => {
     await expect(probe.providerSearch(config, signal)).resolves.toMatchObject({ endpoint: BASE, resultCount: 1 })
     expect(providerFactory).toHaveBeenCalledWith(config)
     expect(search).toHaveBeenCalledWith({ query: PROBE_QUERY, maxResults: 1 }, signal)
+  })
+
+  it('preserves provider request cancellation instead of reporting a search failure', async () => {
+    const cancellation = new DOMException('cancelled provider request', 'AbortError')
+    const probe = new DefaultSearxngProbe({
+      providerFactory: () => ({ search: async () => { throw cancellation } }),
+    })
+
+    await expect(probe.providerSearch({ baseURL: BASE })).rejects.toBe(cancellation)
   })
 
   it('returns a safe failure when the real provider path has no result or throws', async () => {

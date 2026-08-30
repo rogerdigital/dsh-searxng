@@ -241,6 +241,12 @@ function isAbort(error: unknown, signal?: AbortSignal): boolean {
     (error !== null && typeof error === 'object' && 'name' in error && error.name === 'AbortError')
 }
 
+function isIncompleteRollback(error: unknown): error is CliError {
+  return error instanceof CliError &&
+    Array.isArray(error.details.rollbackFailures) &&
+    error.details.rollbackFailures.length > 0
+}
+
 async function externalSetup(
   input: SetupInput,
   endpoint: string,
@@ -383,9 +389,10 @@ export function createSetup(options: SetupFactoryOptions = {}) {
         return managedSetup({ ...input, port }, previous, environment, dependencies, randomSecret, signal)
       })
     } catch (error) {
-      if (error instanceof CliError) throw error
+      if (isIncompleteRollback(error)) throw error
       if (signal?.aborted) signal.throwIfAborted()
       if (isAbort(error, signal)) throw error
+      if (error instanceof CliError) throw error
       throw setupFailed()
     }
   }

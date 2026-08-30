@@ -509,7 +509,15 @@ export class NodeProfileManager implements ProfileManager {
     const dir = this.resolveProfileDirectory(name)
     const packagePath = join(dir, 'package.json')
     const patchPath = join(dir, 'cordis.patch.yml')
-    const installedBefore = await this.readInstalled(packagePath)
+    let manifestBefore: PatchSnapshot
+    try {
+      manifestBefore = await this.readManifestSnapshot(packagePath)
+    } catch (error) {
+      if (error instanceof ProfileConflictError) throw concurrentProfileModification()
+      throw error
+    }
+    const installedBefore = this.installedFromManifestSnapshot(manifestBefore)
+    let manifestBaseline = manifestBefore
     let original: PatchSnapshot
     try {
       original = await this.readPatchSnapshot(patchPath)
@@ -537,12 +545,18 @@ export class NodeProfileManager implements ProfileManager {
       if (!installedBefore) {
         failureStage = 'install'
         await this.runPlugin(name, 'add', signal)
+        const afterAdd = await this.readManifestSnapshot(packagePath)
+        if (!this.installedFromManifestSnapshot(afterAdd)) throw new OperationFailure('install')
         pluginAdded = true
+        manifestBaseline = afterAdd
       }
 
       signal?.throwIfAborted()
       failureStage = 'write'
       const renderBase = await this.readPatchSnapshot(patchPath)
+      if (!await this.manifestMatches(packagePath, manifestBaseline)) {
+        throw concurrentProfileModification()
+      }
       rollbackExpected = renderBase
       if (pluginAdded) {
         if (original.exists && !sameSnapshot(original, renderBase)) {
@@ -566,11 +580,24 @@ export class NodeProfileManager implements ProfileManager {
       }
 
       failureStage = 'validation'
-      await validate(cloneProviderConfig(configFromAttachment(output)))
+      if (!await this.manifestMatches(packagePath, manifestBaseline)) {
+        throw concurrentProfileModification()
+      }
+      let validationError: unknown
+      try {
+        await validate(cloneProviderConfig(configFromAttachment(output)))
+      } catch (error) {
+        validationError = error
+      }
       const afterValidation = await this.readPatchSnapshot(patchPath)
       if (rollbackExpected === undefined || !sameSnapshot(afterValidation, rollbackExpected)) {
+        if (validationError !== undefined) throw validationError
         throw new ProfileConflictError()
       }
+      if (!await this.manifestMatches(packagePath, manifestBaseline)) {
+        throw concurrentProfileModification()
+      }
+      if (validationError !== undefined) throw validationError
       signal?.throwIfAborted()
     } catch (primaryError) {
       const rollbackFailures: string[] = []
@@ -589,7 +616,8 @@ export class NodeProfileManager implements ProfileManager {
           patchRollbackBlocked = true
         }
         try {
-          pluginAdded = await this.readInstalled(packagePath)
+          const afterInstallFailure = await this.readManifestSnapshot(packagePath)
+          pluginAdded = this.installedFromManifestSnapshot(afterInstallFailure)
         } catch {
           rollbackFailures.push('plugin-inspect')
         }
@@ -762,6 +790,15 @@ export class NodeProfileManager implements ProfileManager {
       if (error instanceof ProfileConflictError || error instanceof CliError) throw error
       if (ioCode(error) === 'ENOENT') throw new ProfileConflictError()
       throw profileWriteError('Unable to read the DSH profile manifest')
+    }
+  }
+
+  private async manifestMatches(packagePath: string, expected: PatchSnapshot): Promise<boolean> {
+    try {
+      const current = await this.readManifestSnapshot(packagePath)
+      return sameSnapshot(current, expected) && this.installedFromManifestSnapshot(current)
+    } catch {
+      return false
     }
   }
 

@@ -664,6 +664,41 @@ describe('setup', () => {
     expect(test.events.slice(-3)).toEqual(['ownership', 'docker-down', 'unlock'])
   })
 
+  it('prefers an aborted signal over a normalized probe error and still rolls back created resources', async () => {
+    const controller = new AbortController()
+    const cancellation = new Error('cancelled raw search')
+    const test = harness({ ownershipSequence: ['absent', 'owned'] })
+    vi.mocked(test.deps.searxng.readiness).mockImplementationOnce(async () => {
+      test.events.push('readiness')
+      controller.abort(cancellation)
+      throw new CliError('E_SEARCH_FAILED', 'normalized after abort', 'retry')
+    })
+
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps, controller.signal)).rejects.toBe(cancellation)
+    expect(test.events.slice(-3)).toEqual(['ownership', 'docker-down', 'unlock'])
+    expect(test.writes).toEqual([])
+  })
+
+  it('reports an incomplete Docker rollback even when cancellation was the primary failure', async () => {
+    const controller = new AbortController()
+    const cancellation = new Error('cancelled before cleanup')
+    const test = harness({
+      ownershipSequence: ['absent', 'owned'],
+      downError: new Error('private cleanup failure'),
+    })
+    vi.mocked(test.deps.searxng.readiness).mockImplementationOnce(async () => {
+      test.events.push('readiness')
+      controller.abort(cancellation)
+      throw new CliError('E_SEARCH_FAILED', 'normalized after abort', 'retry')
+    })
+
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps, controller.signal)).rejects.toMatchObject({
+      code: 'E_INTERNAL',
+      details: { primaryError: 'E_SEARCH_FAILED', rollbackFailures: ['docker'] },
+    })
+    expect(test.events.slice(-3)).toEqual(['ownership', 'docker-down', 'unlock'])
+  })
+
   it('restores previous state after attach postcheck fails following a committed state write', async () => {
     const previous: StateV1 = { schemaVersion: 1, profiles: { old: { mode: 'external', endpoint: 'https://old.example' } } }
     const postcheck = new CliError('E_PROFILE_WRITE', 'profile changed after validation', 'repair profile')

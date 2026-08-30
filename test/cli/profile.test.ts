@@ -24,6 +24,8 @@ class RecordingRunner implements CommandRunner {
     args: readonly string[],
     options?: { signal?: AbortSignal },
   ) => Promise<CommandResult>
+  profileDir?: string
+  simulatePluginEffects = true
 
   async run(
     command: string,
@@ -32,9 +34,22 @@ class RecordingRunner implements CommandRunner {
   ): Promise<CommandResult> {
     this.calls.push({ command, args: [...args] })
     this.signals.push(options?.signal)
-    if (this.handler !== undefined) return this.handler(command, args, options)
     if (this.failure !== undefined) throw this.failure
-    return this.response
+    const response = this.handler !== undefined
+      ? await this.handler(command, args, options)
+      : this.response
+    if (response.exitCode === 0 && this.profileDir !== undefined && this.simulatePluginEffects) {
+      const manifestPath = join(this.profileDir, 'package.json')
+      let manifest: { dependencies?: Record<string, string> } = {}
+      try {
+        manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as typeof manifest
+      } catch {}
+      manifest.dependencies ??= {}
+      if (args.includes('add')) manifest.dependencies['dsh-searxng'] = '0.1.1'
+      if (args.includes('remove')) delete manifest.dependencies['dsh-searxng']
+      await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    }
+    return response
   }
 }
 
@@ -56,6 +71,7 @@ async function fixture(options: {
   }
   if (options.patch !== undefined) await fs.writeFile(join(dir, 'cordis.patch.yml'), options.patch)
   const runner = options.runner ?? new RecordingRunner()
+  runner.profileDir = dir
   const manager = new NodeProfileManager({
     commandRunner: runner,
     dshHome,
@@ -265,6 +281,92 @@ describe('ProfileManager contract and discovery', () => {
 })
 
 describe('transactional attachment', () => {
+  it('fails before validation when plugin add reports success without installing the manifest dependency', async () => {
+    const runner = new RecordingRunner()
+    runner.simulatePluginEffects = false
+    runner.handler = async () => ({ exitCode: 0, stdout: '', stderr: '' })
+    const original = '# unchanged\n[]\n'
+    const { manager, patchPath } = await fixture({ patch: original, runner })
+    let validations = 0
+
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {
+      validations += 1
+    })).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { primaryFailure: 'install', primaryError: 'process', rollbackFailures: [] },
+    })
+    expect(validations).toBe(0)
+    expect(runner.calls.map((call) => call.args)).toEqual([
+      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+    ])
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(original)
+  })
+
+  it('rejects manifest dependency removal during attachment validation without removing a pre-existing plugin', async () => {
+    const original = '[]\n'
+    const { manager, runner, dir, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.1' } },
+      patch: original,
+    })
+    const manifestPath = join(dir, 'package.json')
+
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {
+      await fs.writeFile(manifestPath, `${JSON.stringify({ dependencies: {} }, null, 2)}\n`)
+    })).rejects.toMatchObject({ code: 'E_PROFILE_CONCURRENT_MODIFICATION' })
+
+    expect(runner.calls).toEqual([])
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(original)
+  })
+
+  it('rejects a same-byte manifest inode replacement during attachment validation', async () => {
+    const packageJson = `${JSON.stringify({ dependencies: { 'dsh-searxng': '0.1.1' } }, null, 2)}\n`
+    const original = '[]\n'
+    const { manager, runner, dir, patchPath } = await fixture({ packageJson, patch: original })
+    const manifestPath = join(dir, 'package.json')
+    const before = await fs.lstat(manifestPath)
+
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {
+      const replacement = `${manifestPath}.replacement`
+      await fs.writeFile(replacement, packageJson)
+      await fs.rename(replacement, manifestPath)
+    })).rejects.toMatchObject({ code: 'E_PROFILE_CONCURRENT_MODIFICATION' })
+
+    expect(runner.calls).toEqual([])
+    expect((await fs.lstat(manifestPath)).ino).not.toBe(before.ino)
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(original)
+  })
+
+  it('rejects a same-byte manifest replacement during the patch write before validation', async () => {
+    const packageJson = `${JSON.stringify({ dependencies: { 'dsh-searxng': '0.1.1' } }, null, 2)}\n`
+    let manifestPath = ''
+    let patchPath = ''
+    let replaceManifest = true
+    const fileSystem: ProfileFileSystem = {
+      ...fs,
+      rename: async (...args: Parameters<typeof fs.rename>) => {
+        await fs.rename(...args)
+        if (String(args[1]) === patchPath && replaceManifest) {
+          replaceManifest = false
+          const replacement = `${manifestPath}.replacement`
+          await fs.writeFile(replacement, packageJson)
+          await fs.rename(replacement, manifestPath)
+        }
+      },
+    }
+    const created = await fixture({ packageJson, patch: '[]\n', fileSystem })
+    manifestPath = join(created.dir, 'package.json')
+    patchPath = created.patchPath
+    let validations = 0
+
+    await expect(created.manager.attach('web', 'http://localhost:8080', async () => {
+      validations += 1
+    })).rejects.toMatchObject({ code: 'E_PROFILE_CONCURRENT_MODIFICATION' })
+
+    expect(validations).toBe(0)
+    expect(created.runner.calls).toEqual([])
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe('[]\n')
+  })
+
   it('passes a safe clone of the exact written effective config to validation', async () => {
     const patch = `- id: web-search-searxng
   config:

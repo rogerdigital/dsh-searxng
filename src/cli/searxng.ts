@@ -88,7 +88,7 @@ export class DefaultSearxngProbe implements SearxngProbe {
       if (result.sources.length === 0) throw searchFailed('The configured provider returned no usable search result')
       return { endpoint: options.baseURL, resultCount: result.sources.length, elapsedMs: Math.max(0, Date.now() - startedAt) }
     } catch (error) {
-      signal?.throwIfAborted()
+      rethrowCancellation(error, signal)
       if (error instanceof CliError) throw error
       throw searchFailed('The configured SearXNG provider search failed')
     }
@@ -109,17 +109,18 @@ async function runProbe(
   const startedAt = Date.now()
   let lastError: unknown
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    if (signal?.aborted) throw searchFailed('SearXNG probe was cancelled')
+    signal?.throwIfAborted()
     try {
       return await probeAttempt(options, endpoint, timeoutMs, allowEmptyResults, startedAt, signal)
     } catch (error) {
-      lastError = toCliError(error, signal)
+      rethrowCancellation(error, signal)
+      lastError = toCliError(error)
       if (!isTransientFailure(error)) throw lastError
       if (attempt === attempts) throw lastError
       await delay(READINESS_RETRY_DELAY_MS, signal)
     }
   }
-  throw toCliError(lastError, signal)
+  throw toCliError(lastError)
 }
 
 async function runReadiness(options: ProbeOptions, signal?: AbortSignal): Promise<void> {
@@ -134,7 +135,7 @@ async function runReadiness(options: ProbeOptions, signal?: AbortSignal): Promis
   const deadline = startedAt + timeoutMs
   let attempt = 0
   while (true) {
-    if (signal?.aborted) throw searchFailed('SearXNG readiness check was cancelled')
+    signal?.throwIfAborted()
     const remainingMs = deadline - Date.now()
     if (remainingMs <= 0) throw startupTimeout()
     if (options.attempts !== undefined && attempt >= options.attempts) throw startupTimeout()
@@ -151,7 +152,8 @@ async function runReadiness(options: ProbeOptions, signal?: AbortSignal): Promis
       )
       return
     } catch (error) {
-      const cliError = toCliError(error, signal)
+      rethrowCancellation(error, signal)
+      const cliError = toCliError(error)
       if (!isTransientFailure(error)) throw cliError
       if (options.attempts !== undefined && attempt >= options.attempts) throw startupTimeout()
       const delayMs = Math.min(READINESS_RETRY_DELAY_MS, deadline - Date.now())
@@ -255,9 +257,8 @@ function hasValidHttpUrl(value: unknown): boolean {
   return (url.protocol === 'http:' || url.protocol === 'https:') && url.username.length === 0 && url.password.length === 0
 }
 
-function toCliError(error: unknown, signal?: AbortSignal): CliError {
+function toCliError(error: unknown): CliError {
   if (error instanceof CliError) return error
-  if (signal?.aborted) return searchFailed('SearXNG probe was cancelled')
   if (error !== null && typeof error === 'object' && 'message' in error) {
     const message = String(error.message)
     if (/non-JSON|malformed JSON/i.test(message)) {
@@ -265,6 +266,19 @@ function toCliError(error: unknown, signal?: AbortSignal): CliError {
     }
   }
   return searchFailed('SearXNG request failed')
+}
+
+function rethrowCancellation(error: unknown, signal?: AbortSignal): void {
+  if (signal?.aborted) signal.throwIfAborted()
+  if (error !== null && typeof error === 'object') {
+    if ('name' in error && error.name === 'AbortError') throw error
+    if ('kind' in error && error.kind === 'caller-abort') {
+      throw new DOMException('The operation was aborted', 'AbortError')
+    }
+    if ('code' in error && error.code === 'WEB_ABORTED') {
+      throw new DOMException('The operation was aborted', 'AbortError')
+    }
+  }
 }
 
 function isTransientFailure(error: unknown): boolean {
@@ -278,12 +292,14 @@ function searchFailed(message: string): CliError {
 }
 
 function delay(delayMs: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(searchFailed('SearXNG probe was cancelled'))
+  if (signal?.aborted) {
+    return Promise.reject(signal.reason ?? new DOMException('The operation was aborted', 'AbortError'))
+  }
   return new Promise((resolve, reject) => {
     const onAbort = () => {
       clearTimeout(timer)
       signal?.removeEventListener('abort', onAbort)
-      reject(searchFailed('SearXNG probe was cancelled'))
+      reject(signal?.reason ?? new DOMException('The operation was aborted', 'AbortError'))
     }
     const timer = setTimeout(() => {
       signal?.removeEventListener('abort', onAbort)
