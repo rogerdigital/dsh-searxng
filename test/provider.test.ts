@@ -18,6 +18,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 
@@ -105,9 +106,21 @@ describe('SearxngSearchProvider', () => {
         expect(new SearxngSearchProvider({ baseURL }).available()).toBe(false)
       },
     )
+
+    it('is false when the base URL contains credentials', () => {
+      expect(new SearxngSearchProvider({ baseURL: 'http://user:pass@localhost:8080' }).available()).toBe(false)
+    })
   })
 
   describe('search', () => {
+    it('rejects an unsafe base URL without making a request', async () => {
+      const fetchMock = vi.fn()
+      vi.stubGlobal('fetch', fetchMock)
+      await expect(new SearxngSearchProvider({ baseURL: 'http://user:pass@localhost:8080' }).search({ query: 'q' }))
+        .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      expect(fetchMock).not.toHaveBeenCalled()
+    })
+
     it.each([
       [`${BASE}/`, `${BASE}/search`],
       [`${BASE}/searxng`, `${BASE}/searxng/search`],
@@ -172,14 +185,19 @@ describe('SearxngSearchProvider', () => {
       expect((init.headers as Record<string, string>)['authorization']).toBe('Bearer tok')
     })
 
-    it('forwards the abort signal', async () => {
-      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [] }))
+    it('links the caller abort signal to the request', async () => {
+      const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+      }))
       vi.stubGlobal('fetch', fetchMock)
       const controller = new AbortController()
 
-      await new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' }, controller.signal)
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' }, controller.signal)
+      controller.abort()
 
-      expect((fetchMock.mock.calls[0]![1] as RequestInit).signal).toBe(controller.signal)
+      await expect(attempt).rejects.toMatchObject({ code: 'WEB_ABORTED' })
+      expect((fetchMock.mock.calls[0]![1] as RequestInit).signal).not.toBe(controller.signal)
+      expect((fetchMock.mock.calls[0]![1] as RequestInit).signal?.aborted).toBe(true)
     })
 
     it.each([
@@ -208,6 +226,140 @@ describe('SearxngSearchProvider', () => {
         expect((error as WebError).cause).toBe(cause)
         return true
       })
+    })
+
+    it('retries one transient transport failure and then succeeds', async () => {
+      vi.useFakeTimers()
+      const fetchMock = vi.fn()
+        .mockRejectedValueOnce(new TypeError('offline'))
+        .mockResolvedValueOnce(jsonResponse({ results: [{ url: 'https://example.com/ok' }] }))
+      vi.stubGlobal('fetch', fetchMock)
+
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })
+      await vi.runAllTimersAsync()
+
+      await expect(attempt).resolves.toMatchObject({ sources: [{ url: 'https://example.com/ok' }] })
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      vi.useRealTimers()
+    })
+
+    it('cancels during the retry delay and cleans up the delay timer', async () => {
+      vi.useFakeTimers()
+      const controller = new AbortController()
+      const fetchMock = vi.fn().mockRejectedValue(new TypeError('offline'))
+      vi.stubGlobal('fetch', fetchMock)
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' }, controller.signal)
+      const expectation = expect(attempt).rejects.toMatchObject({ code: 'WEB_ABORTED' })
+      await vi.advanceTimersByTimeAsync(0)
+      controller.abort()
+      await expectation
+      expect(fetchMock).toHaveBeenCalledOnce()
+      expect(vi.getTimerCount()).toBe(0)
+      vi.useRealTimers()
+    })
+
+    it.each([502, 503, 504])('retries HTTP %i once and then succeeds', async (status) => {
+      vi.useFakeTimers()
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(new Response('temporary', { status }))
+        .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      vi.stubGlobal('fetch', fetchMock)
+
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })
+      await vi.runAllTimersAsync()
+
+      await expect(attempt).resolves.toMatchObject({ sources: [] })
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      vi.useRealTimers()
+    })
+
+    it('stops after two transient attempts', async () => {
+      vi.useFakeTimers()
+      const fetchMock = vi.fn().mockRejectedValue(new TypeError('offline'))
+      vi.stubGlobal('fetch', fetchMock)
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })
+      const expectation = expect(attempt).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      await vi.runAllTimersAsync()
+      await expectation
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      vi.useRealTimers()
+    })
+
+    it.each([401, 403, 429])('does not retry HTTP %i', async (status) => {
+      const fetchMock = vi.fn().mockResolvedValue(new Response('denied', { status }))
+      vi.stubGlobal('fetch', fetchMock)
+      await expect(new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' }))
+        .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    it('applies a finite default timeout even when fetch ignores abort', async () => {
+      vi.useFakeTimers()
+      const fetchMock = vi.fn(() => new Promise<Response>(() => {}))
+      vi.stubGlobal('fetch', fetchMock)
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })
+      const expectation = expect(attempt).rejects.toSatisfy((error: unknown) => {
+        expect((error as WebError).code).toBe('WEB_PROVIDER_ERROR')
+        expect((error as WebError).message).toMatch(/timed out/i)
+        return true
+      })
+      await vi.advanceTimersByTimeAsync(60_000)
+      await expectation
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      vi.useRealTimers()
+    })
+
+    it('cleans up the per-attempt timeout after a successful response', async () => {
+      vi.useFakeTimers()
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ results: [] })))
+      await expect(new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })).resolves.toBeDefined()
+      expect(vi.getTimerCount()).toBe(0)
+      vi.useRealTimers()
+    })
+
+    it('handles a synchronous fetch throw without an unhandled rejection', async () => {
+      vi.useFakeTimers()
+      const fetchMock = vi.fn(() => { throw new TypeError('sync offline') })
+      vi.stubGlobal('fetch', fetchMock)
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })
+      const expectation = expect(attempt).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      await vi.runAllTimersAsync()
+      await expectation
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      vi.useRealTimers()
+    })
+
+    it('does not retry malformed JSON or a non-JSON success', async () => {
+      for (const response of [
+        new Response('{broken', { status: 200, headers: { 'content-type': 'application/json' } }),
+        new Response('<html>', { status: 200, headers: { 'content-type': 'text/html' } }),
+      ]) {
+        const fetchMock = vi.fn().mockResolvedValue(response)
+        vi.stubGlobal('fetch', fetchMock)
+        await expect(new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' }))
+          .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+        expect(fetchMock).toHaveBeenCalledOnce()
+      }
+    })
+
+    it.each([null, [], { results: 'invalid' }])('rejects a malformed JSON contract without retrying', async (payload) => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload))
+      vi.stubGlobal('fetch', fetchMock)
+      await expect(new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' }))
+        .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    it('ignores Retry-After on a non-retryable rate limit', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(new Response('limited', {
+        status: 429,
+        headers: { 'retry-after': '999999' },
+      }))
+      vi.stubGlobal('fetch', fetchMock)
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })
+      await expect(attempt).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      expect(fetchMock).toHaveBeenCalledOnce()
+      vi.useRealTimers()
     })
 
     it('maps an abort during fetch to WEB_ABORTED', async () => {
