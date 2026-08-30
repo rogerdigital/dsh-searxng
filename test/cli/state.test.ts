@@ -477,11 +477,60 @@ describe('StateStore exclusive lock', () => {
           })
         })
         await expect(new StateStore(root, { open }).withLock(async () => undefined)).rejects.toBeDefined()
+        await expect(lockArtifacts(root)).resolves.toEqual(failure === 'fstat' ? ['state.lock'] : [])
       } finally {
         await rm(root, { recursive: true, force: true })
       }
     },
   )
+
+  it('removes its own partially written lock using the inode captured at open', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    try {
+      const open = injectedOpen((path, flags, handle) => {
+        if (path !== join(root, 'state.lock') || flags !== 'wx') return handle
+        return wrappedHandle(handle, {
+          writeFile: async () => {
+            await handle.writeFile('{"pid":')
+            throw new Error('partial lock write failed')
+          },
+        })
+      })
+      await expect(new StateStore(root, { open }).withLock(async () => undefined)).rejects.toThrow(
+        'partial lock write failed',
+      )
+      await expect(lockArtifacts(root)).resolves.toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves a foreign inode that replaces a partially written lock during acquisition cleanup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const lockPath = join(root, 'state.lock')
+    const foreign = Buffer.from('foreign replacement')
+    try {
+      const open = injectedOpen((path, flags, handle) => {
+        if (path !== lockPath || flags !== 'wx') return handle
+        return wrappedHandle(handle, {
+          writeFile: async () => {
+            await handle.writeFile('{"pid":')
+            await rm(lockPath)
+            await writeFile(lockPath, foreign, { mode: 0o600 })
+            throw new Error('partial lock write failed')
+          },
+        })
+      })
+      await expectAggregate(new StateStore(root, { open }).withLock(async () => undefined), [
+        'partial lock write failed',
+        'Lock ownership changed during acquisition cleanup',
+      ])
+      await expect(readFile(lockPath)).resolves.toEqual(foreign)
+      await expect(lockArtifacts(root)).resolves.toEqual(['state.lock'])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 
   it('reports release rename and removal failures without deleting evidence', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))

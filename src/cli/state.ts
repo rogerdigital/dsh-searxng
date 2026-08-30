@@ -355,10 +355,10 @@ export class StateStore {
     try {
       handle = await this.fs.open(this.lockPath, 'wx', 0o600)
       created = true
-      await handle.writeFile(metadata, 'utf8')
-      await handle.sync()
       const identity = await handle.stat()
       ownership = { token, dev: identity.dev, ino: identity.ino }
+      await handle.writeFile(metadata, 'utf8')
+      await handle.sync()
       await handle.chmod(0o600)
       await handle.close()
       handle = undefined
@@ -375,7 +375,7 @@ export class StateStore {
       }
       if (created) {
         try {
-          await this.quarantineLock(ownership, true, ownership.dev === undefined)
+          await this.quarantineLock(ownership, true, true)
         } catch (error) {
           cleanupErrors.push(error)
         }
@@ -398,7 +398,7 @@ export class StateStore {
   private async quarantineLock(
     expected: LockOwnership,
     foreignIsError: boolean,
-    allowTokenOnly: boolean,
+    allowIncompleteToken: boolean,
   ): Promise<void> {
     const quarantinePath = join(this.root, `state.lock.release-${randomBytes(16).toString('hex')}`)
     await this.fs.rename(this.lockPath, quarantinePath)
@@ -422,7 +422,7 @@ export class StateStore {
 
     const tokenMatches = snapshot.token === expected.token
     const inodeMatches = expected.dev === snapshot.dev && expected.ino === snapshot.ino
-    const owned = tokenMatches && (allowTokenOnly || inodeMatches)
+    const owned = inodeMatches && (allowIncompleteToken || tokenMatches)
     if (owned) {
       await this.fs.rm(quarantinePath)
       return
