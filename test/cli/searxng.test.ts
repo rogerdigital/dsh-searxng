@@ -161,7 +161,6 @@ describe('DefaultSearxngProbe', () => {
     { results: [{ url: '' }] },
     { results: [{ url: 'not a URL' }] },
     { results: [{ url: 'ftp://example.com/file' }] },
-    { results: [{ url: 'https://example.com/ok' }, null] },
   ])('rejects a non-empty malformed readiness result array: $results', async ({ results }) => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results }))
     const error = await new DefaultSearxngProbe().readiness({ baseURL: BASE, attempts: 3, fetch: fetchMock })
@@ -171,14 +170,29 @@ describe('DefaultSearxngProbe', () => {
     expect(fetchMock).toHaveBeenCalledOnce()
   })
 
-  it('rejects mixed valid and malformed final results', async () => {
+  it('accepts mixed final results and counts only usable HTTP URLs', async () => {
     const attempt = probeSearxng({
       baseURL: BASE,
       fetch: vi.fn().mockResolvedValue(jsonResponse({
-        results: [{ url: 'https://example.com/ok' }, { url: 'javascript:alert(1)' }],
+        results: [
+          { url: 'https://example.com/ok' },
+          { url: 'javascript:alert(1)' },
+          null,
+          { url: 'http://example.com/second' },
+        ],
       })),
     })
-    await expect(attempt).rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
+    await expect(attempt).resolves.toMatchObject({ resultCount: 2 })
+  })
+
+  it('accepts mixed readiness results when at least one URL is usable', async () => {
+    const attempt = new DefaultSearxngProbe().readiness({
+      baseURL: BASE,
+      fetch: vi.fn().mockResolvedValue(jsonResponse({
+        results: [null, { url: 'https://example.com/ok' }, { url: '' }],
+      })),
+    })
+    await expect(attempt).resolves.toBeUndefined()
   })
 
   it('cancels during the readiness retry delay without another request', async () => {
@@ -212,6 +226,35 @@ describe('DefaultSearxngProbe', () => {
     }))
     const attempt = new DefaultSearxngProbe().readiness({ baseURL: BASE, attempts: 5, fetch: fetchMock })
     await expect(attempt).rejects.toMatchObject({ code: 'E_RATE_LIMITED' })
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['fast rejection', vi.fn().mockRejectedValue(new TypeError('offline'))],
+    ['hung fetch', vi.fn(() => new Promise<Response>(() => {}))],
+  ])('uses timeoutMs as the total readiness deadline for %s', async (_label, fetchMock) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const attempt = new DefaultSearxngProbe().readiness({
+      baseURL: BASE,
+      timeoutMs: 1_000,
+      fetch: fetchMock,
+    })
+    const expectation = expect(attempt).rejects.toMatchObject({ code: 'E_SEARXNG_START_TIMEOUT' })
+    await vi.advanceTimersByTimeAsync(999)
+    expect(vi.getMockedSystemTime()?.getTime()).toBe(999)
+    await vi.advanceTimersByTimeAsync(1)
+    await expectation
+    expect(vi.getMockedSystemTime()?.getTime()).toBe(1_000)
+  })
+
+  it.each([400, 404, 500])('fails readiness immediately for non-retryable HTTP %i', async (status) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const fetchMock = vi.fn().mockResolvedValue(new Response('failed', { status }))
+    const attempt = new DefaultSearxngProbe().readiness({ baseURL: BASE, timeoutMs: 60_000, fetch: fetchMock })
+    await expect(attempt).rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
+    expect(Date.now()).toBe(0)
     expect(fetchMock).toHaveBeenCalledOnce()
   })
 })

@@ -2,16 +2,19 @@ import { CliError } from './errors.ts'
 import { requestJsonWithRetry } from '../provider.ts'
 
 const PROBE_QUERY = 'deepseek harness'
-const DEFAULT_TIMEOUT_MS = 10_000
+const DEFAULT_PROBE_TIMEOUT_MS = 10_000
+const DEFAULT_READINESS_TIMEOUT_MS = 60_000
+const READINESS_ATTEMPT_TIMEOUT_MS = 5_000
 const DEFAULT_ATTEMPTS = 1
-const DEFAULT_READINESS_ATTEMPTS = 30
-const READINESS_RETRY_DELAY_MS = 100
+const READINESS_RETRY_DELAY_MS = 250
 const RETRYABLE_STATUS = new Set([502, 503, 504])
 
 export interface ProbeOptions {
   baseURL: string
   authHeader?: string
+  /** Total readiness deadline; per-attempt timeout for real/provider searches. */
   timeoutMs?: number
+  /** Optional attempt cap. Readiness otherwise polls until its deadline. */
   attempts?: number
   fetch?: typeof globalThis.fetch
 }
@@ -52,18 +55,7 @@ export async function probeSearxng(options: ProbeOptions, signal?: AbortSignal):
 
 export class DefaultSearxngProbe implements SearxngProbe {
   async readiness(options: ProbeOptions, signal?: AbortSignal): Promise<void> {
-    try {
-      await runProbe({ ...options, attempts: options.attempts ?? DEFAULT_READINESS_ATTEMPTS }, true, signal)
-    } catch (error) {
-      if (error instanceof CliError && isImmediateFailure(error.code)) throw error
-      if (error instanceof MalformedProbeResponseError) throw error
-      if (signal?.aborted) throw searchFailed('SearXNG readiness check was cancelled')
-      throw new CliError(
-        'E_SEARXNG_START_TIMEOUT',
-        'SearXNG did not become ready within the bounded startup checks',
-        'Run dsh-searxng doctor and inspect the managed SearXNG logs',
-      )
-    }
+    await runReadiness(options, signal)
   }
 
   realSearch(options: ProbeOptions, signal?: AbortSignal): Promise<ProbeResult> {
@@ -82,7 +74,7 @@ async function runProbe(
 ): Promise<ProbeAttemptResult> {
   const endpoint = validateEndpoint(options.baseURL)
   const attempts = options.attempts ?? DEFAULT_ATTEMPTS
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS
   if (!Number.isSafeInteger(attempts) || attempts < 1) throw searchFailed('Probe attempts must be a positive safe integer')
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw searchFailed('Probe timeout must be a positive safe integer')
 
@@ -91,35 +83,91 @@ async function runProbe(
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     if (signal?.aborted) throw searchFailed('SearXNG probe was cancelled')
     try {
-      const request = await requestJsonWithRetry({
-        url: buildProbeUrl(endpoint),
-        headers: {
-          accept: 'application/json',
-          ...(options.authHeader !== undefined && options.authHeader.length > 0
-            ? { authorization: options.authHeader }
-            : {}),
-        },
-        signal,
-        timeoutMs,
-        maxAttempts: 1,
-        fetch: options.fetch,
-      })
-      classifyStatus(request.response.status)
-      const results = parseResults(request.payload)
-      if (!results.every(hasValidHttpUrl)) throw new MalformedProbeResponseError()
-      if (!allowEmptyResults && results.length === 0) {
-        throw searchFailed('SearXNG returned no usable search result')
-      }
-      return { endpoint, resultCount: results.length, elapsedMs: Math.max(0, Date.now() - startedAt) }
+      return await probeAttempt(options, endpoint, timeoutMs, allowEmptyResults, startedAt, signal)
     } catch (error) {
       lastError = toCliError(error, signal)
-      if (lastError instanceof CliError && isImmediateFailure(lastError.code)) throw lastError
       if (!isTransientFailure(error)) throw lastError
       if (attempt === attempts) throw lastError
       await delay(READINESS_RETRY_DELAY_MS, signal)
     }
   }
   throw toCliError(lastError, signal)
+}
+
+async function runReadiness(options: ProbeOptions, signal?: AbortSignal): Promise<void> {
+  const endpoint = validateEndpoint(options.baseURL)
+  const timeoutMs = options.timeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw searchFailed('Readiness timeout must be a positive safe integer')
+  if (options.attempts !== undefined && (!Number.isSafeInteger(options.attempts) || options.attempts < 1)) {
+    throw searchFailed('Probe attempts must be a positive safe integer')
+  }
+
+  const startedAt = Date.now()
+  const deadline = startedAt + timeoutMs
+  let attempt = 0
+  while (true) {
+    if (signal?.aborted) throw searchFailed('SearXNG readiness check was cancelled')
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) throw startupTimeout()
+    if (options.attempts !== undefined && attempt >= options.attempts) throw startupTimeout()
+    attempt += 1
+
+    try {
+      await probeAttempt(
+        options,
+        endpoint,
+        Math.min(READINESS_ATTEMPT_TIMEOUT_MS, remainingMs),
+        true,
+        startedAt,
+        signal,
+      )
+      return
+    } catch (error) {
+      const cliError = toCliError(error, signal)
+      if (!isTransientFailure(error)) throw cliError
+      if (options.attempts !== undefined && attempt >= options.attempts) throw startupTimeout()
+      const delayMs = Math.min(READINESS_RETRY_DELAY_MS, deadline - Date.now())
+      if (delayMs <= 0) throw startupTimeout()
+      await delay(delayMs, signal)
+    }
+  }
+}
+
+async function probeAttempt(
+  options: ProbeOptions,
+  endpoint: string,
+  timeoutMs: number,
+  allowEmptyResults: boolean,
+  startedAt: number,
+  signal?: AbortSignal,
+): Promise<ProbeAttemptResult> {
+  const request = await requestJsonWithRetry({
+    url: buildProbeUrl(endpoint),
+    headers: {
+      accept: 'application/json',
+      ...(options.authHeader !== undefined && options.authHeader.length > 0
+        ? { authorization: options.authHeader }
+        : {}),
+    },
+    signal,
+    timeoutMs,
+    maxAttempts: 1,
+    fetch: options.fetch,
+  })
+  classifyStatus(request.response.status)
+  const results = parseResults(request.payload)
+  const resultCount = results.filter(hasValidHttpUrl).length
+  if (results.length > 0 && resultCount === 0) throw new MalformedProbeResponseError()
+  if (!allowEmptyResults && resultCount === 0) throw searchFailed('SearXNG returned no usable search result')
+  return { endpoint, resultCount, elapsedMs: Math.max(0, Date.now() - startedAt) }
+}
+
+function startupTimeout(): CliError {
+  return new CliError(
+    'E_SEARXNG_START_TIMEOUT',
+    'SearXNG did not become ready before the startup deadline',
+    'Run dsh-searxng doctor and inspect the managed SearXNG logs',
+  )
 }
 
 function validateEndpoint(baseURL: string): string {
@@ -190,10 +238,6 @@ function isTransientFailure(error: unknown): boolean {
   if (error instanceof TransientProbeError) return true
   if (error === null || typeof error !== 'object' || !('kind' in error)) return false
   return error.kind === 'network' || error.kind === 'timeout'
-}
-
-function isImmediateFailure(code: CliError['code']): boolean {
-  return code === 'E_AUTH_FAILED' || code === 'E_JSON_DISABLED' || code === 'E_RATE_LIMITED'
 }
 
 function searchFailed(message: string): CliError {

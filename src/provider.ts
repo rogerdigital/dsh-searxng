@@ -33,7 +33,6 @@ class RequestFailure extends Error {
   constructor(
     readonly kind: RequestFailureKind,
     message: string,
-    readonly originalCause?: unknown,
   ) {
     super(message)
     this.name = 'RequestFailure'
@@ -74,9 +73,12 @@ export async function requestJsonWithRetry(options: JsonRequestOptions): Promise
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       const result = await requestJsonAttempt({ ...options, timeoutMs, fetch: fetchRequest })
-      if (RETRYABLE_STATUSES.has(result.response.status) && attempt < maxAttempts) {
-        await abortableDelay(retryDelayMs, options.signal)
-        continue
+      if (!result.response.ok) {
+        cancelResponseBody(result.response)
+        if (RETRYABLE_STATUSES.has(result.response.status) && attempt < maxAttempts) {
+          await abortableDelay(retryDelayMs, options.signal)
+          continue
+        }
       }
       return result
     } catch (error) {
@@ -89,10 +91,18 @@ export async function requestJsonWithRetry(options: JsonRequestOptions): Promise
   throw new RequestFailure('network', 'SearXNG request failed')
 }
 
+function cancelResponseBody(response: Response): void {
+  try {
+    void response.body?.cancel().catch(() => {})
+  } catch {
+    // The HTTP status remains the primary failure; cancellation is best effort.
+  }
+}
+
 async function requestJsonAttempt(
   options: JsonRequestOptions & { timeoutMs: number; fetch: typeof globalThis.fetch },
 ): Promise<JsonRequestResult> {
-  if (options.signal?.aborted) throw new RequestFailure('caller-abort', 'SearXNG request aborted', options.signal.reason)
+  if (options.signal?.aborted) throw new RequestFailure('caller-abort', 'SearXNG request aborted')
 
   const controller = new AbortController()
   let timedOut = false
@@ -100,7 +110,7 @@ async function requestJsonAttempt(
   const boundary = new Promise<never>((_resolve, reject) => { rejectBoundary = reject })
   const onCallerAbort = () => {
     controller.abort(options.signal?.reason)
-    rejectBoundary?.(new RequestFailure('caller-abort', 'SearXNG request aborted', options.signal?.reason))
+    rejectBoundary?.(new RequestFailure('caller-abort', 'SearXNG request aborted'))
   }
   options.signal?.addEventListener('abort', onCallerAbort, { once: true })
   const timer = setTimeout(() => {
@@ -122,19 +132,19 @@ async function requestJsonAttempt(
     }
     try {
       return { response, payload: await response.json() as unknown }
-    } catch (error) {
-      throw new RequestFailure('contract', 'SearXNG returned malformed JSON', error)
+    } catch {
+      throw new RequestFailure('contract', 'SearXNG returned malformed JSON')
     }
   })
 
   try {
     return await Promise.race([request, boundary])
   } catch (error) {
-    if (options.signal?.aborted) throw new RequestFailure('caller-abort', 'SearXNG request aborted', options.signal.reason)
+    if (options.signal?.aborted) throw new RequestFailure('caller-abort', 'SearXNG request aborted')
     if (timedOut) throw new RequestFailure('timeout', 'SearXNG request timed out')
     if (error instanceof RequestFailure) throw error
-    if (isAbortError(error)) throw new RequestFailure('caller-abort', 'SearXNG request aborted', error)
-    throw new RequestFailure('network', 'SearXNG request failed', error)
+    if (isAbortError(error)) throw new RequestFailure('caller-abort', 'SearXNG request aborted')
+    throw new RequestFailure('network', 'SearXNG request failed')
   } finally {
     clearTimeout(timer)
     options.signal?.removeEventListener('abort', onCallerAbort)
@@ -143,18 +153,18 @@ async function requestJsonAttempt(
 }
 
 function normalizeRequestFailure(error: unknown, signal?: AbortSignal): RequestFailure {
-  if (signal?.aborted) return new RequestFailure('caller-abort', 'SearXNG request aborted', signal.reason)
+  if (signal?.aborted) return new RequestFailure('caller-abort', 'SearXNG request aborted')
   if (error instanceof RequestFailure) return error
-  return new RequestFailure('network', 'SearXNG request failed', error)
+  return new RequestFailure('network', 'SearXNG request failed')
 }
 
 function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(new RequestFailure('caller-abort', 'SearXNG request aborted', signal.reason))
+  if (signal?.aborted) return Promise.reject(new RequestFailure('caller-abort', 'SearXNG request aborted'))
   return new Promise((resolve, reject) => {
     const onAbort = () => {
       clearTimeout(timer)
       signal?.removeEventListener('abort', onAbort)
-      reject(new RequestFailure('caller-abort', 'SearXNG request aborted', signal?.reason))
+      reject(new RequestFailure('caller-abort', 'SearXNG request aborted'))
     }
     const timer = setTimeout(() => {
       signal?.removeEventListener('abort', onAbort)
@@ -196,10 +206,11 @@ export interface SearxngSearchProviderOptions {
  * field is optional per the seam contract).
  *
  * @param result - one entry of SearXNG's `results[]`.
- * @returns the normalized source, or `undefined` when the entry has no URL.
+ * @returns the normalized source, or `undefined` when the entry is malformed
+ *   or has no safe HTTP(S) URL.
  */
-export function mapSearxngResult(result: SearxngResult): WebSearchSource | undefined {
-  if (typeof result.url !== 'string' || result.url.length === 0) return undefined
+export function mapSearxngResult(result: unknown): WebSearchSource | undefined {
+  if (!isUsableSearxngResult(result)) return undefined
   return {
     url: result.url,
     ...nonEmpty(result.title) !== undefined ? { title: nonEmpty(result.title) } : {},
@@ -217,11 +228,13 @@ function nonEmpty(value: string | null | undefined): string | undefined {
  * Map a SearXNG response envelope to a normalized search result.
  *
  * @param response - the parsed `GET /search` response body.
- * @returns the normalized result; entries without a URL are dropped
+ * @returns the normalized result; malformed entries and entries without a
+ *   safe HTTP(S) URL are dropped
  *   ({@link mapSearxngResult}).
  */
 export function mapSearxngResponse(response: SearxngSearchResponse): WebSearchResult {
-  const sources = (response.results ?? [])
+  const rawResults = (response as { results?: unknown }).results
+  const sources = (Array.isArray(rawResults) ? rawResults : [])
     .map(mapSearxngResult)
     .filter((source): source is WebSearchSource => source !== undefined)
   // SearXNG returns no generated answer, so `content` is omitted. The web
@@ -272,7 +285,7 @@ export class SearxngSearchProvider implements WebSearchProvider {
     } catch (error: unknown) {
       const failure = normalizeRequestFailure(error, signal)
       if (failure.kind === 'caller-abort') {
-        throw new WebError('SearXNG search aborted', 'WEB_ABORTED', { cause: failure.originalCause ?? error })
+        throw new WebError('SearXNG search aborted', 'WEB_ABORTED')
       }
       if (failure.kind === 'timeout') {
         throw new WebError('SearXNG request timed out; check the instance and network, then retry', 'WEB_PROVIDER_ERROR')
@@ -280,7 +293,7 @@ export class SearxngSearchProvider implements WebSearchProvider {
       if (failure.kind === 'contract') {
         throw new WebError('SearXNG returned an unprocessable response body', 'WEB_PROVIDER_ERROR')
       }
-      throw new WebError('SearXNG request failed', 'WEB_PROVIDER_ERROR', { cause: failure.originalCause ?? error })
+      throw new WebError('SearXNG request failed', 'WEB_PROVIDER_ERROR')
     }
 
     if (!result.response.ok) {
@@ -337,10 +350,10 @@ function isValidBaseUrl(baseURL: string): boolean {
 function isSearxngSearchResponse(value: unknown): value is SearxngSearchResponse {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
   const results = (value as Record<string, unknown>).results
-  return results === undefined || (Array.isArray(results) && results.every(isSearxngResult))
+  return Array.isArray(results)
 }
 
-function isSearxngResult(value: unknown): value is SearxngResult {
+function isUsableSearxngResult(value: unknown): value is SearxngResult & { url: string } {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
   const result = value as Record<string, unknown>
   if (!isValidResultUrl(result.url)) return false
