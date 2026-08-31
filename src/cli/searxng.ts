@@ -1,9 +1,10 @@
 import { CliError } from './errors.ts'
 import {
   requestJsonWithRetry,
-  SearxngSearchProvider,
-  type SearxngSearchProviderOptions,
-} from '../provider.ts'
+  searchSearxng,
+  type SearxngClientOptions,
+  type SearxngClientResult,
+} from '../searxng-client.ts'
 
 const PROBE_QUERY = 'deepseek harness'
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000
@@ -36,11 +37,17 @@ export interface SearxngProbe {
   http(options: ProbeOptions, signal?: AbortSignal): Promise<void>
   readiness(options: ProbeOptions, signal?: AbortSignal): Promise<void>
   realSearch(options: ProbeOptions, signal?: AbortSignal): Promise<ProbeResult>
-  providerSearch(options: SearxngSearchProviderOptions, signal?: AbortSignal): Promise<ProbeResult>
+  providerSearch(options: SearxngClientOptions, signal?: AbortSignal): Promise<ProbeResult>
 }
 
+type ClientSearch = (
+  options: SearxngClientOptions,
+  request: { query: string },
+  signal?: AbortSignal,
+) => Promise<SearxngClientResult>
+
 export interface DefaultSearxngProbeOptions {
-  providerFactory?: (options: SearxngSearchProviderOptions) => Pick<SearxngSearchProvider, 'search'>
+  search?: ClientSearch
 }
 
 interface ProbeAttemptResult {
@@ -66,10 +73,10 @@ export async function probeSearxng(options: ProbeOptions, signal?: AbortSignal):
 }
 
 export class DefaultSearxngProbe implements SearxngProbe {
-  private readonly providerFactory: NonNullable<DefaultSearxngProbeOptions['providerFactory']>
+  private readonly search: ClientSearch
 
   constructor(options: DefaultSearxngProbeOptions = {}) {
-    this.providerFactory = options.providerFactory ?? ((providerOptions) => new SearxngSearchProvider(providerOptions))
+    this.search = options.search ?? searchSearxng
   }
 
   async http(options: ProbeOptions, signal?: AbortSignal): Promise<void> {
@@ -100,11 +107,11 @@ export class DefaultSearxngProbe implements SearxngProbe {
     return probeSearxng(options, signal)
   }
 
-  async providerSearch(options: SearxngSearchProviderOptions, signal?: AbortSignal): Promise<ProbeResult> {
+  async providerSearch(options: SearxngClientOptions, signal?: AbortSignal): Promise<ProbeResult> {
     signal?.throwIfAborted()
     const startedAt = Date.now()
     try {
-      const result = await this.providerFactory({ ...options }).search({ query: PROBE_QUERY, maxResults: 1 }, signal)
+      const result = await this.search({ ...options }, { query: PROBE_QUERY }, signal)
       signal?.throwIfAborted()
       if (result.sources.length === 0) throw searchFailed('The configured provider returned no usable search result')
       return { endpoint: options.baseURL, resultCount: result.sources.length, elapsedMs: Math.max(0, Date.now() - startedAt) }

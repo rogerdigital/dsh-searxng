@@ -280,11 +280,10 @@ describe('DefaultSearxngProbe', () => {
     await expect(attempt).rejects.toBe(cancellation)
   })
 
-  it('validates through SearxngSearchProvider with the exact effective profile config', async () => {
-    const search = vi.fn(async () => ({ sources: [{ url: 'https://example.com/provider' }], truncated: false }))
-    const providerFactory = vi.fn(() => ({ search }))
+  it('validates through the shared client with the exact effective profile config', async () => {
+    const search = vi.fn(async () => ({ sources: [{ url: 'https://example.com/provider' }], truncated: false as const }))
     const signal = new AbortController().signal
-    const probe = new DefaultSearxngProbe({ providerFactory })
+    const probe = new DefaultSearxngProbe({ search })
     const config = {
       baseURL: BASE,
       language: 'zh-CN',
@@ -294,14 +293,13 @@ describe('DefaultSearxngProbe', () => {
     }
 
     await expect(probe.providerSearch(config, signal)).resolves.toMatchObject({ endpoint: BASE, resultCount: 1 })
-    expect(providerFactory).toHaveBeenCalledWith(config)
-    expect(search).toHaveBeenCalledWith({ query: PROBE_QUERY, maxResults: 1 }, signal)
+    expect(search).toHaveBeenCalledWith(config, { query: PROBE_QUERY }, signal)
   })
 
   it('preserves provider request cancellation instead of reporting a search failure', async () => {
     const cancellation = new DOMException('cancelled provider request', 'AbortError')
     const probe = new DefaultSearxngProbe({
-      providerFactory: () => ({ search: async () => { throw cancellation } }),
+      search: async () => { throw cancellation },
     })
 
     await expect(probe.providerSearch({ baseURL: BASE })).rejects.toBe(cancellation)
@@ -310,12 +308,12 @@ describe('DefaultSearxngProbe', () => {
   it('returns a safe failure when the real provider path has no result or throws', async () => {
     const credential = 'Bearer private-token'
     const empty = new DefaultSearxngProbe({
-      providerFactory: () => ({ search: async () => ({ sources: [], truncated: false }) }),
+      search: async () => ({ sources: [], truncated: false }),
     })
     await expect(empty.providerSearch({ baseURL: BASE, authHeader: credential })).rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
 
     const failed = new DefaultSearxngProbe({
-      providerFactory: () => ({ search: async () => { throw new Error(`failed ${credential}`) } }),
+      search: async () => { throw new Error(`failed ${credential}`) },
     })
     const error = await failed.providerSearch({ baseURL: BASE, authHeader: credential }).catch((cause: unknown) => cause)
     expect(error).toMatchObject({ code: 'E_SEARCH_FAILED' })
