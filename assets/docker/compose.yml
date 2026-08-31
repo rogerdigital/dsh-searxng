@@ -3,6 +3,8 @@ services:
     image: "${DSH_SEARXNG_IMAGE}"
     container_name: "${DSH_SEARXNG_CONTAINER}"
     restart: unless-stopped
+    environment:
+      FORCE_OWNERSHIP: "false"
     ports:
       - "127.0.0.1:${DSH_SEARXNG_PORT}:8080"
     labels:
