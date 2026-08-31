@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v7
       # Single pin: the action tag carries the scanner version; Dependabot
       # (github-actions) keeps the ref current — no per-release edits here.
-      - uses: rogerdigital/dsh-vet/action@v0.2.3
+      - uses: rogerdigital/dsh-vet/action@v0.2.4
         with:
           specifier: 'dsh-searxng'
           commit-report: true
