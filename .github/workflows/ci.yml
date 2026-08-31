@@ -61,7 +61,10 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - run: DSH_SEARXNG_E2E=1 pnpm test -- test/e2e/managed-setup.test.ts
+      - name: Run packed managed setup journey
+        run: DSH_SEARXNG_E2E=1 pnpm exec vitest run test/e2e/managed-setup.test.ts
+      - name: Run Docker adapter integration
+        run: DSH_SEARXNG_DOCKER_INTEGRATION=1 pnpm exec vitest run test/cli/docker.integration.test.ts
       - name: Remove any labeled test resources
         if: always()
         shell: bash
