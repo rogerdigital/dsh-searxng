@@ -23,6 +23,7 @@ describe('Docker assets', () => {
     expect(service.cap_drop).toEqual(['ALL'])
     expect(service.cap_add).toEqual(['CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETUID'])
     expect(service.security_opt).toEqual(['no-new-privileges:true'])
+    expect(service.environment).toEqual({ FORCE_OWNERSHIP: 'false' })
     expect(service.volumes[0]).toEqual({
       type: 'bind',
       source: '${DSH_SEARXNG_SETTINGS_DIR}',
