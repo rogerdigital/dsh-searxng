@@ -20,6 +20,6 @@ export default defineConfig([
     clean: false,
     dts: false,
     // The npx CLI must work before a DSH host resolves this plugin's peers.
-    deps: { alwaysBundle: [/.*/], onlyBundle: false },
+    deps: { alwaysBundle: [/.*/], onlyAllowBundle: false },
   },
 ])

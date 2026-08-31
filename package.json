@@ -76,7 +76,7 @@
     "@deepseek-ai/dsh-web": "0.1.0-rc.6",
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^22.10.0",
-    "tsdown": "^0.22.14",
+    "tsdown": "0.21.0",
     "typescript": "^5.8.0",
     "vitest": "^3.0.0"
   }

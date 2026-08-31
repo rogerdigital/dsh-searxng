@@ -424,14 +424,18 @@ describe('StateStore exclusive lock', () => {
     async (kind) => {
       const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
       const lockPath = join(root, 'state.lock')
+      const replacementPath = join(root, 'state.lock.foreign')
       let foreign: Buffer | undefined
       try {
         const store = new FileStateStore(root, {
           rename: (async (from: string, to: string) => {
             if (from === lockPath && to.includes('state.lock.release-') && foreign === undefined) {
               foreign = kind === 'same-token foreign inode' ? await readFile(from) : Buffer.from('not-json')
+              await writeFile(replacementPath, foreign, { mode: 0o600 })
+              const [ownedIdentity, foreignIdentity] = await Promise.all([stat(from), stat(replacementPath)])
+              expect([foreignIdentity.dev, foreignIdentity.ino]).not.toEqual([ownedIdentity.dev, ownedIdentity.ino])
               await rm(from)
-              await writeFile(from, foreign, { mode: 0o600 })
+              await fsRename(replacementPath, from)
             }
             return fsRename(from, to)
           }) as typeof fsRename,
