@@ -1,5 +1,5 @@
 import { lstat, rm } from 'node:fs/promises'
-import { basename, isAbsolute, normalize } from 'node:path'
+import { basename, dirname, isAbsolute, join, normalize } from 'node:path'
 import type { ManagedIdentity } from './assets.ts'
 import type { DockerAdapter } from './docker.ts'
 import { CliError } from './errors.ts'
@@ -15,7 +15,7 @@ export interface RemoveDependencies {
   docker: DockerAdapter
   profiles: ProfileManager
   confirmPurge(volumes: readonly string[]): Promise<boolean>
-  removeManagedDirectory(path: string): Promise<void>
+  removeManagedDirectory(dshHome: string): Promise<void>
 }
 
 function blocked(message: string): CliError {
@@ -45,8 +45,10 @@ async function writeWithRestore(state: StateStore, previous: StateV1, next: Stat
   }
 }
 
-export async function removeManagedDirectory(path: string): Promise<void> {
-  if (!isAbsolute(path) || normalize(path) !== path || basename(path) !== 'dsh-searxng') throw removalFailed('Managed directory path is unsafe')
+export async function removeManagedDirectory(dshHome: string): Promise<void> {
+  if (!isAbsolute(dshHome) || normalize(dshHome) !== dshHome) throw removalFailed('DSH home path is unsafe')
+  const path = join(dshHome, 'dsh-searxng')
+  if (dirname(path) !== dshHome || basename(path) !== 'dsh-searxng') throw removalFailed('Managed directory path is unsafe')
   let info
   try { info = await lstat(path) } catch (error) {
     if (error !== null && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return
@@ -63,7 +65,7 @@ export async function remove(
 ): Promise<RemoveResult> {
   if (input.purgeData && !input.service) throw new CliError('E_USAGE', '--purge-data requires --service', 'Use --service --purge-data')
   const resolved = await dependencies.environment.resolve(input.profile)
-  let purgeDirectory: string | undefined
+  let purgeDshHome: string | undefined
   const result = await dependencies.state.withLock(async () => {
     signal?.throwIfAborted()
     const previous = await dependencies.state.read()
@@ -110,10 +112,10 @@ export async function remove(
       const finalStatus = await dependencies.docker.deploymentStatus(identity(resolved.managedDir, managed), signal)
       if (finalStatus.ownership !== 'owned' || finalStatus.composePath === undefined) throw blocked('Managed Docker ownership changed during removal')
       await dependencies.docker.down(identity(resolved.managedDir, managed, finalStatus.composePath), input.purgeData, signal)
-      if (input.purgeData) purgeDirectory = resolved.managedDir
+      if (input.purgeData) purgeDshHome = resolved.dshHome
     }
     return { profile: input.profile, profileRemoved, serviceRemoved: input.service, dataPurged: input.purgeData }
   })
-  if (purgeDirectory !== undefined) await dependencies.removeManagedDirectory(purgeDirectory)
+  if (purgeDshHome !== undefined) await dependencies.removeManagedDirectory(purgeDshHome)
   return result
 }
