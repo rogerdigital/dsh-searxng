@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { parse as parseYaml } from 'yaml'
 import { FileAssetRenderer, SEARXNG_IMAGE, type ManagedIdentity } from '../../src/cli/assets.ts'
@@ -60,7 +60,7 @@ describe('Docker assets', () => {
     const rendered = await renderer.render({ stateDir, identity, image: SEARXNG_IMAGE, port: 8123, secret: 'a:b#c' })
 
     expect(rendered.composePath).toBe(join(stateDir, `config-${rendered.configurationSha256}`, 'compose.yml'))
-    expect(resolve(rendered.composePath).startsWith(`${resolve(stateDir)}/`)).toBe(true)
+    expect(resolve(rendered.composePath).startsWith(`${resolve(stateDir)}${sep}`)).toBe(true)
     expect(rendered.configurationSha256).toMatch(/^[a-f0-9]{64}$/)
     const bundleDir = dirname(rendered.composePath)
     const generatedSettings = parseYaml(await readFile(join(bundleDir, 'searxng', 'settings.yml'), 'utf8')) as Record<string, any>
@@ -85,11 +85,13 @@ describe('Docker assets', () => {
     const settingsSource = environment.match(/^DSH_SEARXNG_SETTINGS_DIR=(.+)$/m)?.[1]
     expect(resolve(stateDir, settingsSource!)).toBe(join(bundleDir, 'searxng'))
 
-    expect((await stat(stateDir)).mode & 0o777).toBe(0o700)
-    expect((await stat(bundleDir)).mode & 0o777).toBe(0o700)
-    expect((await stat(join(bundleDir, 'searxng'))).mode & 0o777).toBe(0o700)
-    for (const file of [join(bundleDir, '.env'), rendered.composePath, join(bundleDir, 'searxng', 'settings.yml')]) {
-      expect((await stat(file)).mode & 0o777).toBe(0o600)
+    if (process.platform !== 'win32') {
+      expect((await stat(stateDir)).mode & 0o777).toBe(0o700)
+      expect((await stat(bundleDir)).mode & 0o777).toBe(0o700)
+      expect((await stat(join(bundleDir, 'searxng'))).mode & 0o777).toBe(0o700)
+      for (const file of [join(bundleDir, '.env'), rendered.composePath, join(bundleDir, 'searxng', 'settings.yml')]) {
+        expect((await stat(file)).mode & 0o777).toBe(0o600)
+      }
     }
   })
 
@@ -223,7 +225,7 @@ describe('Docker assets', () => {
     const failingOpen: typeof open = async (...args: Parameters<typeof open>) => {
       const handle = await open(...args)
       const file = String(args[0])
-      if (!file.includes('.staging-') || !file.endsWith(target)) return handle
+      if (!file.includes('.staging-') || !file.endsWith(target.replaceAll('/', sep))) return handle
       return new Proxy(handle, {
         get(current, property) {
           if (property === phase) {
