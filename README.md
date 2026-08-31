@@ -1,8 +1,19 @@
 # dsh-searxng
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) search provider backed by
-[SearXNG](https://docs.searxng.org/). It gives `ctx.web` a free, self-hosted metasearch backend
-without requiring a paid search API key.
+[![dsh-vet](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rogerdigital/dsh-searxng/main/.dsh-vet/badge.json)](https://github.com/rogerdigital/dsh-searxng/blob/main/.dsh-vet/report.json)
+
+A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plugin that registers a
+[SearXNG](https://docs.searxng.org/)-backed search provider into the web capability seam
+(`ctx.web`), giving your agent `web_search` through a **free, self-hosted, key-less** metasearch
+instance — instead of the paid Exa/Perplexity APIs.
+
+## Install
+
+```sh
+dsh plugin add dsh-searxng
+```
+
+(With a named profile: `dsh plugin --profile <name> add dsh-searxng`.)
 
 ## Quick start
 
@@ -102,7 +113,7 @@ If several DSH search providers are available, select this one with
 - Podman and Podman Compose are not supported in the managed path.
 - External SearXNG mode does not require Docker.
 
-dsh is in developer preview with breaking changes expected. Version 0.1.1 supports
+dsh is in developer preview with breaking changes expected. Version 0.1.2 supports
 `@deepseek-ai/dsh-web >=0.1.0-rc.6 <0.2.0` and
 `@deepseek-ai/dsh-launch-environment >=0.0.1-rc.3 <0.2.0`.
 

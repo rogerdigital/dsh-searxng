@@ -1,0 +1,28 @@
+# dsh-vet pre-install security audit: report artifact on every run, findings
+# comment on PRs, and a committed report + grade badge on main (D3: the badge
+# reads .dsh-vet/badge.json from this repository — no badge service).
+#
+# The audit targets the PUBLISHED npm artifact, not the source tree: this
+# repo is TypeScript, so a '.' scan finds no .js to analyze.
+name: dsh-vet
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: # refresh the badge after publishing a release
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rogerdigital/dsh-vet/action@v0.2.0
+        with:
+          specifier: 'dsh-searxng'
+          version: '0.2.1'
+          commit-report: true
