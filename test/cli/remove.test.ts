@@ -1,6 +1,9 @@
+import { access, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, sep } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { CliError } from '../../src/cli/errors.ts'
-import { remove, type RemoveDependencies } from '../../src/cli/remove.ts'
+import { remove, removeManagedDirectory, type RemoveDependencies } from '../../src/cli/remove.ts'
 import type { StateV1 } from '../../src/cli/state.ts'
 
 const HOME_ID = '0123456789abcdef'
@@ -67,6 +70,73 @@ function harness(options: {
   return { dependencies, events, writes, current: () => current }
 }
 
+describe('removeManagedDirectory', () => {
+  it('derives and removes only the managed child of DSH home', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-searxng-remove-'))
+    const dshHome = join(root, 'dsh-home')
+    const managed = join(dshHome, 'dsh-searxng')
+    const sibling = join(dshHome, 'keep.txt')
+    try {
+      await mkdir(managed, { recursive: true })
+      await writeFile(sibling, 'keep')
+
+      await removeManagedDirectory(dshHome)
+
+      await expect(access(managed)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(access(sibling)).resolves.toBeUndefined()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('is idempotent when the managed child is absent', async () => {
+    const dshHome = await mkdtemp(join(tmpdir(), 'dsh-searxng-remove-absent-'))
+    try {
+      await expect(removeManagedDirectory(dshHome)).resolves.toBeUndefined()
+      await expect(access(dshHome)).resolves.toBeUndefined()
+    } finally {
+      await rm(dshHome, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a symlink managed child without touching its target', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-searxng-remove-link-'))
+    const dshHome = join(root, 'dsh-home')
+    const target = join(root, 'target')
+    const marker = join(target, 'keep.txt')
+    try {
+      await mkdir(dshHome)
+      await mkdir(target)
+      await writeFile(marker, 'keep')
+      await symlink(target, join(dshHome, 'dsh-searxng'), process.platform === 'win32' ? 'junction' : 'dir')
+
+      await expect(removeManagedDirectory(dshHome)).rejects.toMatchObject({ code: 'E_INTERNAL' })
+      await expect(access(marker)).resolves.toBeUndefined()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a regular-file managed child without removing it', async () => {
+    const dshHome = await mkdtemp(join(tmpdir(), 'dsh-searxng-remove-file-'))
+    const managed = join(dshHome, 'dsh-searxng')
+    try {
+      await writeFile(managed, 'keep')
+      await expect(removeManagedDirectory(dshHome)).rejects.toMatchObject({ code: 'E_INTERNAL' })
+      await expect(access(managed)).resolves.toBeUndefined()
+    } finally {
+      await rm(dshHome, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['relative', 'relative-dsh-home'],
+    ['non-normalized', `${tmpdir()}${sep}nested${sep}..`],
+  ])('rejects a %s DSH home before filesystem access', async (_label, dshHome) => {
+    await expect(removeManagedDirectory(dshHome)).rejects.toMatchObject({ code: 'E_INTERNAL' })
+  })
+})
+
 describe('remove', () => {
   it('detaches only the selected profile and updates attachment state', async () => {
     const test = harness()
@@ -103,7 +173,7 @@ describe('remove', () => {
     const result = await remove({ profile: 'web', service: true, purgeData: true, confirmed: false }, accepted.dependencies)
     expect(result.dataPurged).toBe(true)
     expect(accepted.events).toContain('down:true')
-    expect(accepted.events.at(-1)).toBe('remove-dir:/dsh/dsh-searxng')
+    expect(accepted.events.at(-1)).toBe('remove-dir:/dsh')
   })
 
   it('blocks foreign ownership before every destructive operation', async () => {

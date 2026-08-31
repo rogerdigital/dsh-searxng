@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { access, chmod, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -40,6 +40,17 @@ try {
 
   const packageRoot = join(installDirectory, 'node_modules', 'dsh-searxng')
   const executable = join(installDirectory, 'node_modules', '.bin', process.platform === 'win32' ? 'dsh-searxng.cmd' : 'dsh-searxng')
+  const cliSource = await readFile(join(packageRoot, 'lib', 'cli.mjs'), 'utf8')
+  const forbidden = [
+    ['dynamic evaluation', /\bnew Function\s*\(|\beval\s*\(/],
+    ['Schemastery', /schemastery/i],
+    ['DSH web provider runtime', /@deepseek-ai[+/]dsh-web/i],
+    ['DSH launch environment runtime', /@deepseek-ai[+/]dsh-launch-environment/i],
+    ['Cordis runtime', /@deepseek-ai[+/]cordis/i],
+  ]
+  for (const [label, pattern] of forbidden) {
+    if (pattern.test(cliSource)) throw new Error(`Packed CLI unexpectedly contains ${label}`)
+  }
   if (process.platform !== 'win32') await chmod(executable, 0o755)
   const { stdout } = await run(executable, ['--help'], { cwd: installDirectory })
   for (const commandName of ['setup', 'status', 'doctor', 'remove']) {
