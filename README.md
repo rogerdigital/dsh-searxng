@@ -17,92 +17,119 @@ dsh plugin add dsh-searxng
 
 ## Quick start
 
-1. **Run a SearXNG instance with the JSON format enabled.** If you installed only the plugin,
-   clone the repository example first:
+Requirements: Node.js 20 or newer, `dsh`, Docker Engine or Docker Desktop, and Docker Compose v2.
 
-   ```sh
-   git clone --depth 1 https://github.com/rogerdigital/dsh-searxng.git dsh-searxng-example
-   docker compose -f dsh-searxng-example/examples/docker/docker-compose.yml up -d
-   curl 'http://127.0.0.1:8080/search?q=test&format=json'
-   ```
+```sh
+npx dsh-searxng setup
+dsh --profile web
+```
 
-   From an existing source checkout, you can instead run `docker compose up -d` in
-   `examples/docker`. This repository example is loopback-only and pre-configures
-   [`search.formats`](examples/docker/searxng/settings.yml) with `json` — the one setting most
-   public instances deliberately disable.
+`setup` creates a loopback-only, pinned SearXNG Docker deployment, waits for the JSON API, runs a
+real search through both SearXNG and the final DSH provider configuration, and only then activates
+the profile. Repeating the command reuses the same owned container, port, configuration, and
+secret.
 
-2. **Point the plugin at it.** Either set an environment variable before launching dsh:
+Use another DSH profile or port when needed:
 
-   ```sh
-   export SEARXNG_BASE_URL=http://127.0.0.1:8080
-   dsh
-   ```
+```sh
+npx dsh-searxng setup --profile research --port 9080
+dsh --profile research
+```
 
-   …or override the plugin row in your profile's `cordis.patch.yml`
-   (`$DSH_HOME/profiles/<name>/cordis.patch.yml`):
+Package installation and DSH plugin activation never start Docker. Docker is changed only by an
+explicit `dsh-searxng setup` or `dsh-searxng remove --service` command.
 
-   ```yaml
-   - id: web-search-searxng
-     config:
-       baseURL: http://127.0.0.1:8080
-       language: zh-CN
-   ```
+## Existing SearXNG
 
-3. **Ask your agent something that needs the web.** If this is the only search provider you have
-   installed, the seam auto-selects it. If you also have Exa/Perplexity installed, select it
-   explicitly with `export DSH_WEB_SEARCH_PROVIDER=searxng` (or set `searchProvider: searxng` in
-   the web row's config).
+An existing local, remote, authenticated, or independently managed SearXNG instance is a
+first-class path:
 
-Until `baseURL` is set, the provider registers as unavailable — no public instance is assumed,
-because most disable the JSON format and rate-limit heavily.
+```sh
+npx dsh-searxng setup --profile web --url https://search.example.com
+```
 
-## Configuration
+The endpoint must be HTTP(S), contain no credentials, query, or fragment, and enable JSON search.
+Existing provider options such as `authHeader`, `language`, `engines`, and `categories` in the DSH
+profile are preserved and used by validation. External mode never invokes Docker.
 
-All keys are optional; all live on the `web-search-searxng` row's `config`.
+## Operations
+
+```sh
+# Fast health result; stops at the first failure.
+npx dsh-searxng status --profile web
+
+# Ordered environment, Docker, ownership, HTTP, JSON, search, profile, and provider checks.
+npx dsh-searxng doctor --profile web
+
+# Detach the profile and remove the plugin package from that profile.
+npx dsh-searxng remove --profile web
+
+# Also stop and remove the owned service; keep its data and local state.
+npx dsh-searxng remove --profile web --service
+
+# Permanently delete the exact owned data volume and managed directory.
+npx dsh-searxng remove --profile web --service --purge-data
+```
+
+Permanent deletion prompts on an interactive terminal. Automation must add `--yes`. `--json` is
+available on setup, status, doctor, and remove. Destructive Docker operations run only after the
+container, network, and volume labels match this DSH home; same-name foreign resources are refused.
+
+## Provider configuration
+
+The setup command manages the `web-search-searxng` row in
+`$DSH_HOME/profiles/<name>/cordis.patch.yml`. These optional values can be added to that row:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `baseURL` | `$SEARXNG_BASE_URL` | Base URL of the instance, e.g. `http://127.0.0.1:8080`. Must be http(s), contain no query or fragment, and have `json` in `search.formats`. |
-| `language` | none | Locale passed as SearXNG's `language` parameter, e.g. `zh-CN`, `en-US`. |
-| `engines` | none | Comma-separated engine allowlist, e.g. `bing,duckduckgo`. |
-| `categories` | none | Comma-separated category filter, e.g. `general,it`. |
-| `authHeader` | none | Authorization header value, for instances fronted by an API-key gate. Sent verbatim. |
+| `baseURL` | managed or `--url` endpoint | SearXNG base URL. |
+| `language` | none | SearXNG language, for example `zh-CN` or `en-US`. |
+| `engines` | none | Comma-separated engine allowlist. |
+| `categories` | none | Comma-separated category filter. |
+| `authHeader` | none | Authorization header for a protected external instance. |
 
-The result count is not configurable here: `dsh-tool-web` owns the bound (`searchMaxResults`,
-default 8) and the seam truncates to it.
+If several DSH search providers are available, select this one with
+`DSH_WEB_SEARCH_PROVIDER=searxng` or the corresponding `searchProvider` DSH web configuration.
 
 ## Troubleshooting
 
-- **HTTP 403** — the instance does not enable the JSON format. Add `json` to `search.formats` in
-  its `settings.yml` (see the repository example), then restart the instance.
-- **HTTP 429** — the instance's rate limiter. For a local instance set `limiter: false`, or raise
-  its limits.
-- **Provider unavailable / never selected** — `baseURL` is not set, is not an absolute http(s) URL, or contains a query or fragment.
-- **`WEB_PROVIDER_AMBIGUOUS`** — more than one search provider is installed and available; select
-  one via `DSH_WEB_SEARCH_PROVIDER=searxng`.
+- `E_DOCKER_MISSING` / `E_DOCKER_OFFLINE`: install or start Docker.
+- `E_COMPOSE_UNSUPPORTED`: enable Docker Compose v2.
+- `E_JSON_DISABLED`: add `json` to SearXNG `search.formats`.
+- `E_AUTH_FAILED`: check the external instance's `authHeader` configuration.
+- `E_RATE_LIMITED`: adjust the instance limiter or upstream engine selection.
+- `E_RESOURCE_FOREIGN`: a same-name Docker resource does not carry this installation's ownership
+  labels; it is never modified automatically.
+- `E_PROFILE_CONCURRENT_MODIFICATION`: the DSH profile changed during the operation; review it and
+  retry.
 
-## Compatibility
+`doctor --json` returns the complete redacted check list and actionable error codes.
 
-dsh is in developer preview with breaking changes expected. This table tracks tested pairings:
+## Runtime support
 
-| Plugin version | `@deepseek-ai/dsh-web` | `@deepseek-ai/dsh-launch-environment` | Notes |
-|---|---|---|---|
-| 0.1.1 | `>=0.1.0-rc.6 <0.2.0` (tested against `0.1.0-rc.6`) | `>=0.0.1-rc.3 <0.2.0` (tested against `0.0.1-rc.3`) | First-round hardening |
-| 0.1.0 | `>=0.1.0-rc.1 <0.2.0` | `>=0.0.1-rc.1 <0.2.0` | Initial release |
+- Node.js: 20 and newer.
+- Host OS: Linux, macOS, and Windows.
+- Managed service: Docker Engine on Linux or Docker Desktop on macOS/Windows, with Compose v2.
+- Podman and Podman Compose are not supported in the managed path.
+- External SearXNG mode does not require Docker.
 
-## Develop
+dsh is in developer preview with breaking changes expected. Version 0.1.2 supports
+`@deepseek-ai/dsh-web >=0.1.0-rc.6 <0.2.0` and
+`@deepseek-ai/dsh-launch-environment >=0.0.1-rc.3 <0.2.0`.
+
+## Development
 
 ```sh
 pnpm install
-pnpm test    # vitest
-pnpm build   # tsdown → lib/
+pnpm verify
 ```
 
-Integration check against a live instance:
+The repository Docker example is development-only. The packaged setup path is the supported
+quickstart because it pins the image, generates a private secret, labels every owned resource, and
+validates the final provider before activation. Opt in to the real Docker journey with:
 
 ```sh
-cd examples/docker && docker compose up -d
-node -e "import('./lib/index.mjs').then(m => new m.SearxngSearchProvider({ baseURL: 'http://127.0.0.1:8080' }).search({ query: 'deepseek harness' }).then(r => console.log(r.sources.slice(0, 3))))"
+DSH_SEARXNG_E2E=1 pnpm test -- test/e2e/managed-setup.test.ts
 ```
 
 ## License

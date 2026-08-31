@@ -4,18 +4,33 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_docker_e2e:
+        description: Run the real Docker managed journey
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 jobs:
   verify:
-    name: Verify (Node ${{ matrix.node-version }})
-    runs-on: ubuntu-latest
+    name: Verify (${{ matrix.os }}, Node ${{ matrix.node-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20, 24]
+        include:
+          - os: ubuntu-latest
+            node-version: 20
+          - os: ubuntu-latest
+            node-version: 24
+          - os: macos-latest
+            node-version: 20
+          - os: windows-latest
+            node-version: 20
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
@@ -27,7 +42,30 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - if: matrix.node-version == 20
-        run: pnpm typecheck && pnpm test
-      - if: matrix.node-version == 24
-        run: pnpm verify
+      - run: pnpm verify
+
+  docker-e2e:
+    name: Managed Docker journey
+    if: github.event_name == 'workflow_dispatch' && inputs.run_docker_e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.23.0
+          run_install: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: DSH_SEARXNG_E2E=1 pnpm test -- test/e2e/managed-setup.test.ts
+      - name: Remove any labeled test resources
+        if: always()
+        shell: bash
+        run: |
+          docker ps -aq --filter label=io.dsh-searxng.managed=true | xargs -r docker rm -f
+          docker network ls -q --filter label=io.dsh-searxng.managed=true | xargs -r docker network rm
+          docker volume ls -q --filter label=io.dsh-searxng.managed=true | xargs -r docker volume rm

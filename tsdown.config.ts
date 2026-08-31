@@ -1,13 +1,25 @@
 import { defineConfig } from 'tsdown'
 
-export default defineConfig({
-  entry: ['src/index.ts'],
+const shared = {
   outDir: 'lib',
-  format: 'esm',
+  format: 'esm' as const,
   dts: true,
-  // Self-contained transpile: no project references, no type-check — mirrors
-  // the standalone-plugin guidance in the dsh plugin publish guide.
   target: 'es2022',
-  platform: 'node',
-  clean: true,
-})
+  platform: 'node' as const,
+}
+
+export default defineConfig([
+  {
+    ...shared,
+    entry: { index: 'src/index.ts' },
+    clean: true,
+  },
+  {
+    ...shared,
+    entry: { cli: 'src/cli.ts' },
+    clean: false,
+    dts: false,
+    // The npx CLI must work before a DSH host resolves this plugin's peers.
+    deps: { alwaysBundle: [/.*/], onlyAllowBundle: false },
+  },
+])
