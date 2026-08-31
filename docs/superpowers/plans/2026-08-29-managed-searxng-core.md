@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Completed — delivered in `0.2.0` and reverified against the published `0.2.1` boundary. The unchecked boxes below preserve the original execution outline; this status line is authoritative.
+
 **Goal:** Ship a published-package path that installs or connects `dsh-searxng`, reaches a real search through one setup command, and provides safe status, diagnosis, and removal.
 
 **Architecture:** Keep the runtime provider independent from Docker. Add a Node CLI whose small adapters own process execution, state, Docker Compose, SearXNG probes, and DSH profile patches; orchestration composes those adapters and never performs implicit work during plugin activation.

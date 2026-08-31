@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Completed — delivered and published as `0.2.1`; the packed CLI dependency gate passes, dsh-vet reports grade A, and the remaining low-confidence delete-path finding is tracked in dsh-vet issue #10. The unchecked boxes below preserve the original execution outline; this status line is authoritative.
+
 **Goal:** Publish `dsh-searxng@0.2.1` with a standalone CLI that does not ship the DSH/Schemastery provider chain and with a stricter, reviewable managed-directory deletion boundary.
 
 **Architecture:** Move protocol-level SearXNG request and normalization behavior into a dependency-free shared client. Keep DSH-specific error adaptation in `provider.ts`, make the CLI call the shared client directly, and derive the purge target inside the recursive remover from the resolved DSH home. Verify the actual packed CLI, not only the source graph.

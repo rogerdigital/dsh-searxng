@@ -7,17 +7,12 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plug
 (`ctx.web`), giving your agent `web_search` through a **free, self-hosted, key-less** metasearch
 instance — instead of the paid Exa/Perplexity APIs.
 
-## Install
-
-```sh
-dsh plugin add dsh-searxng
-```
-
-(With a named profile: `dsh plugin --profile <name> add dsh-searxng`.)
-
 ## Quick start
 
 Requirements: Node.js 20 or newer, `dsh`, Docker Engine or Docker Desktop, and Docker Compose v2.
+
+The setup command installs and attaches `dsh-searxng` to the selected profile, so no separate
+plugin-install step is required.
 
 ```sh
 npx dsh-searxng setup
@@ -51,6 +46,17 @@ npx dsh-searxng setup --profile web --url https://search.example.com
 The endpoint must be HTTP(S), contain no credentials, query, or fragment, and enable JSON search.
 Existing provider options such as `authHeader`, `language`, `engines`, and `categories` in the DSH
 profile are preserved and used by validation. External mode never invokes Docker.
+
+## Manual plugin installation
+
+If you manage the DSH profile patch yourself and do not want the setup command to attach it,
+install only the plugin package:
+
+```sh
+dsh plugin add dsh-searxng
+```
+
+With a named profile, use `dsh plugin --profile <name> add dsh-searxng`.
 
 ## Operations
 
@@ -108,12 +114,15 @@ If several DSH search providers are available, select this one with
 ## Runtime support
 
 - Node.js: 20 and newer.
-- Host OS: Linux, macOS, and Windows.
-- Managed service: Docker Engine on Linux or Docker Desktop on macOS/Windows, with Compose v2.
-- Podman and Podman Compose are not supported in the managed path.
+- CLI, tests, build, and packed artifact: verified on Linux, macOS, and Windows.
+- Managed Docker journey and Docker adapter integration: verified in Linux CI with Docker Engine
+  and Compose v2.
+- Docker Desktop on macOS and Windows is supported but has not completed formal release
+  certification.
 - External SearXNG mode does not require Docker.
+- Podman and Podman Compose are not supported in the managed path.
 
-dsh is in developer preview with breaking changes expected. Version 0.2.0 supports
+dsh is in developer preview with breaking changes expected. Version 0.2.1 supports
 `@deepseek-ai/dsh-web >=0.1.0-rc.6 <0.2.0` and
 `@deepseek-ai/dsh-launch-environment >=0.0.1-rc.3 <0.2.0`.
 
@@ -126,10 +135,12 @@ pnpm verify
 
 The repository Docker example is development-only. The packaged setup path is the supported
 quickstart because it pins the image, generates a private secret, labels every owned resource, and
-validates the final provider before activation. Opt in to the real Docker journey with:
+validates the final provider before activation. The opt-in Linux CI job runs both real Docker
+release checks:
 
 ```sh
 DSH_SEARXNG_E2E=1 pnpm test -- test/e2e/managed-setup.test.ts
+DSH_SEARXNG_DOCKER_INTEGRATION=1 pnpm test -- test/cli/docker.integration.test.ts
 ```
 
 ## License

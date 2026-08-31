@@ -20,7 +20,7 @@
 - Modify: `docs/superpowers/plans/2026-08-31-docker-config-ownership-fix.md`
 - Modify: `docs/superpowers/plans/2026-08-31-cli-audit-hardening.md`
 
-- [ ] **Step 1: Add completed status to the managed core plan**
+- [x] **Step 1: Add completed status to the managed core plan**
 
 Insert after the agentic-worker note:
 
@@ -28,7 +28,7 @@ Insert after the agentic-worker note:
 **Status:** Completed — delivered in `0.2.0` and reverified against the published `0.2.1` boundary. The unchecked boxes below preserve the original execution outline; this status line is authoritative.
 ```
 
-- [ ] **Step 2: Mark the lifecycle plan as deferred**
+- [x] **Step 2: Mark the lifecycle plan as deferred**
 
 Insert after the agentic-worker note:
 
@@ -36,7 +36,7 @@ Insert after the agentic-worker note:
 **Status:** Deferred / Not started — `repair`, transactional `update`, durable operation journals, state V2 migration, deployment catalogs, crash recovery, and three-platform Docker certification are not part of `0.2.1`. The unchecked boxes below remain the proposed future execution outline.
 ```
 
-- [ ] **Step 3: Add completed status to the Docker ownership plan**
+- [x] **Step 3: Add completed status to the Docker ownership plan**
 
 Insert after the agentic-worker note:
 
@@ -44,7 +44,7 @@ Insert after the agentic-worker note:
 **Status:** Completed — merged through PR #10 and verified by the packed managed setup journey, Docker adapter integration, and unconditional labeled-resource cleanup. The unchecked boxes below preserve the original execution outline; this status line is authoritative.
 ```
 
-- [ ] **Step 4: Add completed status to the CLI audit plan**
+- [x] **Step 4: Add completed status to the CLI audit plan**
 
 Insert after the agentic-worker note:
 
@@ -52,7 +52,7 @@ Insert after the agentic-worker note:
 **Status:** Completed — delivered and published as `0.2.1`; the packed CLI dependency gate passes, dsh-vet reports grade A, and the remaining low-confidence delete-path finding is tracked in dsh-vet issue #10. The unchecked boxes below preserve the original execution outline; this status line is authoritative.
 ```
 
-- [ ] **Step 5: Verify exactly four authoritative status lines**
+- [x] **Step 5: Verify exactly four authoritative status lines**
 
 Run:
 
@@ -67,7 +67,7 @@ Expected: exactly four matches; three contain `Completed` and one contains `Defe
 **Files:**
 - Modify: `README.md`
 
-- [ ] **Step 1: Make managed setup the first path**
+- [x] **Step 1: Make managed setup the first path**
 
 Remove the mandatory top-level `Install` section. Keep `Quick start` immediately after the introduction and add this sentence after its requirements:
 
@@ -82,7 +82,7 @@ npx dsh-searxng setup
 dsh --profile web
 ```
 
-- [ ] **Step 2: Preserve manual installation as an advanced path**
+- [x] **Step 2: Preserve manual installation as an advanced path**
 
 After the existing-SearXNG section, add:
 
@@ -98,7 +98,7 @@ dsh plugin add dsh-searxng
 With a named profile, use `dsh plugin --profile <name> add dsh-searxng`.
 ````
 
-- [ ] **Step 3: Correct the runtime support evidence**
+- [x] **Step 3: Correct the runtime support evidence**
 
 Replace the runtime-support bullets with statements that distinguish validation layers:
 
@@ -113,7 +113,7 @@ Replace the runtime-support bullets with statements that distinguish validation 
 
 Change `Version 0.2.0 supports` to `Version 0.2.1 supports` without changing the dependency ranges.
 
-- [ ] **Step 4: Keep the README limited to shipped capabilities**
+- [x] **Step 4: Keep the README limited to shipped capabilities**
 
 Run:
 
@@ -131,7 +131,7 @@ Expected: only the support sentence stating that Docker Desktop has not complete
 - Verify: `docs/superpowers/specs/2026-08-31-documentation-status-readme-design.md`
 - Verify: `docs/superpowers/plans/2026-08-31-documentation-status-readme.md`
 
-- [ ] **Step 1: Check stale version references and CLI command scope**
+- [x] **Step 1: Check stale version references and CLI command scope**
 
 Run:
 
@@ -149,7 +149,7 @@ rg -n "expected one command: setup, status, doctor, or remove" src/cli/args.ts
 
 Expected: one match proving the documented command set matches the CLI grammar.
 
-- [ ] **Step 2: Run documentation and release-boundary verification**
+- [x] **Step 2: Run documentation and release-boundary verification**
 
 Run:
 
@@ -160,7 +160,7 @@ pnpm verify
 
 Expected: no whitespace errors; typecheck, 541 unit tests, build, package creation, packed CLI installation, forbidden-marker inspection, and Docker asset checks pass. Environment-gated Docker tests remain skipped locally.
 
-- [ ] **Step 3: Review scope and commit**
+- [x] **Step 3: Review scope and commit**
 
 Run:
 
