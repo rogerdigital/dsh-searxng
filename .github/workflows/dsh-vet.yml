@@ -21,8 +21,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rogerdigital/dsh-vet/action@v0.2.0
+      # Single pin: the action tag carries the scanner version; Dependabot
+      # (github-actions) keeps the ref current — no per-release edits here.
+      - uses: rogerdigital/dsh-vet/action@v0.2.3
         with:
           specifier: 'dsh-searxng'
-          version: '0.2.2'
           commit-report: true
