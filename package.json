@@ -1,6 +1,6 @@
 {
   "name": "dsh-searxng",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "SearXNG-backed search provider for the DeepSeek Harness web capability seam (ctx.web)",
   "type": "module",
   "packageManager": "pnpm@10.23.0",
@@ -26,7 +26,9 @@
       "patch": "./cordis.patch.yml"
     },
     "seams": [
-      "web"
+      "web",
+      "fs",
+      "shell"
     ]
   },
   "scripts": {
