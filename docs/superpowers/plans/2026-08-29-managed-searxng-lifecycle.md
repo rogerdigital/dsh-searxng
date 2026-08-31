@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Deferred / Not started — `repair`, transactional `update`, durable operation journals, state V2 migration, deployment catalogs, crash recovery, and three-platform Docker certification are not part of `0.2.1`. The unchecked boxes below remain the proposed future execution outline.
+
 **Goal:** Add deterministic repair, crash recovery, transactional image updates with verified rollback, and release certification on every officially supported platform.
 
 **Architecture:** Extend the core CLI with a durable operation journal and pure repair/update planners. Executors may mutate only state-backed, ownership-verified resources; every update preserves a deployable prior snapshot and commits state only after a real search passes.

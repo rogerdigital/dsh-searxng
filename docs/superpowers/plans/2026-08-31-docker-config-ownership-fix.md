@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Completed — merged through PR #10 and verified by the packed managed setup journey, Docker adapter integration, and unconditional labeled-resource cleanup. The unchecked boxes below preserve the original execution outline; this status line is authoritative.
+
 **Goal:** Preserve host ownership of private generated SearXNG configuration and make the manual Linux Docker job run both real Docker release tests.
 
 **Architecture:** Keep the existing private `0700` directories and `0600` files, but disable the pinned SearXNG entrypoint's recursive ownership rewrite through the packaged Compose environment. Extend the existing opt-in Ubuntu Docker job with two explicit, isolated Vitest invocations so the packed lifecycle and lower-level Docker adapter are both release gates.
