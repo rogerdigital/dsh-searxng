@@ -4,40 +4,73 @@
     "kind": "npm-package",
     "specifier": "dsh-searxng",
     "resolved": {
-      "version": "0.1.1",
-      "integrity": "sha512-8MV0faiTR4q/Gx2yrs66xQANZoGY1U1xm9KDVgN0uoGwisxJxMS2L8oOWYeT1cdFo4ludKcNQSlYRpUHeCvcrg=="
+      "version": "0.2.0",
+      "integrity": "sha512-b1ES5fhe1+YjuFIz5WP7bJGlpVPWnoxzUAtDg4uVOoydPYl3p2rk5Nxz0ouxQEvgcR7r+T+OxNrd1XbEqvEhAg=="
     }
   },
   "scanner": {
     "name": "dsh-vet",
     "version": "0.2.1",
-    "ranAt": "2026-08-31T11:05:13.595Z"
+    "ranAt": "2026-08-31T11:13:41.304Z"
   },
   "summary": {
     "grade": "C",
     "counts": {
       "critical": 0,
       "high": 0,
-      "medium": 1,
+      "medium": 2,
       "low": 0,
-      "info": 0
+      "info": 1
     }
   },
   "findings": [
     {
-      "id": "perm.network-client",
-      "title": "Opens network connections",
+      "id": "obf.eval-detect",
+      "title": "Evaluates dynamically built code",
       "severity": "medium",
+      "confidence": "medium",
+      "evidence": [
+        {
+          "file": "lib/cli.mjs",
+          "line": 11125,
+          "snippet": "schema.callback = new Function(\"return \" + schema.callback)();",
+          "note": "Function of a non-literal argument"
+        }
+      ],
+      "remediation": "Replace eval/new Function with direct code; dynamic evaluation defeats static audit.",
+      "references": [
+        "https://github.com/rogerdigital/dsh-vet/blob/main/docs/rules/obf.eval-detect.md"
+      ]
+    },
+    {
+      "id": "perm.undeclared-fs-write",
+      "title": "Writes or deletes files outside any plausible plugin scope",
+      "severity": "medium",
+      "confidence": "low",
+      "evidence": [
+        {
+          "file": "lib/cli.mjs",
+          "line": 8972,
+          "snippet": "await rm(path, { recursive: true });"
+        }
+      ],
+      "remediation": "Use fixed, reviewable paths; runtime-computed write targets cannot be audited statically.",
+      "references": [
+        "https://github.com/rogerdigital/dsh-vet/blob/main/docs/rules/perm.undeclared-fs-write.md"
+      ]
+    },
+    {
+      "id": "perm.network-client",
+      "title": "Imports network modules without an observable client call",
+      "severity": "info",
       "confidence": "high",
       "evidence": [
         {
-          "file": "lib/index.mjs",
-          "line": 73,
-          "snippet": "response = await fetch(buildSearchUrl(this.options.baseURL, params), {",
-          "note": "no \"web\" seam declared (target not statically known)"
+          "file": "lib/cli.mjs",
+          "note": "import present, no client call site"
         }
       ],
-      "remediation": "Declare the web seam in dsh.seams, or drop the network access.",
+      "remediation": "Remove the unused import.",
       "references": [
         "https://github.com/rogerdigital/dsh-vet/blob/main/docs/rules/perm.network-client.md"
       ]
