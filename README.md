@@ -113,7 +113,7 @@ If several DSH search providers are available, select this one with
 - Podman and Podman Compose are not supported in the managed path.
 - External SearXNG mode does not require Docker.
 
-dsh is in developer preview with breaking changes expected. Version 0.1.2 supports
+dsh is in developer preview with breaking changes expected. Version 0.2.0 supports
 `@deepseek-ai/dsh-web >=0.1.0-rc.6 <0.2.0` and
 `@deepseek-ai/dsh-launch-environment >=0.0.1-rc.3 <0.2.0`.
 
