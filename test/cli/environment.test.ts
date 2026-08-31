@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { join } from 'node:path'
+import { join, normalize, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import {
   NodeEnvironmentService,
@@ -18,11 +18,12 @@ function abortError(message: string): Error {
 
 describe('environment helpers', () => {
   it('resolves injected DSH_HOME or the injected home directory', () => {
-    expect(resolveDshHome({ DSH_HOME: '/tmp/dsh' }, '/Users/test')).toBe('/tmp/dsh')
-    expect(resolveDshHome({ DSH_HOME: 'relative' }, '/Users/test')).toBe(join(process.cwd(), 'relative'))
-    expect(resolveDshHome({ DSH_HOME: '~/relative' }, '/Users/test')).toBe('/Users/test/relative')
-    expect(resolveDshHome({ DSH_HOME: '  ' }, '/Users/test')).toBe('/Users/test/.dsh')
-    expect(resolveDshHome({}, '/Users/test')).toBe('/Users/test/.dsh')
+    const homeDirectory = resolve('/Users/test')
+    expect(resolveDshHome({ DSH_HOME: '/tmp/dsh' }, homeDirectory)).toBe(resolve('/tmp/dsh'))
+    expect(resolveDshHome({ DSH_HOME: 'relative' }, homeDirectory)).toBe(join(process.cwd(), 'relative'))
+    expect(resolveDshHome({ DSH_HOME: '~/relative' }, homeDirectory)).toBe(join(homeDirectory, 'relative'))
+    expect(resolveDshHome({ DSH_HOME: '  ' }, homeDirectory)).toBe(join(homeDirectory, '.dsh'))
+    expect(resolveDshHome({}, homeDirectory)).toBe(join(homeDirectory, '.dsh'))
   })
 
   it('derives profile and managed paths and rejects unsafe profiles', () => {
@@ -35,7 +36,7 @@ describe('environment helpers', () => {
   })
 
   it('computes a stable, path-derived home id', () => {
-    const normalized = '/tmp/dsh'
+    const normalized = normalize(resolve('/tmp/dsh'))
     const expected = createHash('sha256').update(normalized).digest('hex').slice(0, 16)
     expect(homeId(normalized)).toBe(expected)
     expect(homeId('/tmp/dsh/')).toBe(expected)
@@ -44,12 +45,17 @@ describe('environment helpers', () => {
   })
 
   it('resolves a profile and preflights port separately from dsh', async () => {
+    const dshHome = resolve('/tmp/dsh')
     const service = new NodeEnvironmentService({
       env: { DSH_HOME: '/tmp/dsh' }, homedir: '/Users/test',
       portChecker: async (port) => port !== 8080,
       commandRunner: { run: async () => ({ exitCode: 0, stdout: '', stderr: '' }) },
     })
-    await expect(service.resolve('web')).resolves.toMatchObject({ dshHome: '/tmp/dsh', profileDir: '/tmp/dsh/profiles/web', managedDir: '/tmp/dsh/dsh-searxng' })
+    await expect(service.resolve('web')).resolves.toMatchObject({
+      dshHome,
+      profileDir: join(dshHome, 'profiles', 'web'),
+      managedDir: join(dshHome, 'dsh-searxng'),
+    })
     await expect(service.preflightManaged(8080)).rejects.toMatchObject({ code: 'E_PORT_CONFLICT' })
     await expect(service.preflightDsh()).resolves.toBeUndefined()
   })

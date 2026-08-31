@@ -1004,7 +1004,7 @@ describe('production CLI entry', () => {
     const packageJson = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8')) as Record<string, unknown>
     const source = await readFile(new URL('../../src/cli.ts', import.meta.url), 'utf8')
     expect(packageJson.bin).toEqual({ 'dsh-searxng': './lib/cli.mjs' })
-    expect(source.startsWith('#!/usr/bin/env node\n')).toBe(true)
+    expect(source).toMatch(/^#!\/usr\/bin\/env node\r?\n/)
   })
 
   it('detects a symlinked executable by real path but never treats an ordinary import as main', async () => {

@@ -1168,7 +1168,7 @@ describe('rollback and file safety', () => {
     expect((await fs.lstat(patchPath)).ino).toBe(replacementInode)
   })
 
-  it('cleans temporary files and restores the original after a directory fsync failure', async () => {
+  it.skipIf(process.platform === 'win32')('cleans temporary files and restores the original after a directory fsync failure', async () => {
     let failDirectorySync = true
     const fileSystem: ProfileFileSystem = {
       ...fs,
@@ -1197,7 +1197,7 @@ describe('rollback and file safety', () => {
     expect((await fs.readdir(dir)).filter((name) => name.includes('.tmp-'))).toEqual([])
   })
 
-  it('preserves a same-byte foreign replacement made while post-rename directory fsync fails', async () => {
+  it.skipIf(process.platform === 'win32')('preserves a same-byte foreign replacement made while post-rename directory fsync fails', async () => {
     let replaceDuringDirectorySync = true
     let patchPath = ''
     let foreignInode: number | undefined
@@ -1240,7 +1240,7 @@ describe('rollback and file safety', () => {
     expect(await fs.readFile(patchPath, 'utf8')).toContain('dsh-searxng managed attachment')
   })
 
-  it('rejects and preserves a same-byte foreign replacement made immediately after rename', async () => {
+  it.skipIf(process.platform === 'win32')('rejects and preserves a same-byte foreign replacement made immediately after rename', async () => {
     let replaceAfterRename = true
     let patchPath = ''
     let foreignInode: number | undefined
@@ -1280,7 +1280,7 @@ describe('rollback and file safety', () => {
   it('writes user-only files and leaves no temporary artifacts', async () => {
     const { manager, dir, patchPath } = await fixture({ patch: '[]\n' })
     await manager.attach('web', 'http://localhost:8080', async () => {})
-    expect((await fs.stat(patchPath)).mode & 0o777).toBe(0o600)
+    if (process.platform !== 'win32') expect((await fs.stat(patchPath)).mode & 0o777).toBe(0o600)
     expect((await fs.readdir(dir)).filter((name) => name.includes('.tmp-'))).toEqual([])
   })
 
@@ -1322,7 +1322,7 @@ describe('detachment', () => {
     expect(runner.calls).toEqual([])
   })
 
-  it('rejects and preserves a same-byte foreign replacement immediately after detach rename', async () => {
+  it.skipIf(process.platform === 'win32')('rejects and preserves a same-byte foreign replacement immediately after detach rename', async () => {
     const patch = `# dsh-searxng managed attachment
 - id: web-search-searxng
   config: { baseURL: http://managed.invalid }

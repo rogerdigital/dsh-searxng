@@ -1,3 +1,4 @@
+import { dirname, join, resolve, sep } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { CliError } from '../../src/cli/errors.ts'
 import { CliDockerAdapter } from '../../src/cli/docker.ts'
@@ -22,9 +23,10 @@ class FakeRunner implements CommandRunner {
 const ok = (stdout = '', stderr = ''): CommandResult => ({ exitCode: 0, stdout, stderr })
 const failed = (stderr = ''): CommandResult => ({ exitCode: 1, stdout: '', stderr })
 const configurationSha = 'a'.repeat(64)
+const stateDir = resolve('/private/state')
 const identity: ManagedIdentity = {
-  stateDir: '/private/state',
-  composePath: `/private/state/config-${configurationSha}/compose.yml`,
+  stateDir,
+  composePath: join(stateDir, `config-${configurationSha}`, 'compose.yml'),
   homeId: '0123456789abcdef',
   projectName: 'dsh-searxng-0123456789abcdef',
   containerName: 'dsh-searxng-0123456789abcdef',
@@ -63,7 +65,7 @@ const composePrefix = [
 ]
 
 function joinForTest(composePath: string, file: string): string {
-  return `${composePath.slice(0, composePath.lastIndexOf('/'))}/${file}`
+  return join(dirname(composePath), file)
 }
 
 async function expectCode(promise: Promise<unknown>, code: CliError['code']): Promise<void> {
@@ -119,7 +121,7 @@ describe('CliDockerAdapter deployment status', () => {
       Config: { Labels: {
         ...ownedLabels,
         'com.docker.compose.project': identity.projectName,
-        'com.docker.compose.project.config_files': '/tmp/foreign/compose.yml',
+        'com.docker.compose.project.config_files': resolve('/tmp/foreign/compose.yml'),
       } },
       State: { Running: true },
     }])
@@ -181,11 +183,11 @@ describe('CliDockerAdapter ownership', () => {
     { ...identity, projectName: 'foreign-project' },
     { ...identity, containerName: 'foreign-container' },
     { ...identity, stateDir: 'relative/state', composePath: `relative/state/config-${configurationSha}/compose.yml` },
-    { ...identity, stateDir: '/private/state\nother', composePath: `/private/state\nother/config-${configurationSha}/compose.yml` },
-    { ...identity, composePath: `/private/state/config-${configurationSha}/other.yml` },
-    { ...identity, composePath: `/private/state/nested/config-${configurationSha}/compose.yml` },
-    { ...identity, composePath: `/private/state/config-${'g'.repeat(64)}/compose.yml` },
-    { ...identity, composePath: `/private/state/config-${configurationSha}/../compose.yml` },
+    { ...identity, stateDir: `${stateDir}\nother`, composePath: join(`${stateDir}\nother`, `config-${configurationSha}`, 'compose.yml') },
+    { ...identity, composePath: join(stateDir, `config-${configurationSha}`, 'other.yml') },
+    { ...identity, composePath: join(stateDir, 'nested', `config-${configurationSha}`, 'compose.yml') },
+    { ...identity, composePath: join(stateDir, `config-${'g'.repeat(64)}`, 'compose.yml') },
+    { ...identity, composePath: `${stateDir}${sep}config-${configurationSha}${sep}..${sep}compose.yml` },
   ])('rejects a non-canonical managed identity before invoking Docker: %#', async (invalidIdentity) => {
     const runner = new FakeRunner()
     await expectCode(new CliDockerAdapter(runner).inspectOwnership(invalidIdentity), 'E_USAGE')

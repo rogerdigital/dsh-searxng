@@ -124,7 +124,9 @@ describe('StateStore schema', () => {
       const store = new FileStateStore(root)
       await store.write(populated)
       await expect(store.read()).resolves.toEqual(populated)
-      expect((await stat(join(root, 'state.json'))).mode & 0o777).toBe(0o600)
+      if (process.platform !== 'win32') {
+        expect((await stat(join(root, 'state.json'))).mode & 0o777).toBe(0o600)
+      }
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -261,7 +263,7 @@ describe('StateStore atomic write', () => {
     }))
   })
 
-  it.each(['open', 'sync'] as const)('rolls back and fsyncs after commit directory %s fails', async (failure) => {
+  it.skipIf(process.platform === 'win32').each(['open', 'sync'] as const)('rolls back and fsyncs after commit directory %s fails', async (failure) => {
     let attempts = 0
     await preservesOriginalWhen((root) => ({
       open: (async (...args: Parameters<typeof fsOpen>) => {
@@ -282,7 +284,7 @@ describe('StateStore atomic write', () => {
     expect(attempts).toBe(2)
   })
 
-  it('restores original absence when commit directory fsync fails', async () => {
+  it.skipIf(process.platform === 'win32')('restores original absence when commit directory fsync fails', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const statePath = join(root, 'state.json')
     let syncs = 0
@@ -304,7 +306,7 @@ describe('StateStore atomic write', () => {
     }
   })
 
-  it('retains the only backup and reports rollback restoration failure', async () => {
+  it.skipIf(process.platform === 'win32')('retains the only backup and reports rollback restoration failure', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const statePath = join(root, 'state.json')
     const original = Buffer.from([222, 173, 190, 239])
@@ -368,8 +370,10 @@ describe('StateStore exclusive lock', () => {
     await chmod(root, 0o777)
     try {
       await expect(new FileStateStore(root).withLock(async () => {
-        expect((await stat(root)).mode & 0o777).toBe(0o700)
-        expect((await stat(lockPath)).mode & 0o777).toBe(0o600)
+        if (process.platform !== 'win32') {
+          expect((await stat(root)).mode & 0o777).toBe(0o700)
+          expect((await stat(lockPath)).mode & 0o777).toBe(0o600)
+        }
         const metadata = JSON.parse(await readFile(lockPath, 'utf8')) as Record<string, unknown>
         expect(Object.keys(metadata).sort()).toEqual(['identity', 'pid', 'timestamp'])
         expect(metadata.pid).toBe(process.pid)
@@ -553,7 +557,7 @@ describe('StateStore exclusive lock', () => {
     }
   })
 
-  it('preserves a foreign inode that replaces a partially written lock during acquisition cleanup', async () => {
+  it.skipIf(process.platform === 'win32')('preserves a foreign inode that replaces a partially written lock during acquisition cleanup', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const lockPath = join(root, 'state.lock')
     const foreign = Buffer.from('foreign replacement')
