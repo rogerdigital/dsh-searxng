@@ -1,6 +1,6 @@
 # dsh-searxng
 
-[![dsh-vet](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rogerdigital/dsh-searxng/main/.dsh-vet/badge.json)](https://github.com/rogerdigital/dsh-searxng/blob/main/.dsh-vet/report.json)
+[![dsh-vet](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Frogerdigital%2Fdsh-searxng%2Fdsh-vet%2Freport%2F.dsh-vet%2Fbadge.json)](https://github.com/rogerdigital/dsh-searxng/blob/dsh-vet/report/.dsh-vet/report.json)
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plugin that registers a
 [SearXNG](https://docs.searxng.org/)-backed search provider into the web capability seam
