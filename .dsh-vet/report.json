@@ -10,8 +10,8 @@
   },
   "scanner": {
     "name": "dsh-vet",
-    "version": "0.2.4",
-    "ranAt": "2026-08-31T16:27:37.244Z"
+    "version": "0.2.5",
+    "ranAt": "2026-09-01T09:15:15.336Z"
   },
   "summary": {
     "grade": "A",
