@@ -312,9 +312,14 @@ export async function validateEndToEnd(
     preview = undefined
   }
   const config = preview?.config ?? { baseURL: endpoint }
+  // Cold-start gate first: Compose up returns before the service listens, so
+  // post-mutation validation may run against a container that still refuses
+  // connections. Readiness inherits setup's default retrying budget (no
+  // attempts/timeout overrides) and waits for it; the single-shot checks
+  // below then run against a warm service, reported in doctor's order.
+  await dependencies.searxng.readiness(config, signal)
   await dependencies.searxng.http(config, signal)
   checks.push({ id: 'http', status: 'pass', message: 'SearXNG HTTP endpoint is reachable' })
-  await dependencies.searxng.readiness({ ...config, attempts: 1, timeoutMs: 10_000 }, signal)
   checks.push({ id: 'json', status: 'pass', message: 'SearXNG JSON API is enabled' })
   await dependencies.searxng.realSearch(config, signal)
   checks.push({ id: 'search', status: 'pass', message: 'SearXNG returned a real search result' })

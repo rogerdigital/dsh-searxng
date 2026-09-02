@@ -381,7 +381,7 @@ describe('executeRepair', () => {
     expect(test.events).toEqual([
       'lock', 'state-read', 'journal-read', 'environment', 'docker-preflight', 'ownership',
       'journal-begin', 'journal-mutating', 'docker-restart', 'journal-validating',
-      'profile-preview', 'http', 'json', 'search', 'profile-validate', 'provider-search',
+      'profile-preview', 'json', 'http', 'search', 'profile-validate', 'provider-search',
       'state-write', 'journal-clear', 'unlock',
     ])
     expect(test.journal.store.begin).toHaveBeenCalledWith({
@@ -474,7 +474,7 @@ describe('executeRepair', () => {
     expect(test.events).toEqual([
       'lock', 'state-read', 'journal-read', 'environment',
       'journal-begin', 'journal-mutating', 'profile-attach', 'provider-search', 'journal-validating',
-      'profile-preview', 'http', 'json', 'search', 'profile-validate', 'provider-search',
+      'profile-preview', 'json', 'http', 'search', 'profile-validate', 'provider-search',
       'state-write', 'journal-clear', 'unlock',
     ])
   })

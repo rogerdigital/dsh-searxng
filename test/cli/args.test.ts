@@ -133,6 +133,7 @@ describe('parseCliArgs', () => {
     ['purge without service', ['remove', '--purge-data']],
     ['zero deployment version', ['update', '--deployment-version', '0']],
     ['noninteger deployment version', ['update', '--deployment-version', '2.5']],
+    ['deployment version above range', ['update', '--deployment-version', '65536']],
     ['setup deployment version', ['setup', '--deployment-version', '2']],
     ['status deployment version', ['status', '--deployment-version', '2']],
     ['doctor deployment version', ['doctor', '--deployment-version', '2']],

@@ -91,7 +91,9 @@ function parseDeploymentVersion(value: string | undefined): number | undefined {
   if (value === undefined) return undefined
   if (!/^\d+$/.test(value)) invalid('deployment-version must be an integer')
   const version = Number(value)
-  if (!Number.isSafeInteger(version) || version < 1) invalid('deployment-version must be between 1 and 65535')
+  if (!Number.isSafeInteger(version) || version < 1 || version > 65535) {
+    invalid('deployment-version must be between 1 and 65535')
+  }
   return version
 }
 

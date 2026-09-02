@@ -61,9 +61,21 @@ try {
     access(join(packageRoot, 'assets', 'docker', 'settings.yml.template')),
   ])
   // The packed CLI resolves its deployment catalog from the installed layout;
-  // verify the shipped catalog and every asset it references.
-  const catalog = JSON.parse(await readFile(join(packageRoot, 'assets', 'deployments', 'v1.json'), 'utf8'))
-  if (catalog.schemaVersion !== 1 || !Array.isArray(catalog.deployments) || catalog.deployments.length < 1) {
+  // locate the single versioned catalog file and verify it and every asset
+  // it references. The filename is derived, not hardcoded, so a schema bump
+  // that renames the catalog is still exercised.
+  const deploymentsDir = join(packageRoot, 'assets', 'deployments')
+  const catalogFiles = (await readdir(deploymentsDir)).filter((file) => /^v\d+\.json$/.test(file))
+  if (catalogFiles.length !== 1) {
+    throw new Error(`Expected exactly one deployment catalog, found ${catalogFiles.length}: ${catalogFiles.join(', ')}`)
+  }
+  const catalogFile = catalogFiles[0]
+  const fileVersion = Number(catalogFile.replace(/^v/, '').replace(/\.json$/, ''))
+  const catalog = JSON.parse(await readFile(join(deploymentsDir, catalogFile), 'utf8'))
+  if (catalog.schemaVersion !== fileVersion) {
+    throw new Error(`Packed catalog schema ${catalog.schemaVersion} does not match its file name v${fileVersion}`)
+  }
+  if (!Array.isArray(catalog.deployments) || catalog.deployments.length < 1) {
     throw new Error('Packed deployment catalog is invalid')
   }
   let previousVersion = 0

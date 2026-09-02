@@ -147,6 +147,12 @@ interface HarnessOptions {
   failSearchCalls?: number[]
   failProviderCalls?: number[]
   stateWriteError?: unknown
+  /**
+   * Model a cold-starting container: connection attempts are refused until a
+   * retrying readiness budget (no `attempts` override) has waited for the
+   * service; single-shot probes against the cold container fail.
+   */
+  coldStart?: boolean
 }
 
 function updateHarness(options: HarnessOptions = {}) {
@@ -225,11 +231,21 @@ function updateHarness(options: HarnessOptions = {}) {
   let readinessCalls = 0
   let searchCalls = 0
   let providerCalls = 0
+  let serviceWarm = false
   const searxng: SearxngProbe = {
-    http: vi.fn(async () => {}),
-    readiness: vi.fn(async () => {
+    http: vi.fn(async () => {
+      if (options.coldStart === true && !serviceWarm) {
+        throw new CliError('E_SEARCH_FAILED', 'SearXNG HTTP endpoint is unavailable', 'Run dsh-searxng doctor')
+      }
+    }),
+    readiness: vi.fn(async (probeOptions: { attempts?: number }) => {
       events.push('readiness-target')
       readinessCalls += 1
+      if (options.coldStart === true && probeOptions.attempts === 1 && !serviceWarm) {
+        // A single-shot budget dies on the first refused attempt of a cold start.
+        throw new CliError('E_SEARXNG_START_TIMEOUT', 'SearXNG did not become ready before the startup deadline', 'Inspect the managed container logs')
+      }
+      if (options.coldStart === true && probeOptions.attempts === undefined) serviceWarm = true
       if (options.failReadinessCalls?.includes(readinessCalls)) {
         throw options.readinessError ?? new CliError('E_SEARXNG_START_TIMEOUT', 'SearXNG did not become ready', 'Check the managed container logs')
       }
@@ -300,7 +316,7 @@ function updateHarness(options: HarnessOptions = {}) {
   }
 
   return {
-    dependencies, events, writes, journal, docker, assets, profiles, environment, readPreservedSecret,
+    dependencies, events, writes, journal, docker, assets, profiles, environment, readPreservedSecret, searxng,
     state: () => state,
     update: (signal?: AbortSignal) => updateManagedService(
       { profile: 'web', ...(options.deploymentVersion === undefined ? {} : { deploymentVersion: options.deploymentVersion }) },
@@ -347,6 +363,9 @@ describe('updateManagedService success', () => {
       beforeStateSha256: stateSha256(managedState()),
       target: { deploymentVersion: 2, image: TARGET_IMAGE },
     })
+    // Target validation inherits setup's default retrying readiness budget —
+    // no single-shot override may be passed to the post-mutation probe.
+    expect(test.searxng.readiness).toHaveBeenCalledWith({ baseURL: ENDPOINT }, undefined)
     // The previous bundle (rollback target) is never deleted; the runtime is
     // switched by bringing the current project down and the staged bundle up.
     expect(test.docker.down).toHaveBeenCalledTimes(1)
@@ -380,6 +399,19 @@ describe('updateManagedService success', () => {
     expect(test.assets.stage).toHaveBeenCalledWith(expect.objectContaining({
       definition: expect.objectContaining({ deploymentVersion: 2 }),
     }))
+  })
+
+  it('waits for a cold-starting target through the retrying readiness budget instead of rolling back', async () => {
+    const test = updateHarness({ coldStart: true })
+    await test.update()
+
+    // Compose up returns before the service listens; validation must survive
+    // the refused first attempts and still complete the full transaction.
+    expect(test.events).toEqual(SUCCESS_EVENTS)
+    expect(test.searxng.readiness).toHaveBeenCalledWith({ baseURL: ENDPOINT }, undefined)
+    expect(test.journal.active()).toBeUndefined()
+    expect(test.state().managed?.current.deploymentVersion).toBe(2)
+    expect(test.state().managed?.previous?.deploymentVersion).toBe(1)
   })
 })
 
@@ -448,6 +480,14 @@ describe('updateManagedService refuses non-updatable bases', () => {
     const test = updateHarness({ foreignThrow: true })
     await expect(test.update()).rejects.toMatchObject({ code: 'E_RESOURCE_FOREIGN' })
     expect(test.events).toEqual(['lock', 'diagnose-current', 'ownership', 'unlock'])
+  })
+
+  it('refuses before journaling when Docker is offline at the ownership gate', async () => {
+    const test = updateHarness({ dockerOffline: true })
+    await expect(test.update()).rejects.toMatchObject({ code: 'E_DOCKER_OFFLINE' })
+    expect(test.events).toEqual(['lock', 'diagnose-current', 'unlock'])
+    expect(test.journal.store.begin).not.toHaveBeenCalled()
+    expect(test.writes).toEqual([])
   })
 
   it('refuses when the deployment disappeared between diagnosis and the gate', async () => {
@@ -530,6 +570,40 @@ describe('updateManagedService pre-mutation failures unwind cleanly', () => {
     const test = updateHarness({ stageFailures: 2, stageErrorCode: 'E_STATE_INVALID' })
     await expect(test.update()).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
     expect(test.assets.stage).toHaveBeenCalledTimes(1)
+    expect(test.journal.active()).toBeUndefined()
+    expect(test.writes).toEqual([])
+  })
+
+  it('rethrows a damage signal that does not identify the bundle, without a rebuild retry', async () => {
+    const test = updateHarness({ stageFailures: 1, stageOmitBundleDetail: true })
+    const error = await errorFrom(test.update())
+    expect(error).toMatchObject({ code: 'E_BUNDLE_DAMAGED' })
+    expect(error.message).toBe('Managed configuration bundle does not match its identity')
+    expect(test.assets.stage).toHaveBeenCalledTimes(1)
+    expect(test.events).toEqual([
+      'lock', 'diagnose-current', 'ownership', 'journal-prepared', 'pull-target',
+      'journal-mutating', 'render-target', 'journal-clear', 'unlock',
+    ])
+    expect(test.journal.active()).toBeUndefined()
+    expect(test.writes).toEqual([])
+  })
+
+  it('unwinds without staging when the current secret cannot be preserved', async () => {
+    const test = updateHarness({
+      readSecretError: new CliError(
+        'E_STATE_INVALID',
+        'The managed SearXNG secret cannot be preserved because the configuration bundle is unreadable',
+        'Run dsh-searxng doctor and repair the managed deployment',
+      ),
+    })
+    await expect(test.update()).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+    expect(test.assets.stage).not.toHaveBeenCalled()
+    expect(test.docker.up).not.toHaveBeenCalled()
+    expect(test.docker.down).not.toHaveBeenCalled()
+    expect(test.events).toEqual([
+      'lock', 'diagnose-current', 'ownership', 'journal-prepared', 'pull-target',
+      'journal-mutating', 'journal-clear', 'unlock',
+    ])
     expect(test.journal.active()).toBeUndefined()
     expect(test.writes).toEqual([])
   })
@@ -659,10 +733,18 @@ describe('updateManagedService post-mutation failures roll back', () => {
     expect(test.journal.active()).toMatchObject({ phase: 'rolling-back' })
   })
 
-  it('rolls back on mid-mutation cancellation and then rethrows the cancellation', async () => {
+  it('maps an aborted mid-mutation update to the rolled-back envelope after restoring the service', async () => {
     const cancellation = new DOMException('The operation was aborted', 'AbortError')
     const test = updateHarness({ failReadinessCalls: [1], readinessError: cancellation })
-    await expect(test.update()).rejects.toBe(cancellation)
+    const error = await errorFrom(test.update())
+
+    // The cancellation must not hide that the service was restored: JSON
+    // consumers see the rolled-back envelope with targetError 'abort'.
+    expect(error).toMatchObject({
+      code: 'E_INTERNAL',
+      details: { rolledBack: true, targetVersion: 2, targetError: 'abort' },
+    })
+    expect(error.message).toContain('restored')
     expect(test.events).toEqual([
       'lock', 'diagnose-current', 'ownership', 'journal-prepared', 'pull-target',
       'journal-mutating', 'render-target', 'up-target', 'journal-validating',

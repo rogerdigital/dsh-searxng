@@ -18,7 +18,11 @@ export interface DockerAdapter {
    * pull failure never leaves a half-updated runtime behind.
    */
   pull(image: string, signal?: AbortSignal): Promise<void>
-  /** Report whether the exact image reference is present in the local store. */
+  /**
+   * Report whether the exact image reference is present in the local store.
+   * Reserved for crash-recovery decisions (lifecycle Task 5); the update
+   * transaction always pulls unconditionally.
+   */
   imageExists(image: string, signal?: AbortSignal): Promise<boolean>
   /**
    * Optional capability to delete a named temporary Docker resource after

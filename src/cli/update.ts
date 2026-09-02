@@ -6,7 +6,7 @@ import { CliError } from './errors.ts'
 import type { EnvironmentService } from './environment.ts'
 import { validateEndToEnd, type DiagnosticCheck, type DiagnosticSnapshot } from './diagnostics.ts'
 import { recommendRecovery, stateSha256, type JournalStore, type RecoveryRecommendation } from './journal.ts'
-import { bundleComposePath, bundleDirectory, healthyTimestamp, isAbort, stateIdentity } from './managed.ts'
+import { bundleComposePath, bundleDirectory, healthyTimestamp, isAbort, isConfigBundleName, stateIdentity } from './managed.ts'
 import { readPreservedSecretFromBundle, removeBundleForRebuild } from './repair.ts'
 import type { ProfileManager } from './profile.ts'
 import type { SearxngProbe } from './searxng.ts'
@@ -216,7 +216,7 @@ async function stageTarget(
   } catch (error) {
     if (!(error instanceof CliError) || error.code !== 'E_BUNDLE_DAMAGED') throw error
     const bundle = error.details.bundle
-    if (typeof bundle !== 'string' || !/^config-[a-f0-9]{64}$/.test(bundle)) throw error
+    if (typeof bundle !== 'string' || !isConfigBundleName(bundle)) throw error
     await removeBundleForRebuild(input.stateDir, join(input.stateDir, bundle))
     return await dependencies.assets.stage(input)
   }
@@ -378,7 +378,10 @@ export async function updateManagedService(
           throw rollbackFailed(error, rollbackError)
         }
         dependencies.report?.('rolled-back')
-        if (isAbort(error, signal)) throw error
+        // A cancelled update that was successfully rolled back still reports
+        // the rolled-back envelope — swallowing it into a bare cancellation
+        // would hide that the service was restored. Pre-mutation aborts keep
+        // rethrowing the raw cancellation (nothing happened).
         throw updateRolledBack(error, target, managed.current)
       }
 
