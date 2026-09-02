@@ -51,6 +51,8 @@ export interface ProfileAttachmentPreview {
   installed: boolean
   attached: boolean
   config: ProfileAttachmentConfig
+  /** Effective config of the currently recorded target patch, when one is readable. */
+  current?: ProfileAttachmentConfig
 }
 
 export interface ProfileFileSystem {
@@ -439,8 +441,15 @@ export class NodeProfileManager implements ProfileManager {
     const current = parsePatch(source)
     const attached = installed && isCurrentManagedAttachment(current, normalizedEndpoint)
     const output = renderAttachment(parsePatch(source), normalizedEndpoint)
+    let currentConfig: ProfileAttachmentConfig | undefined
+    try { currentConfig = cloneProviderConfig(configFromAttachment(source)) } catch { currentConfig = undefined }
     signal?.throwIfAborted()
-    return { installed, attached, config: cloneProviderConfig(configFromAttachment(output)) }
+    return {
+      installed,
+      attached,
+      config: cloneProviderConfig(configFromAttachment(output)),
+      ...(currentConfig === undefined ? {} : { current: currentConfig }),
+    }
   }
 
   async validate(

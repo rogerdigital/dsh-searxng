@@ -18,8 +18,9 @@ export class SearxngClientError extends Error {
     readonly kind: SearxngClientFailureKind,
     message: string,
     readonly status?: number,
+    options?: { cause?: unknown },
   ) {
-    super(message)
+    super(message, options)
     this.name = 'SearxngClientError'
   }
 }
@@ -213,7 +214,9 @@ async function requestJsonAttempt(
     if (timedOut) throw new SearxngClientError('timeout', 'SearXNG request timed out')
     if (error instanceof SearxngClientError) throw error
     if (isAbortError(error)) throw new SearxngClientError('caller-abort', 'SearXNG request aborted')
-    throw new SearxngClientError('network', 'SearXNG request failed')
+    // The original fetch failure is preserved as the cause chain so callers can
+    // classify TLS-level failures; message content stays redacted.
+    throw new SearxngClientError('network', 'SearXNG request failed', undefined, { cause: error })
   } finally {
     clearTimeout(timer)
     options.signal?.removeEventListener('abort', onCallerAbort)
@@ -224,7 +227,7 @@ async function requestJsonAttempt(
 function normalizeRequestFailure(error: unknown, signal?: AbortSignal): SearxngClientError {
   if (signal?.aborted) return new SearxngClientError('caller-abort', 'SearXNG request aborted')
   if (error instanceof SearxngClientError) return error
-  return new SearxngClientError('network', 'SearXNG request failed')
+  return new SearxngClientError('network', 'SearXNG request failed', undefined, { cause: error })
 }
 
 function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {

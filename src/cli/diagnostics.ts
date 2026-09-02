@@ -205,7 +205,9 @@ export async function inspectSnapshot(
       await dependencies.searxng.realSearch(config, signal)
     } catch (error) {
       rethrowCancellation(error, signal)
-      endpointHealth = error instanceof CliError && error.code === 'E_AUTH_FAILED' ? 'auth-failed' : 'unreachable'
+      endpointHealth = error instanceof CliError && error.code === 'E_AUTH_FAILED'
+        ? 'auth-failed'
+        : error instanceof CliError && error.code === 'E_TLS_FAILED' ? 'tls-failed' : 'unreachable'
     }
   } else {
     endpointHealth = 'unreachable'
@@ -224,7 +226,15 @@ export async function inspectSnapshot(
     generatedAssets,
     port,
     endpoint: endpointHealth,
-    ...(attached ? {} : { profileEndpoint: { profile, expected: expectedEndpoint } }),
+    ...(attached ? {} : {
+      profileEndpoint: {
+        profile,
+        expected: expectedEndpoint,
+        ...(preview?.current !== undefined && preview.current.baseURL !== expectedEndpoint
+          ? { actual: preview.current.baseURL }
+          : {}),
+      },
+    }),
     ownedTemporaryResourceIds: [],
     ...(interruptedOperation === undefined ? {} : { interruptedOperation }),
   }

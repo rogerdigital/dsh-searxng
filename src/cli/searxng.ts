@@ -58,6 +58,23 @@ interface ProbeAttemptResult {
 
 class TransientProbeError extends Error {}
 
+/** Node fetch reports TLS failures as cause chains carrying OpenSSL-style codes. */
+const TLS_FAILURE_CODE = /^(?:ERR_TLS|ERR_SSL|UNABLE_TO_VERIFY_LEAF_SIGNATURE|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|CERT_HAS_EXPIRED|CERT_NOT_YET_VALID|CERT_SIGNATURE_FAILURE|EPROTO)/
+
+function isTlsFailure(error: unknown): boolean {
+  let current: unknown = error
+  while (current !== null && typeof current === 'object') {
+    const code = (current as { code?: unknown }).code
+    if (typeof code === 'string' && TLS_FAILURE_CODE.test(code)) return true
+    current = (current as { cause?: unknown }).cause
+  }
+  return false
+}
+
+function tlsFailed(): CliError {
+  return new CliError('E_TLS_FAILED', 'SearXNG TLS validation failed', 'Check the endpoint certificate, then retry')
+}
+
 class MalformedProbeResponseError extends CliError {
   constructor() {
     super(
@@ -95,6 +112,7 @@ export class DefaultSearxngProbe implements SearxngProbe {
     } catch (error) {
       rethrowCancellation(error, signal)
       if (error instanceof CliError) throw error
+      if (isTlsFailure(error)) throw tlsFailed()
       throw searchFailed('SearXNG HTTP endpoint is unavailable')
     }
   }
@@ -287,6 +305,7 @@ function hasValidHttpUrl(value: unknown): boolean {
 
 function toCliError(error: unknown): CliError {
   if (error instanceof CliError) return error
+  if (isTlsFailure(error)) return tlsFailed()
   if (error !== null && typeof error === 'object' && 'message' in error) {
     const message = String(error.message)
     if (/non-JSON|malformed JSON/i.test(message)) {

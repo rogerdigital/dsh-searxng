@@ -44,6 +44,33 @@ describe('SearXNG HTTP diagnostics', () => {
     const fetchMock = vi.fn().mockImplementation(async () => { controller.abort(cancellation); throw cancellation })
     await expect(new DefaultSearxngProbe().http({ baseURL: BASE, fetch: fetchMock }, controller.signal)).rejects.toBe(cancellation)
   })
+
+  it.each([
+    'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+    'DEPTH_ZERO_SELF_SIGNED_CERT',
+    'SELF_SIGNED_CERT_IN_CHAIN',
+    'CERT_HAS_EXPIRED',
+    'ERR_TLS_CERT_ALTNAME_INVALID',
+    'ERR_SSL_PROTOCOL_ERROR',
+  ] as const)('classifies a TLS fetch cause (%s) as E_TLS_FAILED', async (causeCode) => {
+    const failure = Object.assign(new Error('fetch failed'), {
+      cause: Object.assign(new Error('tls failure'), { code: causeCode }),
+    })
+    const probe = new DefaultSearxngProbe()
+    await expect(probe.http({ baseURL: 'https://127.0.0.1:8443', fetch: vi.fn().mockRejectedValue(failure) }))
+      .rejects.toMatchObject({ code: 'E_TLS_FAILED' })
+    await expect(probe.realSearch({ baseURL: 'https://127.0.0.1:8443', fetch: vi.fn().mockRejectedValue(failure) }))
+      .rejects.toMatchObject({ code: 'E_TLS_FAILED' })
+  })
+
+  it('keeps a plain connection failure as E_SEARCH_FAILED', async () => {
+    const failure = Object.assign(new Error('fetch failed'), {
+      cause: Object.assign(new Error('connect'), { code: 'ECONNREFUSED' }),
+    })
+    const probe = new DefaultSearxngProbe()
+    await expect(probe.http({ baseURL: 'https://127.0.0.1:8443', fetch: vi.fn().mockRejectedValue(failure) }))
+      .rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
+  })
 })
 
 describe('probeSearxng', () => {

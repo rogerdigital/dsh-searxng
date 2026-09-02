@@ -262,7 +262,7 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
       }
       const result = await executeRepair(plan, repairDependencies, options.signal)
       if (format === 'json') {
-        presentSuccess({ profile: command.profile, endpoint: plan.endpoint, healthy: true, actions: result.actions }, presenter)
+        presentSuccess({ profile: command.profile, endpoint: plan.endpoint, healthy: true, actions: result.actions, checks: result.checks }, presenter)
       } else {
         stdout([
           'SearXNG healthy',

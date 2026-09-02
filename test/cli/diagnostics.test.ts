@@ -128,8 +128,10 @@ function snapshotHarness(options: {
   assets?: 'valid' | 'missing' | 'invalid'
   portOccupied?: boolean
   authFailed?: boolean
+  tlsFailed?: boolean
   searchFailed?: boolean
   attached?: boolean
+  currentEndpoint?: string
   journal?: OperationJournal
   profileMissing?: boolean
 } = {}) {
@@ -173,7 +175,12 @@ function snapshotHarness(options: {
       inspect: vi.fn(), attach: vi.fn(), detach: vi.fn(), uninstall: vi.fn(), validate: vi.fn(),
       preview: vi.fn(async () => {
         calls.push('profile')
-        return { installed: options.attached ?? true, attached: options.attached ?? true, config: { baseURL: ENDPOINT } }
+        return {
+          installed: options.attached ?? true,
+          attached: options.attached ?? true,
+          config: { baseURL: ENDPOINT },
+          ...(options.currentEndpoint === undefined ? {} : { current: { baseURL: options.currentEndpoint } }),
+        }
       }),
     },
     searxng: {
@@ -182,6 +189,7 @@ function snapshotHarness(options: {
       realSearch: vi.fn(async () => {
         calls.push('search')
         if (options.authFailed) throw new CliError('E_AUTH_FAILED', 'auth', 'check header')
+        if (options.tlsFailed) throw new CliError('E_TLS_FAILED', 'tls', 'check certificate')
         if (options.searchFailed) throw new CliError('E_SEARCH_FAILED', 'down', 'doctor')
         return { endpoint: ENDPOINT, resultCount: 1, elapsedMs: 1 }
       }),
@@ -248,6 +256,12 @@ describe('inspectSnapshot', () => {
     expect(snapshot).toMatchObject({ endpoint: 'auth-failed' })
   })
 
+  it('classifies a TLS failure distinctly as tls-failed', async () => {
+    const test = snapshotHarness({ tlsFailed: true })
+    const snapshot = await inspectSnapshot('web', test.dependencies)
+    expect(snapshot).toMatchObject({ endpoint: 'tls-failed' })
+  })
+
   it('classifies a generic endpoint failure as unreachable', async () => {
     const test = snapshotHarness({ searchFailed: true })
     const snapshot = await inspectSnapshot('web', test.dependencies)
@@ -260,7 +274,13 @@ describe('inspectSnapshot', () => {
     expect(snapshot).toMatchObject({ container: 'missing', generatedAssets: 'valid', port: 'available' })
   })
 
-  it('reports a stale attachment as a profile endpoint mismatch', async () => {
+  it('reports a stale attachment as a profile endpoint mismatch with its live endpoint', async () => {
+    const test = snapshotHarness({ attached: false, currentEndpoint: 'http://drifted.invalid' })
+    const snapshot = await inspectSnapshot('web', test.dependencies)
+    expect(snapshot.profileEndpoint).toEqual({ profile: 'web', expected: ENDPOINT, actual: 'http://drifted.invalid' })
+  })
+
+  it('omits the live endpoint when no attachment config is readable', async () => {
     const test = snapshotHarness({ attached: false })
     const snapshot = await inspectSnapshot('web', test.dependencies)
     expect(snapshot.profileEndpoint).toEqual({ profile: 'web', expected: ENDPOINT })

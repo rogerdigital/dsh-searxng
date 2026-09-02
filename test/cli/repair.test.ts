@@ -1,8 +1,8 @@
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { SEARXNG_IMAGE } from '../../src/cli/assets.ts'
+import { FileAssetRenderer, SEARXNG_IMAGE, type AssetRenderer } from '../../src/cli/assets.ts'
 import type { DockerAdapter } from '../../src/cli/docker.ts'
 import { CliError } from '../../src/cli/errors.ts'
 import type { EnvironmentService } from '../../src/cli/environment.ts'
@@ -137,8 +137,8 @@ describe('planRepair', () => {
     ['occupied foreign port', snapshot({ container: 'missing', port: 'foreign' }), 'E_PORT_CONFLICT'],
     ['Docker offline', snapshot({ docker: 'offline', endpoint: 'unreachable' }), 'E_DOCKER_OFFLINE'],
     ['external endpoint failure', externalSnapshot({ endpoint: 'unreachable' }), 'E_SEARCH_FAILED'],
-    ['TLS failure', snapshot({ endpoint: 'tls-failed' }), 'E_SEARCH_FAILED'],
-    ['external TLS failure', externalSnapshot({ endpoint: 'tls-failed' }), 'E_SEARCH_FAILED'],
+    ['TLS failure', snapshot({ endpoint: 'tls-failed' }), 'E_TLS_FAILED'],
+    ['external TLS failure', externalSnapshot({ endpoint: 'tls-failed' }), 'E_TLS_FAILED'],
     ['authentication failure', snapshot({ endpoint: 'auth-failed' }), 'E_AUTH_FAILED'],
     ['external authentication failure', externalSnapshot({ endpoint: 'auth-failed' }), 'E_AUTH_FAILED'],
   ] as const)('blocks repair for %s with one CliError and no actions', (_name, input, code) => {
@@ -161,7 +161,7 @@ describe('planRepair', () => {
   )
 })
 
-function managedState(): StateV2 {
+function managedState(configurationSha256: string = PERSISTED_HASH): StateV2 {
   return {
     schemaVersion: 2,
     homeId: HOME_ID,
@@ -173,7 +173,7 @@ function managedState(): StateV2 {
         port: 8080,
         projectName: PROJECT,
         containerName: PROJECT,
-        configurationSha256: PERSISTED_HASH,
+        configurationSha256,
       },
       lastHealthyAt: '2026-08-29T00:00:00.000Z',
     },
@@ -229,17 +229,22 @@ interface HarnessOptions {
   realSearchError?: unknown
   readSecretError?: unknown
   supportRemoveOwnedResource?: boolean
+  managedDir?: string
+  assetsRenderer?: AssetRenderer
+  renderFailures?: number
+  useProductionSecretReader?: boolean
 }
 
 function executorHarness(options: HarnessOptions = {}) {
   const events: string[] = []
   const writes: StateV2[] = []
+  const managedDir = options.managedDir ?? MANAGED_DIR
   let state = structuredClone(options.state ?? managedState())
   const journal = fakeJournalStore(events, options.journal)
   const environment: EnvironmentService = {
     resolve: vi.fn(async (profile: string) => {
       events.push('environment')
-      return { dshHome: '/tmp/dsh', profileDir: `/tmp/dsh/profiles/${profile}`, managedDir: MANAGED_DIR, homeId: HOME_ID }
+      return { dshHome: '/tmp/dsh', profileDir: `/tmp/dsh/profiles/${profile}`, managedDir, homeId: HOME_ID }
     }),
     preflightManaged: vi.fn(async () => {}),
     preflightDsh: vi.fn(async () => {}),
@@ -264,10 +269,15 @@ function executorHarness(options: HarnessOptions = {}) {
   if (options.supportRemoveOwnedResource) {
     docker.removeOwnedResource = vi.fn(async (resourceId: string) => { events.push(`remove-resource:${resourceId}`) })
   }
-  const assets = {
+  let renderFailures = options.renderFailures ?? 0
+  const assets: AssetRenderer = options.assetsRenderer ?? {
     render: vi.fn(async (input: { identity: { stateDir: string }; port: number }) => {
       events.push('render')
-      expect(input.identity.stateDir).toBe(MANAGED_DIR)
+      expect(input.identity.stateDir).toBe(managedDir)
+      if (renderFailures > 0) {
+        renderFailures -= 1
+        throw new CliError('E_STATE_INVALID', 'Managed configuration bundle does not match its identity', 'repair the bundle')
+      }
       return { composePath: COMPOSE_PATH, configurationSha256: RENDERED_HASH }
     }),
   }
@@ -321,7 +331,7 @@ function executorHarness(options: HarnessOptions = {}) {
     searxng,
     profiles,
     diagnose: vi.fn(async () => { throw new Error('executeRepair must not call diagnose') }),
-    readPreservedSecret,
+    ...(options.useProductionSecretReader === true ? {} : { readPreservedSecret }),
     now: () => new Date(START),
   }
   return {
@@ -340,7 +350,17 @@ describe('executeRepair', () => {
     const plan = test.planFor({ container: 'stopped', port: 'available' })
     const result = await executeRepair(plan, test.dependencies)
 
-    expect(result).toEqual({ actions: [{ type: 'restart-container' }], healthy: true })
+    expect(result).toEqual({
+      actions: [{ type: 'restart-container' }],
+      checks: [
+        { id: 'http', status: 'pass', message: 'SearXNG HTTP endpoint is reachable' },
+        { id: 'json', status: 'pass', message: 'SearXNG JSON API is enabled' },
+        { id: 'search', status: 'pass', message: 'SearXNG returned a real search result' },
+        { id: 'profile', status: 'pass', message: 'DSH profile has the expected managed attachment' },
+        { id: 'provider', status: 'pass', message: 'DSH provider search returned a result' },
+      ],
+      healthy: true,
+    })
     expect(test.events).toEqual([
       'lock', 'state-read', 'journal-read', 'environment', 'docker-preflight', 'ownership',
       'journal-begin', 'journal-mutating', 'docker-restart', 'journal-validating',
@@ -382,6 +402,24 @@ describe('executeRepair', () => {
     expect(test.events.filter((event) => event === 'render' || event.startsWith('docker-'))).toEqual([
       'docker-preflight', 'render', 'docker-down:false', 'docker-up',
     ])
+  })
+
+  it('retries a damaged bundle render exactly once by removing the recorded bundle directory', async () => {
+    const test = executorHarness({ renderFailures: 1 })
+    const plan = test.planFor({ generatedAssets: 'invalid', container: 'missing', port: 'available' })
+    const result = await executeRepair(plan, test.dependencies)
+    expect(result.healthy).toBe(true)
+    expect(test.assets.render).toHaveBeenCalledTimes(2)
+    expect(test.events.filter((event) => event === 'render')).toEqual(['render', 'render'])
+  })
+
+  it('propagates a persistent bundle-render failure after the single rebuild retry', async () => {
+    const test = executorHarness({ renderFailures: 3 })
+    const plan = test.planFor({ generatedAssets: 'invalid', container: 'missing', port: 'available' })
+    await expect(executeRepair(plan, test.dependencies)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+    expect(test.assets.render).toHaveBeenCalledTimes(2)
+    expect(test.journal.active()).toMatchObject({ kind: 'repair', phase: 'mutating' })
+    expect(test.writes).toEqual([])
   })
 
   it('refuses to invent a secret when the bundle cannot preserve it and leaves the journal at mutating', async () => {
@@ -536,6 +574,89 @@ function cliHarness(options: { container?: 'running' | 'stopped' } = {}) {
   return { ...test, dependencies: dependencies as unknown as NonNullable<Parameters<typeof runCli>[1]>['dependencies'] }
 }
 
+describe('executeRepair bundle rebuild (real filesystem)', () => {
+  async function renderedBundle(root: string) {
+    const renderer = new FileAssetRenderer({ assetRoot: new URL('../../assets/docker/', import.meta.url) })
+    const stateDir = join(root, 'dsh-searxng')
+    const rendered = await renderer.render({
+      stateDir,
+      identity: {
+        stateDir,
+        composePath: join(stateDir, `config-${'0'.repeat(64)}`, 'compose.yml'),
+        homeId: HOME_ID,
+        projectName: PROJECT,
+        containerName: PROJECT,
+      },
+      image: SEARXNG_IMAGE,
+      port: 8080,
+      secret: PRESERVED_SECRET,
+    })
+    return {
+      renderer,
+      bundleDir: dirname(rendered.composePath),
+      digest: rendered.configurationSha256,
+      render: vi.spyOn(renderer, 'render'),
+    }
+  }
+
+  it('rebuilds a damaged same-digest bundle with the preserved secret and identical digest', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-searxng-rebuild-'))
+    try {
+      const bundle = await renderedBundle(root)
+      // Damage the bundle while keeping the secret source intact.
+      await rm(join(bundle.bundleDir, '.env'))
+
+      const test = executorHarness({
+        managedDir: join(root, 'dsh-searxng'),
+        assetsRenderer: bundle.renderer,
+        useProductionSecretReader: true,
+        state: managedState(bundle.digest),
+      })
+      const plan = test.planFor({ generatedAssets: 'invalid', container: 'missing', port: 'available' })
+      const result = await executeRepair(plan, test.dependencies)
+
+      expect(result.healthy).toBe(true)
+      expect(bundle.render).toHaveBeenCalledTimes(2)
+      await expect(readFile(join(bundle.bundleDir, '.env'), 'utf8')).resolves.toContain(`DSH_SEARXNG_IMAGE=${SEARXNG_IMAGE}`)
+      await expect(readFile(join(bundle.bundleDir, 'compose.yml'), 'utf8')).resolves.not.toBe('')
+      await expect(readFile(join(bundle.bundleDir, 'searxng', 'settings.yml'), 'utf8'))
+        .resolves.toContain(`secret_key: ${PRESERVED_SECRET}`)
+      expect(test.state().managed?.current.configurationSha256).toBe(bundle.digest)
+      expect(test.state().managed?.lastHealthyAt).toBe(START)
+      expect(test.docker.down).toHaveBeenCalledWith(expect.objectContaining({ composePath: join(bundle.bundleDir, 'compose.yml') }), false, undefined)
+      expect(test.docker.up).toHaveBeenCalledWith(expect.objectContaining({ composePath: join(bundle.bundleDir, 'compose.yml') }), undefined)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('fails closed and never rotates the secret when no owned artifact preserves it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-searxng-rebuild-'))
+    try {
+      const bundle = await renderedBundle(root)
+      await rm(join(bundle.bundleDir, 'searxng', 'settings.yml'))
+
+      const test = executorHarness({
+        managedDir: join(root, 'dsh-searxng'),
+        assetsRenderer: bundle.renderer,
+        useProductionSecretReader: true,
+        state: managedState(bundle.digest),
+      })
+      const plan = test.planFor({ generatedAssets: 'invalid', container: 'missing', port: 'available' })
+      await expect(executeRepair(plan, test.dependencies)).rejects.toMatchObject({
+        code: 'E_STATE_INVALID',
+        action: expect.stringContaining('setup'),
+      })
+      expect(bundle.render).not.toHaveBeenCalled()
+      expect(test.journal.active()).toMatchObject({ kind: 'repair', phase: 'mutating' })
+      expect(test.writes).toEqual([])
+      await expect(readFile(join(bundle.bundleDir, 'searxng', 'settings.yml'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('readPreservedSecretFromBundle', () => {
   it('reads the secret from an existing bundle without altering it', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-searxng-secret-'))
@@ -590,7 +711,7 @@ describe('repair CLI', () => {
     expect(test.events).toContain('docker-restart')
   })
 
-  it('emits exactly one JSON envelope containing the action identifiers', async () => {
+  it('emits exactly one JSON envelope containing the action identifiers and redacted checks', async () => {
     const test = cliHarness({ container: 'stopped' })
     const stdout: string[] = []
     const stderr: string[] = []
@@ -607,6 +728,13 @@ describe('repair CLI', () => {
       endpoint: ENDPOINT,
       healthy: true,
       actions: [{ type: 'restart-container' }],
+      checks: [
+        { id: 'http', status: 'pass', message: 'SearXNG HTTP endpoint is reachable' },
+        { id: 'json', status: 'pass', message: 'SearXNG JSON API is enabled' },
+        { id: 'search', status: 'pass', message: 'SearXNG returned a real search result' },
+        { id: 'profile', status: 'pass', message: 'DSH profile has the expected managed attachment' },
+        { id: 'provider', status: 'pass', message: 'DSH provider search returned a result' },
+      ],
     })
   })
 

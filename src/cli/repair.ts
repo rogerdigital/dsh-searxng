@@ -1,5 +1,5 @@
-import { readFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { lstat, readFile, rm } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
 import { parse } from 'yaml'
 import type { AssetRenderer, ManagedIdentity } from './assets.ts'
 import type { DockerAdapter } from './docker.ts'
@@ -9,7 +9,7 @@ import { recommendRecovery, stateSha256, type JournalStore, type OperationJourna
 import type { ProfileAttachmentPreview, ProfileManager } from './profile.ts'
 import type { SearxngProbe } from './searxng.ts'
 import type { DeploymentSnapshot, StateStore, StateV2 } from './state.ts'
-import type { DiagnosticSnapshot } from './diagnostics.ts'
+import type { DiagnosticCheck, DiagnosticSnapshot } from './diagnostics.ts'
 
 export type RepairAction =
   | { type: 'restart-container' }
@@ -46,6 +46,8 @@ export interface RepairDependencies {
 
 export interface RepairResult {
   actions: RepairAction[]
+  /** Validating-phase outcomes with the same shape and redaction as doctor checks. */
+  checks: DiagnosticCheck[]
   healthy: true
 }
 
@@ -74,7 +76,7 @@ function authFailed(): CliError {
 }
 
 function tlsFailed(): CliError {
-  return new CliError('E_SEARCH_FAILED', 'SearXNG TLS validation failed', 'Check the endpoint certificate, then retry')
+  return new CliError('E_TLS_FAILED', 'SearXNG TLS validation failed', 'Check the endpoint certificate, then retry')
 }
 
 function externalEndpointFailed(): CliError {
@@ -111,6 +113,39 @@ function secretUnavailable(): CliError {
     'The managed SearXNG secret cannot be preserved because the configuration bundle is unreadable',
     'Run dsh-searxng setup to re-create the managed deployment',
   )
+}
+
+function unsafeBundleRemoval(): CliError {
+  return new CliError(
+    'E_STATE_INVALID',
+    'The damaged managed configuration bundle cannot be rebuilt safely',
+    'Run dsh-searxng doctor and repair the managed configuration directory',
+  )
+}
+
+/**
+ * Remove exactly the recorded configuration bundle directory so the
+ * content-addressed renderer can rebuild a damaged same-digest bundle. The
+ * removal is ownership-bounded like remove.ts: only a direct `config-<sha256>`
+ * child of the managed directory, never a symlink or any path outside it.
+ */
+async function removeBundleForRebuild(managedDir: string, bundleDir: string): Promise<void> {
+  if (dirname(bundleDir) !== managedDir || !/^config-[a-f0-9]{64}$/.test(basename(bundleDir))) {
+    throw unsafeBundleRemoval()
+  }
+  let info: Awaited<ReturnType<typeof lstat>>
+  try {
+    info = await lstat(bundleDir)
+  } catch (error) {
+    if (error !== null && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return
+    throw unsafeBundleRemoval()
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) throw unsafeBundleRemoval()
+  try {
+    await rm(bundleDir, { recursive: true })
+  } catch {
+    throw unsafeBundleRemoval()
+  }
 }
 
 function validationFailed(error: unknown): CliError {
@@ -283,7 +318,8 @@ async function validateRepaired(
   plan: RepairPlan,
   dependencies: RepairDependencies,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<DiagnosticCheck[]> {
+  const checks: DiagnosticCheck[] = []
   let preview: ProfileAttachmentPreview | undefined
   try {
     preview = await dependencies.profiles.preview(plan.profile, plan.endpoint, signal)
@@ -292,17 +328,23 @@ async function validateRepaired(
   }
   const config = preview?.config ?? { baseURL: plan.endpoint }
   await dependencies.searxng.http(config, signal)
+  checks.push({ id: 'http', status: 'pass', message: 'SearXNG HTTP endpoint is reachable' })
   await dependencies.searxng.readiness({ ...config, attempts: 1, timeoutMs: 10_000 }, signal)
+  checks.push({ id: 'json', status: 'pass', message: 'SearXNG JSON API is enabled' })
   await dependencies.searxng.realSearch(config, signal)
+  checks.push({ id: 'search', status: 'pass', message: 'SearXNG returned a real search result' })
   if (preview === undefined || !preview.installed || !preview.attached) {
     throw new CliError('E_SEARCH_FAILED', 'The DSH profile attachment is missing or outdated after repair', 'Re-run dsh-searxng repair')
   }
+  checks.push({ id: 'profile', status: 'pass', message: 'DSH profile has the expected managed attachment' })
   await dependencies.profiles.validate(
     plan.profile,
     plan.endpoint,
     async (validated) => { await dependencies.searxng.providerSearch(validated, signal) },
     signal,
   )
+  checks.push({ id: 'provider', status: 'pass', message: 'DSH provider search returned a result' })
+  return checks
 }
 
 interface ActionContext {
@@ -338,14 +380,23 @@ async function executeAction(
       const bundleDir = bundleDirectory(managedDir, state.managed.current, composePath)
       if (bundleDir === undefined) throw secretUnavailable()
       const secret = await (dependencies.readPreservedSecret ?? readPreservedSecretFromBundle)(bundleDir)
-      const rendered = await dependencies.assets.render({
+      const input = {
         stateDir: identity.stateDir,
         identity,
         image: state.managed.current.image,
         port: state.managed.current.port,
         secret,
-      })
-      return rendered
+      }
+      try {
+        return await dependencies.assets.render(input)
+      } catch (error) {
+        // The content-addressed renderer refuses to overwrite a damaged bundle
+        // that carries the same digest; rebuild it deterministically from the
+        // recorded state and re-render with the preserved secret.
+        if (!(error instanceof CliError) || error.code !== 'E_STATE_INVALID') throw error
+        await removeBundleForRebuild(managedDir, bundleDir)
+        return await dependencies.assets.render(input)
+      }
     }
     case 'recreate-runtime': {
       if (identity === undefined || state.managed === undefined) {
@@ -439,8 +490,9 @@ export async function executeRepair(
       }
 
       await dependencies.journal.transition(journal.id, 'validating')
+      let checks: DiagnosticCheck[]
       try {
-        await validateRepaired(plan, dependencies, signal)
+        checks = await validateRepaired(plan, dependencies, signal)
       } catch (error) {
         if (isAbort(error, signal)) throw error
         throw validationFailed(error)
@@ -449,7 +501,7 @@ export async function executeRepair(
       const next = repairedState(state, plan, dependencies, rendered?.configurationSha256)
       await dependencies.state.write(next)
       await dependencies.journal.clear(journal.id)
-      return { actions: plan.actions, healthy: true as const }
+      return { actions: plan.actions, checks, healthy: true as const }
     })
   } catch (error) {
     if (error instanceof CliError) throw error
