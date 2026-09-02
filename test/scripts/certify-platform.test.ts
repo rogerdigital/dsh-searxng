@@ -1,9 +1,12 @@
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { RESOURCE_LABELS } from '../../src/cli/docker.ts'
 import { homeId } from '../../src/cli/environment.ts'
 import {
   CERTIFY_CHECKS,
   CertificationError,
+  HOME_ID_LABEL,
+  MANAGED_LABEL,
   certifyHomeId,
   parseCertifyArgs,
   preflightCertification,
@@ -214,6 +217,15 @@ describe('certifyHomeId', () => {
   })
 })
 
+describe('ownership labels', () => {
+  it('pins the runner label keys to the CLI resource labels', () => {
+    // If either side drifts, the runner's cleanup filter stops matching the
+    // resources the CLI stamps and the sweep silently becomes a no-op.
+    expect(MANAGED_LABEL).toBe(RESOURCE_LABELS.managed)
+    expect(HOME_ID_LABEL).toBe(RESOURCE_LABELS.homeId)
+  })
+})
+
 describe('redactText', () => {
   it('masks secret-looking assignments and keeps ordinary output', () => {
     expect(redactText('server:\n  secret_key: abc123\n  limiter: false\n'))
@@ -302,6 +314,7 @@ describe('runCertification', () => {
     expect(report.diagnostics).toBeUndefined()
     for (const name of CERTIFY_CHECKS) expect(report.checks[name]).toBe('pass')
     expect(report.checks.cleanup).toBe('pass')
+    expect(report.cleanupProblems).toBeUndefined()
 
     // The isolated home lives under the temporary root, never the user home.
     expect(dshHome.startsWith(tempRoot)).toBe(true)
@@ -390,5 +403,30 @@ describe('runCertification', () => {
     const removals = world.calls.filter((call) => call.file === 'docker' && call.args.includes('rm'))
     expect(removals.length).toBeGreaterThan(0)
     expect(removals.every((call) => !call.args.includes('foreign123'))).toBe(true)
+  })
+
+  it('records why cleanup failed alongside the step failure instead of dropping the cause', async () => {
+    const journeyWithBrokenSweep: Respond = (file, args) => {
+      if (file === 'node' && args[0]?.endsWith('cli.mjs') && args[1] === 'setup') {
+        return { code: 1, stderr: `${JSON.stringify({ code: 'E_DOCKER_OFFLINE', message: 'The Docker daemon is unavailable', action: 'Start Docker' })}\n` }
+      }
+      if (file === 'docker' && args[0] === 'container' && args[1] === 'ls') return { code: 0, stdout: '' }
+      if (file === 'docker' && args[0] === 'network' && args[1] === 'ls') return { code: 1, stderr: 'docker: network listing failed' }
+      if (file === 'docker' && args[0] === 'volume' && args[1] === 'ls') return { code: 0, stdout: '' }
+      return createHappyJourney().respond(file, args, new FakeWorld(() => undefined))
+    }
+
+    const world = new FakeWorld(journeyWithBrokenSweep)
+    seedInstalledPackage(world)
+    const { report, exitCode } = await runJourney(world)
+
+    expect(exitCode).toBe(1)
+    expect(report.checks.setup).toBe('fail')
+    expect(report.checks.cleanup).toBe('fail')
+    // The step failure stays the headline diagnostics...
+    expect(report.diagnostics?.message).toContain('setup did not complete')
+    // ...and the cleanup failure keeps its own recorded cause.
+    expect(report.cleanupProblems).toBeDefined()
+    expect(report.cleanupProblems?.join('\n')).toContain('network')
   })
 })

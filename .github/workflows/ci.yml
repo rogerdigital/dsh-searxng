@@ -132,6 +132,9 @@ jobs:
           chmod +x "$RUNNER_TEMP/stub-bin/dsh"
           echo "$RUNNER_TEMP/stub-bin" >> "$GITHUB_PATH"
       - name: Certify the packed artifact
+        # shell: bash runs with -eo pipefail; the default run shell has no
+        # pipefail, which would let `tee` mask a failed certification.
+        shell: bash
         run: |
           tarball="$(find node_modules/.cache/pack -maxdepth 1 -name '*.tgz' -print -quit)"
           pnpm certify:platform -- --tarball "$tarball" | tee "$RUNNER_TEMP/certification-report.json"

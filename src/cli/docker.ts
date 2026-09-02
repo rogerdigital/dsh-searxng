@@ -106,7 +106,12 @@ function composeMajor(version: string): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined
 }
 
-const RESOURCE_LABELS = {
+/**
+ * Ownership labels stamped on every managed Docker resource. Exported for the
+ * certification runner's contract test, which pins the runner's copy of the
+ * label keys so cleanup can never silently become a no-op through drift.
+ */
+export const RESOURCE_LABELS = {
   managed: 'io.dsh-searxng.managed',
   homeId: 'io.dsh-searxng.home-id',
   schema: 'io.dsh-searxng.schema',

@@ -29,6 +29,11 @@ pnpm certify:platform -- --tarball "$PWD/node_modules/.cache/pack/dsh-searxng-<v
 echo "exit: $?"
 ```
 
+`sha256sum` is the Linux spelling; on native macOS use `shasum -a 256` and on Windows
+`certutil -hashfile <tarball> SHA256` (or `Get-FileHash` in PowerShell). The runner's recorded
+`tarballSha256` is the authoritative value — compare it against the local hash before accepting
+the report.
+
 The runner refuses to start unless `dsh`, Docker, Compose v2, Node, and the
 tarball are present. It installs the tarball into a throwaway npm project with
 an isolated temporary `DSH_HOME`, never modifies the real package or any user

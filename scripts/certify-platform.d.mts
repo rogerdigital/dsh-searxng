@@ -64,6 +64,8 @@ export interface CertificationReport {
   durationMs: number
   checks: Record<string, CertifyCheckStatus>
   notes: string[]
+  /** Present only when cleanup failed: why, recorded even alongside step diagnostics. */
+  cleanupProblems?: string[]
   diagnostics?: {
     message: string
     command?: readonly string[]

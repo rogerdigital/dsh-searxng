@@ -139,7 +139,7 @@ await writeFile(path, JSON.stringify(manifest) + '\\n')
           image: current.image,
           composeAsset: current.composeAsset,
           settingsAsset: faultAsset,
-          stateSchemas: [2],
+          stateSchemas: [...current.stateSchemas],
         }],
       }, null, 2)}\n`)
       const updateFailure = await exec(cli, ['update', '--profile', 'web', '--deployment-version', '2', '--json'], { env: environment, timeout: 240_000 })

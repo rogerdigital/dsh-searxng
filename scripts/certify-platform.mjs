@@ -299,6 +299,8 @@ export async function runCertification(input) {
   const checks = Object.fromEntries(CERTIFY_CHECKS.map((name) => [name, 'skip']))
   let diagnostics
   let cleanup = 'pass'
+  /** Why cleanup failed, recorded even when a step failure already set diagnostics. */
+  const cleanupProblems = []
   let packageVersion = preflight.packageVersion ?? 'unknown'
   let injectedVersion
 
@@ -471,11 +473,17 @@ export async function runCertification(input) {
     assert(DIGEST_PINNED_IMAGE.test(image), 'cannot inject a synthetic deployment without a digest-pinned image')
 
     // The injection below touches only this run's temporary installed copy.
+    // The synthetic entry copies the state schemas of the catalog entry the
+    // current deployment runs on, so a future schema bump does not dead-end
+    // the runner with a misleading unsupported-schema failure.
     const catalogPath = join(packageRoot(), 'assets', 'deployments', 'v1.json')
     const catalog = parseJson(await fileSystem.readFile(catalogPath), 'The installed deployment catalog')
     const deployments = catalog?.deployments
     assert(Array.isArray(deployments) && deployments.length > 0, 'The installed deployment catalog is empty')
     assert(deployments.every((entry) => entry?.deploymentVersion !== targetVersion), 'The installed catalog already ships the synthetic target version')
+    const baseEntry = deployments.find((entry) => entry?.deploymentVersion === Number(current.deploymentVersion)) ?? deployments[deployments.length - 1]
+    const stateSchemas = baseEntry?.stateSchemas
+    assert(Array.isArray(stateSchemas) && stateSchemas.length > 0, 'The installed catalog entry has no state schemas to copy')
     const templatePath = join(packageRoot(), 'assets', 'docker', 'settings.yml.template')
     const template = await fileSystem.readFile(templatePath)
     const jsonItems = template.match(JSON_LIST_ITEM_GLOBAL)
@@ -491,7 +499,7 @@ export async function runCertification(input) {
         image,
         composeAsset: 'docker/compose.yml',
         settingsAsset: faultAsset,
-        stateSchemas: [2],
+        stateSchemas: [...stateSchemas],
       }],
     }, null, 2)}\n`)
     injectedVersion = targetVersion
@@ -569,29 +577,32 @@ export async function runCertification(input) {
   }
 
   async function cleanupEverything() {
-    const problems = []
     if (cliInstalled && setupAttempted) {
       try {
         await runCli(['remove', '--profile', profile, '--service', '--purge-data', '--yes'], { timeoutMs: TIMEOUTS.remove })
       } catch {
-        // The sweep below is the authority; a refused remove (for example
-        // because the journey already removed everything) is not a failure.
+        // Tolerated by design: the CLI legitimately refuses once the journey
+        // already removed everything; the sweep below is the cleanup
+        // authority and records any genuine residual-resource failure.
       }
     }
     try {
       await sweepOwnedResources()
       await assertNoOwnedResources()
     } catch (error) {
-      problems.push(error instanceof Error ? error.message : String(error))
+      cleanupProblems.push(error instanceof Error ? error.message : String(error))
     }
     try {
       await fileSystem.removeTree(tempRoot)
     } catch (error) {
-      problems.push(`temporary directory removal failed: ${error instanceof Error ? error.message : String(error)}`)
+      cleanupProblems.push(`temporary directory removal failed: ${error instanceof Error ? error.message : String(error)}`)
     }
-    if (problems.length > 0) {
+    if (cleanupProblems.length > 0) {
       cleanup = 'fail'
-      diagnostics ??= { message: `cleanup problems: ${problems.join('; ')}` }
+      // Only when no step failed does the cleanup reason itself become the
+      // headline diagnostics; otherwise it stays in cleanupProblems so both
+      // the failure and the residual-resource cause remain visible.
+      diagnostics ??= { message: `cleanup problems: ${cleanupProblems.join('; ')}` }
     }
   }
 
@@ -650,6 +661,7 @@ export async function runCertification(input) {
       'repair: the generated bundle .env was deleted (settings.yml intact) to force the render-assets rebuild path',
       `cleanup: only Docker resources whose inspect output carries ${MANAGED_LABEL}=true and ${HOME_ID_LABEL}=${homeId} are removed`,
     ],
+    ...(cleanupProblems.length > 0 ? { cleanupProblems } : {}),
     ...(diagnostics === undefined ? {} : { diagnostics }),
   }
 
