@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "deployments": [
+    {
+      "deploymentVersion": 1,
+      "image": "ghcr.io/searxng/searxng:2026.8.20-8d3dd0cd4@sha256:e7bb47bebf338c52c55c7bed92293873cfe757b554b261829c0d710fd8307fa3",
+      "composeAsset": "docker/compose.yml",
+      "settingsAsset": "docker/settings.yml.template",
+      "stateSchemas": [1, 2]
+    }
+  ]
+}

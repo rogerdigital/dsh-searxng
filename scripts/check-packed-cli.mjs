@@ -59,6 +59,7 @@ try {
   await Promise.all([
     access(join(packageRoot, 'assets', 'docker', 'compose.yml')),
     access(join(packageRoot, 'assets', 'docker', 'settings.yml.template')),
+    access(join(packageRoot, 'assets', 'deployments', 'v1.json')),
   ])
   process.stdout.write('Packed CLI and Docker assets verified\n')
 } finally {
