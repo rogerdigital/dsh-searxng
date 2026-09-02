@@ -1,6 +1,7 @@
-<!-- Destination: a community "Show Your Plugins" / plugin release thread, posted
-     from the dsh-searxng maintainer's account — the adopter voice, complementing
-     dsh-vet's own announcements. Facts verified against the live report on
+<!-- Published: https://github.com/deepseek-ai/deepseek-harness/discussions/5451
+     Ownership: maintainer-owned adoption case, not evidence of third-party
+     emitter or marketplace adoption. Posted from the dsh-searxng maintainer's
+     account to Show Your Plugins. Facts verified against the live report on
      dsh-searxng's dsh-vet/report branch (grade A, scanner 0.2.6) and the
      0.1.0-era first audit (grade C, committed in dsh-vet's examples/). -->
 
