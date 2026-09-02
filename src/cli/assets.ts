@@ -2,9 +2,10 @@ import { createHash, randomBytes } from 'node:crypto'
 import { constants } from 'node:fs'
 import { chmod, lstat, mkdir, open, readFile, rename, rm } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { parse, stringify } from 'yaml'
 import { CliError } from './errors.ts'
+import { isDigestPinnedImage, isSafeAssetPath, type DeploymentDefinition } from './deployments.ts'
 
 export const SEARXNG_IMAGE =
   'ghcr.io/searxng/searxng:2026.8.20-8d3dd0cd4@sha256:e7bb47bebf338c52c55c7bed92293873cfe757b554b261829c0d710fd8307fa3'
@@ -26,7 +27,34 @@ export interface AssetRenderer {
     image: string
     port: number
     secret: string
+    /** Deployment version stamped into the environment; the create path defaults to 1. */
+    deploymentVersion?: number
   }): Promise<{ composePath: string; configurationSha256: string }>
+}
+
+/** A rendered, published, content-addressed target bundle ready for activation. */
+export interface StagedAssets {
+  directory: string
+  configurationSha256: string
+  definition: DeploymentDefinition
+}
+
+export interface StageInput {
+  stateDir: string
+  identity: ManagedIdentity
+  port: number
+  secret: string
+  definition: DeploymentDefinition
+}
+
+/**
+ * Renderer that can additionally stage a catalog deployment: publishing a new
+ * bundle for the target version without touching the active one. Activation
+ * (pointing the Compose runtime at the staged bundle) is transaction
+ * orchestration over Docker, not a filesystem concern.
+ */
+export interface StagingAssetRenderer extends AssetRenderer {
+  stage(input: StageInput): Promise<StagedAssets>
 }
 
 export interface AssetFileSystem {
@@ -60,12 +88,19 @@ function invalidInput(message: string): CliError {
   return new CliError('E_USAGE', message, 'Use a valid managed deployment configuration')
 }
 
-function invalidBundle(message: string): CliError {
+function invalidBundle(message: string, bundleName?: string): CliError {
   // Dedicated damage signal: the existing content-addressed bundle directory
-  // is present but mismatched, incomplete, or unsafe. Consumers (repair)
-  // key deterministic rebuild decisions on exactly this code, so it must not
-  // be reused for unrelated invalid-state failures.
-  return new CliError('E_BUNDLE_DAMAGED', message, 'Remove the damaged managed configuration bundle and retry')
+  // is present but mismatched, incomplete, or unsafe. Consumers (repair,
+  // update) key deterministic rebuild decisions on exactly this code, so it
+  // must not be reused for unrelated invalid-state failures. `bundleName` is
+  // the digest-only directory name (never a path) so consumers can locate
+  // the damaged bundle for a bounded rebuild.
+  return new CliError(
+    'E_BUNDLE_DAMAGED',
+    message,
+    'Remove the damaged managed configuration bundle and retry',
+    bundleName === undefined ? {} : { bundle: bundleName },
+  )
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -104,7 +139,12 @@ function renderSettings(template: string, secret: string): string {
   return stringify({ ...settings, server: { ...(server as Record<string, unknown>), secret_key: secret } })
 }
 
-function baseEnvironment(input: Parameters<AssetRenderer['render']>[0]): string {
+function baseEnvironment(input: {
+  image: string
+  port: number
+  identity: ManagedIdentity
+  deploymentVersion: number
+}): string {
   return [
     `DSH_SEARXNG_IMAGE=${input.image}`,
     `DSH_SEARXNG_PORT=${input.port}`,
@@ -113,7 +153,7 @@ function baseEnvironment(input: Parameters<AssetRenderer['render']>[0]): string 
     `DSH_SEARXNG_CONTAINER=${input.identity.containerName}`,
     `DSH_SEARXNG_NETWORK=${input.identity.projectName}-network`,
     `DSH_SEARXNG_CACHE_VOLUME=${input.identity.projectName}-cache`,
-    'DSH_SEARXNG_DEPLOYMENT_VERSION=1',
+    `DSH_SEARXNG_DEPLOYMENT_VERSION=${input.deploymentVersion}`,
   ].join('\n')
 }
 
@@ -140,26 +180,90 @@ export class FileAssetRenderer implements AssetRenderer {
 
   async render(input: Parameters<AssetRenderer['render']>[0]): Promise<{ composePath: string; configurationSha256: string }> {
     validateInput(input)
-    let compose: string
-    let template: string
+    const [compose, template] = await this.readAssets('compose.yml', 'settings.yml.template')
+    return this.publishBundle({
+      stateDir: input.stateDir,
+      identity: input.identity,
+      image: input.image,
+      port: input.port,
+      secret: input.secret,
+      deploymentVersion: input.deploymentVersion ?? 1,
+      compose,
+      template,
+    })
+  }
+
+  async stage(input: StageInput): Promise<StagedAssets> {
+    const definition = input.definition
+    if (
+      !Number.isSafeInteger(definition.deploymentVersion) || definition.deploymentVersion < 1 ||
+      typeof definition.image !== 'string' || !isEnvironmentValue(definition.image) ||
+      !isDigestPinnedImage(definition.image) ||
+      !isSafeAssetPath(definition.composeAsset) || !isSafeAssetPath(definition.settingsAsset)
+    ) {
+      throw invalidInput('Deployment definition is invalid')
+    }
+    validateInput({
+      stateDir: input.stateDir,
+      identity: input.identity,
+      image: definition.image,
+      port: input.port,
+      secret: input.secret,
+    })
+    const [compose, template] = await this.readAssets(definition.composeAsset, definition.settingsAsset)
+    const published = await this.publishBundle({
+      stateDir: input.stateDir,
+      identity: input.identity,
+      image: definition.image,
+      port: input.port,
+      secret: input.secret,
+      deploymentVersion: definition.deploymentVersion,
+      compose,
+      template,
+    })
+    return {
+      directory: dirname(published.composePath),
+      configurationSha256: published.configurationSha256,
+      definition,
+    }
+  }
+
+  private async readAssets(composePath: string, settingsPath: string): Promise<[string, string]> {
     try {
-      ;[compose, template] = await Promise.all([
-        this.fs.readFile(new URL('compose.yml', this.assetRoot), 'utf8'),
-        this.fs.readFile(new URL('settings.yml.template', this.assetRoot), 'utf8'),
+      return await Promise.all([
+        this.fs.readFile(new URL(composePath, this.assetRoot), 'utf8'),
+        this.fs.readFile(new URL(settingsPath, this.assetRoot), 'utf8'),
       ])
     } catch {
       throw invalidAssets('Packaged Docker assets are unavailable')
     }
+  }
 
-    const settings = renderSettings(template, input.secret)
+  /**
+   * Shared content-addressed publish pipeline: render, stage in a private
+   * sibling temporary directory, fsync, atomically rename into place, and
+   * verify any pre-existing same-digest bundle. The active bundle is never
+   * edited in place; each generation gets its own immutable directory.
+   */
+  private async publishBundle(input: {
+    stateDir: string
+    identity: ManagedIdentity
+    image: string
+    port: number
+    secret: string
+    deploymentVersion: number
+    compose: string
+    template: string
+  }): Promise<{ composePath: string; configurationSha256: string }> {
+    const settings = renderSettings(input.template, input.secret)
     const environmentBase = baseEnvironment(input)
-    const configurationSha256 = configurationHash(environmentBase, compose, settings)
+    const configurationSha256 = configurationHash(environmentBase, input.compose, settings)
     const bundleName = `config-${configurationSha256}`
     const bundleDir = join(input.stateDir, bundleName)
     const composePath = join(bundleDir, 'compose.yml')
     const contents: BundleContents = {
       environment: finalEnvironment(environmentBase, bundleName),
-      compose,
+      compose: input.compose,
       settings,
     }
 
@@ -236,12 +340,13 @@ export class FileAssetRenderer implements AssetRenderer {
   }
 
   private async verifyExistingBundle(bundleDir: string, contents: BundleContents): Promise<boolean> {
+    const bundleName = basename(bundleDir)
     let bundleStats
     try { bundleStats = await this.fs.lstat(bundleDir) } catch (error) {
       if (errorCode(error) === 'ENOENT') return false
       throw error
     }
-    if (bundleStats.isSymbolicLink() || !bundleStats.isDirectory()) throw invalidBundle('Managed configuration bundle is not a directory')
+    if (bundleStats.isSymbolicLink() || !bundleStats.isDirectory()) throw invalidBundle('Managed configuration bundle is not a directory', bundleName)
 
     const expected = [
       [join(bundleDir, '.env'), contents.environment],
@@ -250,31 +355,31 @@ export class FileAssetRenderer implements AssetRenderer {
     ] as const
     try {
       const settingsStats = await this.fs.lstat(join(bundleDir, 'searxng'))
-      if (settingsStats.isSymbolicLink() || !settingsStats.isDirectory()) throw invalidBundle('Managed configuration settings path is invalid')
+      if (settingsStats.isSymbolicLink() || !settingsStats.isDirectory()) throw invalidBundle('Managed configuration settings path is invalid', bundleName)
       if (process.platform !== 'win32' && ((bundleStats.mode & 0o777) !== 0o700 || (settingsStats.mode & 0o777) !== 0o700)) {
-        throw invalidBundle('Managed configuration directory permissions are invalid')
+        throw invalidBundle('Managed configuration directory permissions are invalid', bundleName)
       }
       for (const [path, content] of expected) {
-        const actual = await this.readVerifiedFile(path)
+        const actual = await this.readVerifiedFile(path, bundleName)
         if (actual !== content) {
-          throw invalidBundle('Managed configuration bundle does not match its identity')
+          throw invalidBundle('Managed configuration bundle does not match its identity', bundleName)
         }
       }
     } catch (error) {
       if (error instanceof CliError) throw error
-      throw invalidBundle('Managed configuration bundle is incomplete')
+      throw invalidBundle('Managed configuration bundle is incomplete', bundleName)
     }
     return true
   }
 
-  private async readVerifiedFile(path: string): Promise<string> {
+  private async readVerifiedFile(path: string, bundleName: string): Promise<string> {
     const pathStats = await this.fs.lstat(path)
     if (
       pathStats.isSymbolicLink() ||
       !pathStats.isFile() ||
       pathStats.nlink !== 1 ||
       (process.platform !== 'win32' && (pathStats.mode & 0o777) !== 0o600)
-    ) throw invalidBundle('Managed configuration file type or permissions are invalid')
+    ) throw invalidBundle('Managed configuration file type or permissions are invalid', bundleName)
 
     const noFollow = 'O_NOFOLLOW' in constants ? constants.O_NOFOLLOW : 0
     const handle = await this.fs.open(path, constants.O_RDONLY | noFollow)
@@ -285,7 +390,7 @@ export class FileAssetRenderer implements AssetRenderer {
         openedStats.nlink !== 1 ||
         openedStats.dev !== pathStats.dev ||
         openedStats.ino !== pathStats.ino
-      ) throw invalidBundle('Managed configuration file changed during validation')
+      ) throw invalidBundle('Managed configuration file changed during validation', bundleName)
       return await handle.readFile('utf8')
     } finally {
       await handle.close()

@@ -130,6 +130,8 @@ function harness(options: HarnessOptions = {}) {
       if (options.downError !== undefined) throw options.downError
     }),
     logs: vi.fn(async () => ''),
+    pull: vi.fn(),
+    imageExists: vi.fn(async () => false),
     deploymentStatus: vi.fn(async () => ({ ownership: 'owned' as const, container: 'running' as const, composePath: COMPOSE_PATH })),
   }
   const assets: AssetRenderer = {

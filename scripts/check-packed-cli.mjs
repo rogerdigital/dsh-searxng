@@ -53,15 +53,32 @@ try {
   }
   if (process.platform !== 'win32') await chmod(executable, 0o755)
   const { stdout } = await run(executable, ['--help'], { cwd: installDirectory })
-  for (const commandName of ['setup', 'status', 'doctor', 'remove']) {
+  for (const commandName of ['setup', 'status', 'doctor', 'repair', 'update', 'remove']) {
     if (!stdout.includes(commandName)) throw new Error(`Packed CLI help is missing ${commandName}`)
   }
   await Promise.all([
     access(join(packageRoot, 'assets', 'docker', 'compose.yml')),
     access(join(packageRoot, 'assets', 'docker', 'settings.yml.template')),
-    access(join(packageRoot, 'assets', 'deployments', 'v1.json')),
   ])
-  process.stdout.write('Packed CLI and Docker assets verified\n')
+  // The packed CLI resolves its deployment catalog from the installed layout;
+  // verify the shipped catalog and every asset it references.
+  const catalog = JSON.parse(await readFile(join(packageRoot, 'assets', 'deployments', 'v1.json'), 'utf8'))
+  if (catalog.schemaVersion !== 1 || !Array.isArray(catalog.deployments) || catalog.deployments.length < 1) {
+    throw new Error('Packed deployment catalog is invalid')
+  }
+  let previousVersion = 0
+  for (const deployment of catalog.deployments) {
+    if (!(deployment.deploymentVersion > previousVersion)) {
+      throw new Error('Packed deployment versions must be unique and increasing')
+    }
+    previousVersion = deployment.deploymentVersion
+    if (!/@sha256:[a-f0-9]{64}$/.test(deployment.image ?? '')) {
+      throw new Error(`Packed deployment ${deployment.deploymentVersion} is not pinned to a sha256 image digest`)
+    }
+    await access(join(packageRoot, 'assets', deployment.composeAsset))
+    await access(join(packageRoot, 'assets', deployment.settingsAsset))
+  }
+  process.stdout.write('Packed CLI, deployment catalog, and Docker assets verified\n')
 } finally {
   await rm(temporary, { recursive: true, force: true })
 }

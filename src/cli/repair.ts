@@ -5,6 +5,7 @@ import type { AssetRenderer, ManagedIdentity } from './assets.ts'
 import type { DockerAdapter } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService } from './environment.ts'
+import { validateEndToEnd } from './diagnostics.ts'
 import { recommendRecovery, stateSha256, type JournalStore, type OperationJournal, type RecoveryRecommendation } from './journal.ts'
 import {
   bundleComposePath,
@@ -12,10 +13,9 @@ import {
   healthyTimestamp,
   isAbort,
   isConfigBundleName,
-  rethrowCancellation,
   stateIdentity,
 } from './managed.ts'
-import type { ProfileAttachmentPreview, ProfileManager } from './profile.ts'
+import type { ProfileManager } from './profile.ts'
 import type { SearxngProbe } from './searxng.ts'
 import type { StateStore, StateV2 } from './state.ts'
 import type { DiagnosticCheck, DiagnosticSnapshot } from './diagnostics.ts'
@@ -138,7 +138,7 @@ function unsafeBundleRemoval(): CliError {
  * removal is ownership-bounded like remove.ts: only a direct `config-<sha256>`
  * child of the managed directory, never a symlink or any path outside it.
  */
-async function removeBundleForRebuild(managedDir: string, bundleDir: string): Promise<void> {
+export async function removeBundleForRebuild(managedDir: string, bundleDir: string): Promise<void> {
   if (dirname(bundleDir) !== managedDir || !isConfigBundleName(basename(bundleDir))) {
     throw unsafeBundleRemoval()
   }
@@ -300,33 +300,7 @@ async function validateRepaired(
   dependencies: RepairDependencies,
   signal?: AbortSignal,
 ): Promise<DiagnosticCheck[]> {
-  const checks: DiagnosticCheck[] = []
-  let preview: ProfileAttachmentPreview | undefined
-  try {
-    preview = await dependencies.profiles.preview(plan.profile, plan.endpoint, signal)
-  } catch (error) {
-    rethrowCancellation(error, signal)
-    preview = undefined
-  }
-  const config = preview?.config ?? { baseURL: plan.endpoint }
-  await dependencies.searxng.http(config, signal)
-  checks.push({ id: 'http', status: 'pass', message: 'SearXNG HTTP endpoint is reachable' })
-  await dependencies.searxng.readiness({ ...config, attempts: 1, timeoutMs: 10_000 }, signal)
-  checks.push({ id: 'json', status: 'pass', message: 'SearXNG JSON API is enabled' })
-  await dependencies.searxng.realSearch(config, signal)
-  checks.push({ id: 'search', status: 'pass', message: 'SearXNG returned a real search result' })
-  if (preview === undefined || !preview.installed || !preview.attached) {
-    throw new CliError('E_SEARCH_FAILED', 'The DSH profile attachment is missing or outdated after repair', 'Re-run dsh-searxng repair')
-  }
-  checks.push({ id: 'profile', status: 'pass', message: 'DSH profile has the expected managed attachment' })
-  await dependencies.profiles.validate(
-    plan.profile,
-    plan.endpoint,
-    async (validated) => { await dependencies.searxng.providerSearch(validated, signal) },
-    signal,
-  )
-  checks.push({ id: 'provider', status: 'pass', message: 'DSH provider search returned a result' })
-  return checks
+  return validateEndToEnd(plan.profile, plan.endpoint, dependencies, signal)
 }
 
 interface ActionContext {
@@ -368,6 +342,7 @@ async function executeAction(
         image: state.managed.current.image,
         port: state.managed.current.port,
         secret,
+        deploymentVersion: state.managed.current.deploymentVersion,
       }
       try {
         return await dependencies.assets.render(input)

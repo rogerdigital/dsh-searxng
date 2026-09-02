@@ -53,6 +53,7 @@ function harness(options: {
     docker: {
       preflight: vi.fn(async () => ({ serverVersion: '27', composeVersion: '2.30' })),
       inspectOwnership: vi.fn(async () => 'owned' as const), up: vi.fn(), restart: vi.fn(), logs: vi.fn(async () => ''),
+      pull: vi.fn(), imageExists: vi.fn(async () => false),
       deploymentStatus: vi.fn(async () => {
         events.push('ownership')
         ownershipCalls += 1

@@ -44,6 +44,7 @@ function harness(mode: 'managed' | 'external' = 'managed', failure?: string) {
     docker: {
       preflight: vi.fn(async () => { calls.push('docker'); fail('docker'); return { serverVersion: '27', composeVersion: '2.30' } }),
       inspectOwnership: vi.fn(async () => 'owned' as const), up: vi.fn(), restart: vi.fn(), down: vi.fn(), logs: vi.fn(async () => ''),
+      pull: vi.fn(), imageExists: vi.fn(async () => false),
       deploymentStatus: vi.fn(async () => {
         calls.push('ownership'); fail('ownership')
         return { ownership: 'owned' as const, container: failure === 'container' ? 'stopped' as const : 'running' as const, composePath: `/dsh/dsh-searxng/config-${'a'.repeat(64)}/compose.yml` }
@@ -167,6 +168,7 @@ function snapshotHarness(options: {
         return { serverVersion: '27', composeVersion: '2.30' }
       }),
       inspectOwnership: vi.fn(async () => 'owned' as const), up: vi.fn(), restart: vi.fn(), down: vi.fn(), logs: vi.fn(async () => ''),
+      pull: vi.fn(), imageExists: vi.fn(async () => false),
       deploymentStatus: vi.fn(async () => {
         calls.push('ownership')
         if (options.foreign) throw new CliError('E_RESOURCE_FOREIGN', 'foreign', 'rename it')

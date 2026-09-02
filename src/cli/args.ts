@@ -21,6 +21,12 @@ export type CliCommand =
       json: boolean
     }
   | {
+      command: 'update'
+      profile: string
+      deploymentVersion?: number
+      json: boolean
+    }
+  | {
       command: 'remove'
       profile: string
       json: boolean
@@ -37,6 +43,7 @@ const options = {
   service: { type: 'boolean' as const },
   'purge-data': { type: 'boolean' as const },
   yes: { type: 'boolean' as const },
+  'deployment-version': { type: 'string' as const },
   help: { type: 'boolean' as const, short: 'h' },
 }
 
@@ -80,6 +87,14 @@ function parseUrl(value: string | undefined): string | undefined {
   return value
 }
 
+function parseDeploymentVersion(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined
+  if (!/^\d+$/.test(value)) invalid('deployment-version must be an integer')
+  const version = Number(value)
+  if (!Number.isSafeInteger(version) || version < 1) invalid('deployment-version must be between 1 and 65535')
+  return version
+}
+
 export function parseCliArgs(argv: readonly string[]): CliCommand {
   const parsed = parseArgs({ args: [...argv], options, allowPositionals: true, strict: true })
   const [command, ...extra] = parsed.positionals
@@ -89,13 +104,16 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     }
     return { command: 'help' }
   }
-  if (!command || extra.length > 0 || !['setup', 'status', 'doctor', 'repair', 'remove'].includes(command)) {
-    invalid('expected one command: setup, status, doctor, repair, or remove')
+  if (!command || extra.length > 0 || !['setup', 'status', 'doctor', 'repair', 'update', 'remove'].includes(command)) {
+    invalid('expected one command: setup, status, doctor, repair, update, or remove')
   }
   const cliCommand = command as CliCommand['command']
 
   if (cliCommand !== 'setup' && parsed.values.port !== undefined) {
     invalid('--port is only supported by setup')
+  }
+  if (cliCommand !== 'update' && parsed.values['deployment-version'] !== undefined) {
+    invalid('--deployment-version is only supported by update')
   }
 
   const profile = parseProfile(parsed.values.profile)
@@ -105,6 +123,7 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   const service = parsed.values.service ?? false
   const purgeData = parsed.values['purge-data'] ?? false
   const yes = parsed.values.yes ?? false
+  const deploymentVersion = parseDeploymentVersion(parsed.values['deployment-version'])
 
   if (cliCommand !== 'setup' && url !== undefined) invalid('--url is only supported by setup')
   if (cliCommand !== 'remove' && (service || purgeData || yes)) invalid('remove flags are only supported by remove')
@@ -117,6 +136,12 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     ...(url === undefined ? {} : { url }),
     port,
     portExplicit: parsed.values.port !== undefined,
+    json,
+  }
+  if (cliCommand === 'update') return {
+    command: cliCommand,
+    profile,
+    ...(deploymentVersion === undefined ? {} : { deploymentVersion }),
     json,
   }
   if (cliCommand === 'remove') return { command: cliCommand, profile, json, service, purgeData, yes }

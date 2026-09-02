@@ -290,6 +290,48 @@ async function probeEndpointHealth(
   }
 }
 
+/**
+ * Shared end-to-end validation used by repair and update after a mutation:
+ * the doctor-shaped HTTP/JSON/real-search/profile/provider chain, returning
+ * the passing checks or throwing on the first failure. Both transactions
+ * validate through this one pipeline so their post-mutation semantics can
+ * never drift.
+ */
+export async function validateEndToEnd(
+  profile: string,
+  endpoint: string,
+  dependencies: Pick<DiagnosticDependencies, 'profiles' | 'searxng'>,
+  signal?: AbortSignal,
+): Promise<DiagnosticCheck[]> {
+  const checks: DiagnosticCheck[] = []
+  let preview: ProfileAttachmentPreview | undefined
+  try {
+    preview = await dependencies.profiles.preview(profile, endpoint, signal)
+  } catch (error) {
+    rethrowCancellation(error, signal)
+    preview = undefined
+  }
+  const config = preview?.config ?? { baseURL: endpoint }
+  await dependencies.searxng.http(config, signal)
+  checks.push({ id: 'http', status: 'pass', message: 'SearXNG HTTP endpoint is reachable' })
+  await dependencies.searxng.readiness({ ...config, attempts: 1, timeoutMs: 10_000 }, signal)
+  checks.push({ id: 'json', status: 'pass', message: 'SearXNG JSON API is enabled' })
+  await dependencies.searxng.realSearch(config, signal)
+  checks.push({ id: 'search', status: 'pass', message: 'SearXNG returned a real search result' })
+  if (preview === undefined || !preview.installed || !preview.attached) {
+    throw new CliError('E_SEARCH_FAILED', 'The DSH profile attachment is missing or outdated', 'Re-run dsh-searxng repair')
+  }
+  checks.push({ id: 'profile', status: 'pass', message: 'DSH profile has the expected managed attachment' })
+  await dependencies.profiles.validate(
+    profile,
+    endpoint,
+    async (validated) => { await dependencies.searxng.providerSearch(validated, signal) },
+    signal,
+  )
+  checks.push({ id: 'provider', status: 'pass', message: 'DSH provider search returned a result' })
+  return checks
+}
+
 export async function diagnose(
   profile: string,
   kind: 'status' | 'doctor',

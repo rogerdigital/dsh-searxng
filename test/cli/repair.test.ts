@@ -263,6 +263,8 @@ function executorHarness(options: HarnessOptions = {}) {
     restart: vi.fn(async () => { events.push('docker-restart') }),
     down: vi.fn(async (_identity, volumes) => { events.push(`docker-down:${volumes}`) }),
     logs: vi.fn(async () => ''),
+    pull: vi.fn(),
+    imageExists: vi.fn(async () => false),
     deploymentStatus: vi.fn(async () => {
       events.push('ownership')
       if (options.foreign) throw new CliError('E_RESOURCE_FOREIGN', 'foreign', 'rename it')

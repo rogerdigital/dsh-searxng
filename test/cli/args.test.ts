@@ -68,6 +68,19 @@ describe('parseCliArgs', () => {
     })
   })
 
+  it('parses update with defaults', () => {
+    expect(parseCliArgs(['update'])).toEqual({ command: 'update', profile: 'web', json: false })
+  })
+
+  it('parses update profile, deployment version, and JSON output', () => {
+    expect(parseCliArgs(['update', '--profile', 'work', '--deployment-version', '2', '--json'])).toEqual({
+      command: 'update',
+      profile: 'work',
+      deploymentVersion: 2,
+      json: true,
+    })
+  })
+
   it('keeps remove defaults explicit', () => {
     expect(parseCliArgs(['remove'])).toEqual({
       command: 'remove',
@@ -118,6 +131,16 @@ describe('parseCliArgs', () => {
     ['repair purge-data', ['repair', '--purge-data']],
     ['repair yes', ['repair', '--yes']],
     ['purge without service', ['remove', '--purge-data']],
+    ['zero deployment version', ['update', '--deployment-version', '0']],
+    ['noninteger deployment version', ['update', '--deployment-version', '2.5']],
+    ['setup deployment version', ['setup', '--deployment-version', '2']],
+    ['status deployment version', ['status', '--deployment-version', '2']],
+    ['doctor deployment version', ['doctor', '--deployment-version', '2']],
+    ['repair deployment version', ['repair', '--deployment-version', '2']],
+    ['remove deployment version', ['remove', '--deployment-version', '2']],
+    ['update port', ['update', '--port', '8081']],
+    ['update url', ['update', '--url', 'https://search.example']],
+    ['update service', ['update', '--service']],
   ] as const)('rejects %s', (_name, argv) => {
     expect(() => parseCliArgs(argv)).toThrow()
   })

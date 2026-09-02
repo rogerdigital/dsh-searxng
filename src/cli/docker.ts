@@ -14,6 +14,13 @@ export interface DockerAdapter {
   logs(identity: ManagedIdentity, tail: number, signal?: AbortSignal): Promise<string>
   deploymentStatus(identity: ManagedIdentity, signal?: AbortSignal): Promise<DockerDeploymentStatus>
   /**
+   * Pull the exact digest-pinned image before any deployment mutation, so a
+   * pull failure never leaves a half-updated runtime behind.
+   */
+  pull(image: string, signal?: AbortSignal): Promise<void>
+  /** Report whether the exact image reference is present in the local store. */
+  imageExists(image: string, signal?: AbortSignal): Promise<boolean>
+  /**
    * Optional capability to delete a named temporary Docker resource after
    * re-verifying this installation's ownership labels. Adapters without it
    * make `remove-owned-temporary` repair actions fail closed.
@@ -60,6 +67,22 @@ function operationFailed(operation: string): CliError {
 
 function restartFailed(): CliError {
   return new CliError('E_INTERNAL', 'Docker container restart failed', 'Run dsh-searxng doctor and repair the managed deployment')
+}
+
+function imageReferenceInvalid(): CliError {
+  return new CliError('E_USAGE', 'Image reference is invalid', 'Use a digest-pinned image reference')
+}
+
+function pullFailed(): CliError {
+  return new CliError('E_INTERNAL', 'Docker image pull failed', 'Check network access to the image registry, then retry')
+}
+
+function imageInspectFailed(): CliError {
+  return new CliError('E_INTERNAL', 'Docker image inspection failed', 'Run dsh-searxng doctor and inspect Docker status')
+}
+
+function validateImageReference(image: string): void {
+  if (typeof image !== 'string' || image.length === 0 || /[\s\u0000-\u001f\u007f]/.test(image)) throw imageReferenceInvalid()
 }
 
 function incompleteManagedResources(): CliError {
@@ -125,10 +148,15 @@ function resourceLabels(value: unknown, kind: ResourceKind): Record<string, stri
 }
 
 function hasExpectedLabels(labels: Record<string, string>, homeId: string): boolean {
+  // Ownership is the home identity, not the deployment version: any resource
+  // carrying this homeId was created by this installation, whatever packaged
+  // deployment version rendered it. Requiring a fixed version here would
+  // misclassify (and refuse to roll back) our own updated deployments.
+  const deploymentVersion = labels[RESOURCE_LABELS.deploymentVersion]
   return labels[RESOURCE_LABELS.managed] === 'true' &&
     labels[RESOURCE_LABELS.homeId] === homeId &&
     labels[RESOURCE_LABELS.schema] === '1' &&
-    labels[RESOURCE_LABELS.deploymentVersion] === '1'
+    typeof deploymentVersion === 'string' && /^\d+$/.test(deploymentVersion) && Number(deploymentVersion) >= 1
 }
 
 function absentMessage(kind: ResourceKind, output: string): boolean {
@@ -287,6 +315,36 @@ export class CliDockerAdapter implements DockerAdapter {
       ? (redacted as Record<string, unknown>).output
       : undefined
     return capUtf8(typeof output === 'string' ? output : '[REDACTED]', this.maxLogBytes)
+  }
+
+  async pull(image: string, signal?: AbortSignal): Promise<void> {
+    validateImageReference(image)
+    signal?.throwIfAborted()
+    let result: CommandResult
+    try {
+      result = await this.runner.run('docker', ['image', 'pull', image], { signal })
+      signal?.throwIfAborted()
+    } catch (error) {
+      cancellation(error, signal)
+      throw pullFailed()
+    }
+    if (result.exitCode !== 0) throw pullFailed()
+  }
+
+  async imageExists(image: string, signal?: AbortSignal): Promise<boolean> {
+    validateImageReference(image)
+    signal?.throwIfAborted()
+    let result: CommandResult
+    try {
+      result = await this.runner.run('docker', ['image', 'inspect', image], { signal })
+      signal?.throwIfAborted()
+    } catch (error) {
+      cancellation(error, signal)
+      throw imageInspectFailed()
+    }
+    if (result.exitCode === 0) return true
+    if (/no such image/i.test(`${result.stdout}\n${result.stderr}`)) return false
+    throw imageInspectFailed()
   }
 
   private composeArgs(identity: ManagedIdentity, operation: readonly string[]): string[] {

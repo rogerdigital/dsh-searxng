@@ -17,8 +17,8 @@ import { exactKeys } from './state.ts'
 /** Catalog schema understood by this CLI; newer schemas must fail loudly. */
 const CATALOG_SCHEMA_VERSION = 1
 
-/** Location of the catalog inside the asset root. */
-const CATALOG_ASSET = 'deployments/v1.json'
+/** Location of the catalog inside the asset root, derived from the schema version. */
+const CATALOG_ASSET = `deployments/v${CATALOG_SCHEMA_VERSION}.json`
 
 /**
  * Resolve the asset root from the packed CLI first (lib/*.mjs sits directly
@@ -37,6 +37,11 @@ export interface DeploymentDefinition {
 }
 
 const DIGEST_PINNED_IMAGE = /^[^\s@]+@sha256:[a-f0-9]{64}$/
+
+/** True when an image reference is pinned to a full sha256 digest; shared with the renderer's staging gate. */
+export function isDigestPinnedImage(value: string): boolean {
+  return DIGEST_PINNED_IMAGE.test(value)
+}
 const DEPLOYMENT_KEYS = ['composeAsset', 'deploymentVersion', 'image', 'settingsAsset', 'stateSchemas']
 
 function deploymentUnsupported(message: string, action: string, details: Record<string, unknown> = {}): CliError {
@@ -59,7 +64,7 @@ function isPositiveInteger(value: unknown): value is number {
 }
 
 /** Relative POSIX-style path that cannot escape the asset root. */
-function isSafeAssetPath(value: unknown): value is string {
+export function isSafeAssetPath(value: unknown): value is string {
   if (typeof value !== 'string' || value.length === 0) return false
   if (value.includes('\\') || value.includes(':') || value.startsWith('/') || value.includes('\0')) return false
   return value.split('/').every((segment) => segment.length > 0 && segment !== '.' && segment !== '..')
@@ -85,7 +90,7 @@ function validateDeployment(value: unknown, index: number, assetRoot: URL): Depl
   if (!isPositiveInteger(deploymentVersion)) {
     throw deploymentUnsupported(`${where} has an invalid deployment version`, 'Reinstall dsh-searxng and retry')
   }
-  if (typeof image !== 'string' || !DIGEST_PINNED_IMAGE.test(image)) {
+  if (typeof image !== 'string' || !isDigestPinnedImage(image)) {
     throw deploymentUnsupported(
       `Deployment version ${deploymentVersion} is not pinned to a sha256 image digest`,
       'Reinstall dsh-searxng and retry',
