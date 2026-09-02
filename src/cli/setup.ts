@@ -6,7 +6,7 @@ import { CliError } from './errors.ts'
 import type { EnvironmentService, ResolvedEnvironment } from './environment.ts'
 import type { ProfileManager } from './profile.ts'
 import type { SearxngProbe } from './searxng.ts'
-import type { StateStore, StateV1 } from './state.ts'
+import type { DeploymentSnapshot, StateStore, StateV2 } from './state.ts'
 
 export interface SetupDependencies {
   environment: EnvironmentService
@@ -98,19 +98,20 @@ function canonicalIdentity(environment: ResolvedEnvironment): ManagedIdentity {
 }
 
 function isMatchingManagedState(
-  managed: StateV1['managed'],
+  managed: StateV2['managed'],
+  homeId: string,
   identity: ManagedIdentity,
   endpoint: string,
   port: number,
-): managed is NonNullable<StateV1['managed']> {
+): boolean {
   return managed !== undefined &&
-    managed.deploymentVersion === 1 &&
-    managed.image === SEARXNG_IMAGE &&
-    managed.endpoint === endpoint &&
-    managed.port === port &&
-    managed.homeId === identity.homeId &&
-    managed.projectName === identity.projectName &&
-    managed.containerName === identity.containerName
+    homeId === identity.homeId &&
+    managed.current.deploymentVersion === 1 &&
+    managed.current.image === SEARXNG_IMAGE &&
+    managed.current.endpoint === endpoint &&
+    managed.current.port === port &&
+    managed.current.projectName === identity.projectName &&
+    managed.current.containerName === identity.containerName
 }
 
 function healthyTimestamp(dependencies: SetupDependencies): string {
@@ -120,45 +121,53 @@ function healthyTimestamp(dependencies: SetupDependencies): string {
 }
 
 function managedState(
-  previous: StateV1,
+  previous: StateV2,
   input: SetupInput,
   endpoint: string,
   identity: ManagedIdentity,
   dependencies: SetupDependencies,
-): StateV1 {
+  configurationSha256?: string,
+): StateV2 {
+  const prior = previous.managed?.current
+  const digest = configurationSha256 ?? prior?.configurationSha256
+  const current: DeploymentSnapshot = {
+    deploymentVersion: prior?.deploymentVersion ?? 1,
+    image: SEARXNG_IMAGE,
+    endpoint,
+    port: input.port,
+    projectName: identity.projectName,
+    containerName: identity.containerName,
+    ...(digest === undefined ? {} : { configurationSha256: digest }),
+  }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    homeId: identity.homeId,
     managed: {
-      deploymentVersion: 1,
-      image: SEARXNG_IMAGE,
-      endpoint,
-      port: input.port,
-      homeId: identity.homeId,
-      projectName: identity.projectName,
-      containerName: identity.containerName,
+      current,
       lastHealthyAt: healthyTimestamp(dependencies),
     },
     profiles: { ...previous.profiles, [input.profile]: { mode: 'managed', endpoint } },
   }
 }
 
-function externalState(previous: StateV1, input: SetupInput, endpoint: string): StateV1 {
+function externalState(previous: StateV2, input: SetupInput, endpoint: string): StateV2 {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    homeId: previous.homeId,
     ...(previous.managed === undefined ? {} : { managed: previous.managed }),
     profiles: { ...previous.profiles, [input.profile]: { mode: 'external', endpoint } },
   }
 }
 
-function profileStateMatches(previous: StateV1, input: SetupInput, endpoint: string, mode: 'managed' | 'external'): boolean {
+function profileStateMatches(previous: StateV2, input: SetupInput, endpoint: string, mode: 'managed' | 'external'): boolean {
   const current = previous.profiles[input.profile]
   return current?.mode === mode && current.endpoint === endpoint
 }
 
 async function withStateRestore(
-  previous: StateV1,
+  previous: StateV2,
   dependencies: SetupDependencies,
-  operation: (write: (next: StateV1) => Promise<void>) => Promise<void>,
+  operation: (write: (next: StateV2) => Promise<void>) => Promise<void>,
 ): Promise<void> {
   let stateWriteAttempted = false
   try {
@@ -180,8 +189,8 @@ async function withStateRestore(
 async function attachAndCommit(
   input: SetupInput,
   endpoint: string,
-  previous: StateV1,
-  next: StateV1,
+  previous: StateV2,
+  next: StateV2,
   dependencies: SetupDependencies,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -201,8 +210,8 @@ async function attachAndCommit(
 async function validateAndCommit(
   input: SetupInput,
   endpoint: string,
-  previous: StateV1,
-  next: StateV1,
+  previous: StateV2,
+  next: StateV2,
   dependencies: SetupDependencies,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -250,7 +259,7 @@ function isIncompleteRollback(error: unknown): error is CliError {
 async function externalSetup(
   input: SetupInput,
   endpoint: string,
-  previous: StateV1,
+  previous: StateV2,
   dependencies: SetupDependencies,
   signal?: AbortSignal,
 ): Promise<SetupResult> {
@@ -272,7 +281,7 @@ async function externalSetup(
 
 async function managedSetup(
   input: SetupInput,
-  previous: StateV1,
+  previous: StateV2,
   environment: ResolvedEnvironment,
   dependencies: SetupDependencies,
   randomSecret: () => string,
@@ -285,7 +294,7 @@ async function managedSetup(
   const ownership = await dependencies.docker.inspectOwnership(placeholderIdentity, signal)
   const hasState = previous.managed !== undefined
   const matching = hasState && ownership === 'owned' &&
-    isMatchingManagedState(previous.managed, placeholderIdentity, endpoint, input.port)
+    isMatchingManagedState(previous.managed, previous.homeId, placeholderIdentity, endpoint, input.port)
 
   if ((hasState && !matching) || (!hasState && ownership === 'owned')) {
     throw inconsistentManagedDeployment()
@@ -352,7 +361,7 @@ async function managedSetup(
     await dependencies.docker.up(identity, signal)
     await dependencies.searxng.readiness(preview.config, signal)
     await dependencies.searxng.realSearch(preview.config, signal)
-    const next = managedState(previous, input, endpoint, identity, dependencies)
+    const next = managedState(previous, input, endpoint, identity, dependencies, rendered.configurationSha256)
     await attachAndCommit(input, endpoint, previous, next, dependencies, signal)
     return { profile: input.profile, endpoint, reused: false }
   } catch (primary) {
@@ -382,8 +391,8 @@ export function createSetup(options: SetupFactoryOptions = {}) {
         const portExplicit = input.portExplicit ?? true
         let port = input.port
         if (previous.managed !== undefined) {
-          if (!portExplicit) port = previous.managed.port
-          else if (port !== previous.managed.port) throw portMigrationRequired()
+          if (!portExplicit) port = previous.managed.current.port
+          else if (port !== previous.managed.current.port) throw portMigrationRequired()
         }
         await dependencies.environment.preflightDsh(signal)
         return managedSetup({ ...input, port }, previous, environment, dependencies, randomSecret, signal)

@@ -38,13 +38,17 @@ function invalidState(message: string): CliError {
   return new CliError('E_STATE_INVALID', message, 'Run dsh-searxng setup or repair the recorded attachment')
 }
 
-function identity(managedDir: string, managed: NonNullable<Awaited<ReturnType<StateStore['read']>>['managed']>): ManagedIdentity {
+function identity(
+  managedDir: string,
+  homeId: string,
+  managed: NonNullable<Awaited<ReturnType<StateStore['read']>>['managed']>,
+): ManagedIdentity {
   return {
     stateDir: managedDir,
     composePath: `${managedDir}/config-${'0'.repeat(64)}/compose.yml`,
-    homeId: managed.homeId,
-    projectName: managed.projectName,
-    containerName: managed.containerName,
+    homeId,
+    projectName: managed.current.projectName,
+    containerName: managed.current.containerName,
   }
 }
 
@@ -97,7 +101,7 @@ export async function diagnose(
     if (blocked && kind === 'status') return { profile, mode: entry.mode, endpoint: entry.endpoint, healthy: false, checks }
     await record('ownership', 'Managed Docker resources have valid ownership labels', async () => {
       if (environment === undefined || state?.managed === undefined) throw invalidState('Managed deployment state is missing')
-      deployment = await dependencies.docker.deploymentStatus(identity(environment.managedDir, state.managed), signal)
+      deployment = await dependencies.docker.deploymentStatus(identity(environment.managedDir, state.homeId, state.managed), signal)
       if (deployment.ownership !== 'owned') throw invalidState('Managed Docker resources are absent')
     })
     if (blocked && kind === 'status') return { profile, mode: entry.mode, endpoint: entry.endpoint, healthy: false, checks }

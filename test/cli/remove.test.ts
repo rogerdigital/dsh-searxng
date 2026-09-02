@@ -4,19 +4,22 @@ import { join, sep } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { CliError } from '../../src/cli/errors.ts'
 import { remove, removeManagedDirectory, type RemoveDependencies } from '../../src/cli/remove.ts'
-import type { StateV1 } from '../../src/cli/state.ts'
+import type { StateV2 } from '../../src/cli/state.ts'
 
 const HOME_ID = '0123456789abcdef'
 const PROJECT = `dsh-searxng-${HOME_ID}`
 const ENDPOINT = 'http://127.0.0.1:8080'
 const COMPOSE = `/dsh/dsh-searxng/config-${'a'.repeat(64)}/compose.yml`
 
-function managedState(extraProfiles: StateV1['profiles'] = {}): StateV1 {
+function managedState(extraProfiles: StateV2['profiles'] = {}): StateV2 {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    homeId: HOME_ID,
     managed: {
-      deploymentVersion: 1, image: 'image', endpoint: ENDPOINT, port: 8080,
-      homeId: HOME_ID, projectName: PROJECT, containerName: PROJECT,
+      current: {
+        deploymentVersion: 1, image: 'image', endpoint: ENDPOINT, port: 8080,
+        projectName: PROJECT, containerName: PROJECT,
+      },
       lastHealthyAt: '2026-08-30T00:00:00.000Z',
     },
     profiles: { web: { mode: 'managed', endpoint: ENDPOINT }, ...extraProfiles },
@@ -24,7 +27,7 @@ function managedState(extraProfiles: StateV1['profiles'] = {}): StateV1 {
 }
 
 function harness(options: {
-  state?: StateV1
+  state?: StateV2
   ownershipError?: unknown
   foreignOnSecondOwnership?: boolean
   confirmed?: boolean
@@ -34,7 +37,7 @@ function harness(options: {
 } = {}) {
   let current = structuredClone(options.state ?? managedState())
   const events: string[] = []
-  const writes: StateV1[] = []
+  const writes: StateV2[] = []
   let ownershipCalls = 0
   let uninstallFailures = options.uninstallFailures ?? 0
   const dependencies: RemoveDependencies = {

@@ -1,20 +1,23 @@
 import { describe, expect, it, vi } from 'vitest'
 import { CliError } from '../../src/cli/errors.ts'
 import { diagnose, type DiagnosticDependencies } from '../../src/cli/diagnostics.ts'
-import type { StateV1 } from '../../src/cli/state.ts'
+import type { StateV2 } from '../../src/cli/state.ts'
 
 const HOME_ID = '0123456789abcdef'
 const PROJECT = `dsh-searxng-${HOME_ID}`
 const ENDPOINT = 'http://127.0.0.1:8080'
 
-function state(mode: 'managed' | 'external'): StateV1 {
+function state(mode: 'managed' | 'external'): StateV2 {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    homeId: HOME_ID,
     ...(mode === 'managed' ? {
       managed: {
-        deploymentVersion: 1,
-        image: 'image', endpoint: ENDPOINT, port: 8080, homeId: HOME_ID,
-        projectName: PROJECT, containerName: PROJECT,
+        current: {
+          deploymentVersion: 1,
+          image: 'image', endpoint: ENDPOINT, port: 8080,
+          projectName: PROJECT, containerName: PROJECT,
+        },
         lastHealthyAt: '2026-08-30T00:00:00.000Z',
       },
     } : {}),

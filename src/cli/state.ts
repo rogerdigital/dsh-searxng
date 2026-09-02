@@ -21,21 +21,50 @@ export interface StateV1 {
   profiles: Record<string, { mode: 'managed' | 'external'; endpoint: string }>
 }
 
+export interface DeploymentSnapshot {
+  deploymentVersion: number
+  image: string
+  endpoint: string
+  port: number
+  projectName: string
+  containerName: string
+  /**
+   * Absent only for snapshots migrated from schema v1, which never recorded a
+   * configuration digest; every newly rendered deployment records one.
+   */
+  configurationSha256?: string
+}
+
+export interface StateV2 {
+  schemaVersion: 2
+  homeId: string
+  managed?: {
+    current: DeploymentSnapshot
+    previous?: DeploymentSnapshot
+    lastHealthyAt: string
+  }
+  profiles: Record<string, { mode: 'managed' | 'external'; endpoint: string }>
+}
+
 export interface StateStore {
-  read(): Promise<StateV1>
-  write(state: StateV1): Promise<void>
+  read(): Promise<StateV2>
+  write(state: StateV2): Promise<void>
   withLock<T>(operation: () => Promise<T>): Promise<T>
 }
 
-interface FsFacade {
+/** Filesystem operations required by the shared atomic file-replace primitive. */
+export interface AtomicWriteFs {
   mkdir: typeof mkdir
   open: typeof open
-  readFile: typeof readFile
   rename: typeof rename
   rm: typeof rm
   chmod: typeof chmod
-  stat: typeof stat
   link: typeof link
+}
+
+interface FsFacade extends AtomicWriteFs {
+  readFile: typeof readFile
+  stat: typeof stat
 }
 
 interface LockOwnership {
@@ -68,7 +97,7 @@ function errorCode(error: unknown): string | undefined {
     : undefined
 }
 
-function exactKeys(value: object, expected: readonly string[]): boolean {
+export function exactKeys(value: object, expected: readonly string[]): boolean {
   const actual = Object.keys(value).sort()
   const sortedExpected = [...expected].sort()
   return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index])
@@ -90,28 +119,21 @@ function isEndpoint(value: unknown): value is string {
   }
 }
 
-function isNonEmptyString(value: unknown): value is string {
+export function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
 }
 
-function isCanonicalTimestamp(value: unknown): value is string {
+export function isCanonicalTimestamp(value: unknown): value is string {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false
   const parsed = Date.parse(value)
   return !Number.isNaN(parsed) && new Date(parsed).toISOString() === value
 }
 
-function validateState(value: unknown): asserts value is StateV1 {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw stateInvalid('State must be an object')
-  const root = value as Record<string, unknown>
-  const rootKeys = root.managed === undefined
-    ? ['schemaVersion', 'profiles']
-    : ['schemaVersion', 'managed', 'profiles']
-  if (root.schemaVersion !== 1 || !exactKeys(root, rootKeys)) throw stateInvalid('Unsupported state schema')
-  if (root.profiles === null || typeof root.profiles !== 'object' || Array.isArray(root.profiles)) {
+function validateProfiles(value: unknown): void {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw stateInvalid('Invalid profiles')
   }
-
-  for (const [profile, entry] of Object.entries(root.profiles as Record<string, unknown>)) {
+  for (const [profile, entry] of Object.entries(value as Record<string, unknown>)) {
     try {
       assertValidProfile(profile)
     } catch {
@@ -128,6 +150,16 @@ function validateState(value: unknown): asserts value is StateV1 {
       throw stateInvalid('Invalid profile state')
     }
   }
+}
+
+function validateStateV1(value: unknown): asserts value is StateV1 {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw stateInvalid('State must be an object')
+  const root = value as Record<string, unknown>
+  const rootKeys = root.managed === undefined
+    ? ['schemaVersion', 'profiles']
+    : ['schemaVersion', 'managed', 'profiles']
+  if (root.schemaVersion !== 1 || !exactKeys(root, rootKeys)) throw stateInvalid('Unsupported state schema')
+  validateProfiles(root.profiles)
 
   if (root.managed === undefined) return
   if (
@@ -165,30 +197,245 @@ function validateState(value: unknown): asserts value is StateV1 {
   }
 }
 
+function validateSnapshot(value: unknown, where: string): asserts value is DeploymentSnapshot {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw stateInvalid(`Invalid managed ${where}`)
+  const snapshot = value as Record<string, unknown>
+  const keys = ['deploymentVersion', 'image', 'endpoint', 'port', 'projectName', 'containerName']
+  if (snapshot.configurationSha256 !== undefined) keys.push('configurationSha256')
+  if (!exactKeys(snapshot, keys)) throw stateInvalid(`Invalid managed ${where}`)
+  if (
+    !Number.isSafeInteger(snapshot.deploymentVersion) ||
+    (snapshot.deploymentVersion as number) < 1 ||
+    !isNonEmptyString(snapshot.image) ||
+    !isEndpoint(snapshot.endpoint) ||
+    !Number.isSafeInteger(snapshot.port) ||
+    (snapshot.port as number) < 1 ||
+    (snapshot.port as number) > 65535 ||
+    !isNonEmptyString(snapshot.projectName) ||
+    !isNonEmptyString(snapshot.containerName) ||
+    (snapshot.configurationSha256 !== undefined &&
+      (typeof snapshot.configurationSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(snapshot.configurationSha256)))
+  ) {
+    throw stateInvalid(`Invalid managed ${where}`)
+  }
+}
+
+function validateStateV2(value: unknown): asserts value is StateV2 {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw stateInvalid('State must be an object')
+  const root = value as Record<string, unknown>
+  const rootKeys = root.managed === undefined
+    ? ['schemaVersion', 'homeId', 'profiles']
+    : ['schemaVersion', 'homeId', 'managed', 'profiles']
+  if (root.schemaVersion !== 2 || !exactKeys(root, rootKeys)) throw stateInvalid('Unsupported state schema')
+  if (typeof root.homeId !== 'string' || !/^[a-f0-9]{16}$/.test(root.homeId)) {
+    throw stateInvalid('Invalid state home identity')
+  }
+  validateProfiles(root.profiles)
+
+  if (root.managed === undefined) return
+  if (root.managed === null || typeof root.managed !== 'object' || Array.isArray(root.managed)) {
+    throw stateInvalid('Invalid managed state')
+  }
+  const managed = root.managed as Record<string, unknown>
+  const managedKeys = managed.previous === undefined
+    ? ['current', 'lastHealthyAt']
+    : ['current', 'previous', 'lastHealthyAt']
+  if (!exactKeys(managed, managedKeys)) throw stateInvalid('Invalid managed state')
+  validateSnapshot(managed.current, 'current')
+  if (managed.previous !== undefined) validateSnapshot(managed.previous, 'previous')
+  if (!isCanonicalTimestamp(managed.lastHealthyAt)) throw stateInvalid('Invalid managed state')
+}
+
+/**
+ * Migrate a validated v1 state in memory. v1 recorded no configuration digest,
+ * so the migrated current snapshot legitimately carries none; v1 homeId moves
+ * from the managed section to the state root, falling back to the store home.
+ */
+function migrateStateV1(state: StateV1, fallbackHomeId: string): StateV2 {
+  return {
+    schemaVersion: 2,
+    homeId: state.managed?.homeId ?? fallbackHomeId,
+    ...(state.managed === undefined ? {} : {
+      managed: {
+        current: {
+          deploymentVersion: state.managed.deploymentVersion,
+          image: state.managed.image,
+          endpoint: state.managed.endpoint,
+          port: state.managed.port,
+          projectName: state.managed.projectName,
+          containerName: state.managed.containerName,
+        },
+        lastHealthyAt: state.managed.lastHealthyAt,
+      },
+    }),
+    profiles: state.profiles,
+  }
+}
+
 function combinedError(primary: unknown, secondary: readonly unknown[], message: string): unknown {
   if (secondary.length === 0) return primary
   return new AggregateError([primary, ...secondary], message)
 }
 
+async function syncDirectory(fs: AtomicWriteFs, root: string): Promise<void> {
+  if (process.platform === 'win32') return
+  const directory = await fs.open(root, constants.O_RDONLY)
+  try {
+    await directory.sync()
+  } finally {
+    await directory.close()
+  }
+}
+
+async function rollbackReplace(
+  fs: AtomicWriteFs,
+  root: string,
+  path: string,
+  originalExists: boolean,
+  backupPath: string,
+  failedPath: string,
+  errors: unknown[],
+): Promise<void> {
+  if (originalExists) {
+    try {
+      await fs.rename(path, failedPath)
+    } catch (error) {
+      errors.push(error)
+      return
+    }
+    try {
+      await fs.link(backupPath, path)
+    } catch (error) {
+      errors.push(error)
+      return
+    }
+    try {
+      await syncDirectory(fs, root)
+    } catch (error) {
+      errors.push(error)
+      return
+    }
+    try {
+      await fs.rm(failedPath, { force: true })
+    } catch (error) {
+      errors.push(error)
+    }
+    try {
+      await fs.rm(backupPath, { force: true })
+    } catch (error) {
+      errors.push(error)
+    }
+    return
+  }
+
+  try {
+    await fs.rename(path, failedPath)
+  } catch (renameError) {
+    try {
+      await fs.rm(path)
+    } catch (removeError) {
+      errors.push(renameError, removeError)
+      return
+    }
+  }
+  try {
+    await syncDirectory(fs, root)
+  } catch (error) {
+    errors.push(error)
+    return
+  }
+  try {
+    await fs.rm(failedPath, { force: true })
+  } catch (error) {
+    errors.push(error)
+  }
+}
+
+/**
+ * Atomically replace `path` with `contents` using the same discipline as the
+ * state store: hard-link backup, exclusive 0600 temporary, fsync, rename
+ * commit, directory fsync, and rollback with retained evidence on failure.
+ */
+export async function writeAtomicFile(fs: AtomicWriteFs, root: string, path: string, contents: string): Promise<void> {
+  await fs.mkdir(root, { recursive: true, mode: 0o700 })
+
+  const suffix = `${process.pid}-${randomBytes(8).toString('hex')}`
+  const temporaryPath = `${path}.tmp-${suffix}`
+  const backupPath = `${path}.backup-${suffix}`
+  const failedPath = `${path}.failed-${suffix}`
+  let originalExists = true
+  try {
+    await fs.link(path, backupPath)
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') originalExists = false
+    else throw error
+  }
+
+  let handle: FileHandle | undefined
+  let committed = false
+  try {
+    handle = await fs.open(temporaryPath, 'wx', 0o600)
+    await handle.writeFile(contents, 'utf8')
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+    await fs.chmod(temporaryPath, 0o600)
+    await fs.rename(temporaryPath, path)
+    committed = true
+    await syncDirectory(fs, root)
+    if (originalExists) await fs.rm(backupPath)
+  } catch (primary) {
+    const recoveryErrors: unknown[] = []
+    if (handle !== undefined) {
+      try {
+        await handle.close()
+      } catch (error) {
+        recoveryErrors.push(error)
+      }
+    }
+    try {
+      await fs.rm(temporaryPath, { force: true })
+    } catch (error) {
+      recoveryErrors.push(error)
+    }
+
+    if (committed) {
+      await rollbackReplace(fs, root, path, originalExists, backupPath, failedPath, recoveryErrors)
+    } else if (originalExists) {
+      try {
+        await fs.rm(backupPath, { force: true })
+      } catch (error) {
+        recoveryErrors.push(error)
+      }
+    }
+    throw combinedError(primary, recoveryErrors, 'Atomic file write failed and cleanup or rollback was incomplete')
+  }
+}
+
 export class FileStateStore implements StateStore {
   private readonly root: string
+  private readonly homeId: string
   private readonly fs: FsFacade
   private readonly statePath: string
   private readonly lockPath: string
 
-  constructor(managedDirectory: string, fsFacade: Partial<FsFacade> = {}) {
+  constructor(managedDirectory: string, homeId: string, fsFacade: Partial<FsFacade> = {}) {
+    if (typeof homeId !== 'string' || !/^[a-f0-9]{16}$/.test(homeId)) {
+      throw new CliError('E_INTERNAL', 'State home identity is invalid', 'Check the CLI installation and retry')
+    }
     this.root = managedDirectory
+    this.homeId = homeId
     this.fs = { ...realFs, ...fsFacade }
     this.statePath = join(managedDirectory, 'state.json')
     this.lockPath = join(managedDirectory, 'state.lock')
   }
 
-  async read(): Promise<StateV1> {
+  async read(): Promise<StateV2> {
     let source: string
     try {
       source = await this.fs.readFile(this.statePath, 'utf8')
     } catch (error) {
-      if (errorCode(error) === 'ENOENT') return { schemaVersion: 1, profiles: {} }
+      if (errorCode(error) === 'ENOENT') return { schemaVersion: 2, homeId: this.homeId, profiles: {} }
       throw stateReadFailed()
     }
 
@@ -198,65 +445,27 @@ export class FileStateStore implements StateStore {
     } catch {
       throw stateInvalid('State JSON is malformed')
     }
-    validateState(parsed)
+    // read() has a write side effect: it persists the one-shot v1→v2
+    // migration. It cannot take the state lock itself — diagnose reads
+    // unlocked while setup/remove call read() under withLock, and lock
+    // recursion would deadlock — so this migration write may race a
+    // concurrent committed write. Last writer wins and re-running setup
+    // converges; the update transaction (lifecycle Task 4) must instead
+    // read state only after acquiring the lock.
+    if (isSchemaV1(parsed)) {
+      validateStateV1(parsed)
+      const migrated = migrateStateV1(parsed, this.homeId)
+      validateStateV2(migrated)
+      await this.write(migrated)
+      return migrated
+    }
+    validateStateV2(parsed)
     return parsed
   }
 
-  async write(state: StateV1): Promise<void> {
-    validateState(state)
-    await this.fs.mkdir(this.root, { recursive: true, mode: 0o700 })
-
-    const suffix = `${process.pid}-${randomBytes(8).toString('hex')}`
-    const temporaryPath = `${this.statePath}.tmp-${suffix}`
-    const backupPath = `${this.statePath}.backup-${suffix}`
-    const failedPath = `${this.statePath}.failed-${suffix}`
-    let originalExists = true
-    try {
-      await this.fs.link(this.statePath, backupPath)
-    } catch (error) {
-      if (errorCode(error) === 'ENOENT') originalExists = false
-      else throw error
-    }
-
-    let handle: FileHandle | undefined
-    let committed = false
-    try {
-      handle = await this.fs.open(temporaryPath, 'wx', 0o600)
-      await handle.writeFile(`${JSON.stringify(state)}\n`, 'utf8')
-      await handle.sync()
-      await handle.close()
-      handle = undefined
-      await this.fs.chmod(temporaryPath, 0o600)
-      await this.fs.rename(temporaryPath, this.statePath)
-      committed = true
-      await this.syncDirectory()
-      if (originalExists) await this.fs.rm(backupPath)
-    } catch (primary) {
-      const recoveryErrors: unknown[] = []
-      if (handle !== undefined) {
-        try {
-          await handle.close()
-        } catch (error) {
-          recoveryErrors.push(error)
-        }
-      }
-      try {
-        await this.fs.rm(temporaryPath, { force: true })
-      } catch (error) {
-        recoveryErrors.push(error)
-      }
-
-      if (committed) {
-        await this.rollbackWrite(originalExists, backupPath, failedPath, recoveryErrors)
-      } else if (originalExists) {
-        try {
-          await this.fs.rm(backupPath, { force: true })
-        } catch (error) {
-          recoveryErrors.push(error)
-        }
-      }
-      throw combinedError(primary, recoveryErrors, 'State write failed and cleanup or rollback was incomplete')
-    }
+  async write(state: StateV2): Promise<void> {
+    validateStateV2(state)
+    await writeAtomicFile(this.fs, this.root, this.statePath, `${JSON.stringify(state)}\n`)
   }
 
   async withLock<T>(operation: () => Promise<T>): Promise<T> {
@@ -287,77 +496,6 @@ export class FileStateStore implements StateStore {
     if (operationFailed) throw operationError
     if (releaseError !== undefined) throw releaseError
     return result as T
-  }
-
-  private async rollbackWrite(
-    originalExists: boolean,
-    backupPath: string,
-    failedPath: string,
-    errors: unknown[],
-  ): Promise<void> {
-    if (originalExists) {
-      try {
-        await this.fs.rename(this.statePath, failedPath)
-      } catch (error) {
-        errors.push(error)
-        return
-      }
-      try {
-        await this.fs.link(backupPath, this.statePath)
-      } catch (error) {
-        errors.push(error)
-        return
-      }
-      try {
-        await this.syncDirectory()
-      } catch (error) {
-        errors.push(error)
-        return
-      }
-      try {
-        await this.fs.rm(failedPath, { force: true })
-      } catch (error) {
-        errors.push(error)
-      }
-      try {
-        await this.fs.rm(backupPath, { force: true })
-      } catch (error) {
-        errors.push(error)
-      }
-      return
-    }
-
-    try {
-      await this.fs.rename(this.statePath, failedPath)
-    } catch (renameError) {
-      try {
-        await this.fs.rm(this.statePath)
-      } catch (removeError) {
-        errors.push(renameError, removeError)
-        return
-      }
-    }
-    try {
-      await this.syncDirectory()
-    } catch (error) {
-      errors.push(error)
-      return
-    }
-    try {
-      await this.fs.rm(failedPath, { force: true })
-    } catch (error) {
-      errors.push(error)
-    }
-  }
-
-  private async syncDirectory(): Promise<void> {
-    if (process.platform === 'win32') return
-    const directory = await this.fs.open(this.root, constants.O_RDONLY)
-    try {
-      await directory.sync()
-    } finally {
-      await directory.close()
-    }
   }
 
   private async acquireLock(): Promise<LockOwnership> {
@@ -475,4 +613,9 @@ export class FileStateStore implements StateStore {
       throw combinedError(primary, cleanupErrors, 'Lock quarantine inspection failed')
     }
   }
+}
+
+function isSchemaV1(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) &&
+    (value as { schemaVersion?: unknown }).schemaVersion === 1
 }

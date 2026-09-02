@@ -9,7 +9,7 @@ import { parseCliArgs } from './cli/args.ts'
 import { FileAssetRenderer } from './cli/assets.ts'
 import { CliDockerAdapter } from './cli/docker.ts'
 import { diagnose } from './cli/diagnostics.ts'
-import { managedDir, NodeEnvironmentService, resolveDshHome, type PortChecker } from './cli/environment.ts'
+import { homeId, managedDir, NodeEnvironmentService, resolveDshHome, type PortChecker } from './cli/environment.ts'
 import { CliError } from './cli/errors.ts'
 import { presentError, presentSuccess } from './cli/presenter.ts'
 import { NodeProcessRunner, type CommandRunner } from './cli/process.ts'
@@ -150,7 +150,7 @@ export function createProductionDependencies(options: ProductionDependencyOption
   const portChecker = options.portChecker ?? createLoopbackPortChecker()
   return {
     environment: new NodeEnvironmentService({ env, homedir: options.homedir, portChecker, commandRunner: runner }),
-    state: new FileStateStore(managedDir(dshHome)),
+    state: new FileStateStore(managedDir(dshHome), homeId(dshHome)),
     docker: new CliDockerAdapter(runner),
     assets: new FileAssetRenderer(),
     searxng: new DefaultSearxngProbe(),

@@ -10,7 +10,7 @@ import { CliError } from '../../src/cli/errors.ts'
 import type { EnvironmentService } from '../../src/cli/environment.ts'
 import type { ProfileAttachmentConfig, ProfileManager } from '../../src/cli/profile.ts'
 import type { SearxngProbe } from '../../src/cli/searxng.ts'
-import type { StateStore, StateV1 } from '../../src/cli/state.ts'
+import type { DeploymentSnapshot, StateStore, StateV2 } from '../../src/cli/state.ts'
 import { createSetup, setup, type SetupDependencies } from '../../src/cli/setup.ts'
 import { createLoopbackPortChecker, isMainModule, runCli } from '../../src/cli.ts'
 
@@ -19,9 +19,11 @@ const MANAGED_DIR = '/tmp/dsh/dsh-searxng'
 const PROJECT = `dsh-searxng-${HOME_ID}`
 const ENDPOINT = 'http://127.0.0.1:8080'
 const COMPOSE_PATH = join(MANAGED_DIR, `config-${'a'.repeat(64)}`, 'compose.yml')
+const RENDERED_HASH = 'a'.repeat(64)
+const PERSISTED_HASH = 'b'.repeat(64)
 
 interface HarnessOptions {
-  state?: StateV1
+  state?: StateV2
   ownership?: 'absent' | 'owned'
   readinessFailures?: number
   realSearchFailures?: number
@@ -42,19 +44,22 @@ interface HarnessOptions {
   writeBehaviors?: ReadonlyArray<'success' | 'fail-before' | 'fail-after'>
 }
 
-function managedState(overrides: Partial<NonNullable<StateV1['managed']>> = {}): StateV1 {
+function managedState(overrides: Partial<DeploymentSnapshot> = {}): StateV2 {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    homeId: HOME_ID,
     managed: {
-      deploymentVersion: 1,
-      image: SEARXNG_IMAGE,
-      endpoint: ENDPOINT,
-      port: 8080,
-      homeId: HOME_ID,
-      projectName: PROJECT,
-      containerName: PROJECT,
+      current: {
+        deploymentVersion: 1,
+        image: SEARXNG_IMAGE,
+        endpoint: ENDPOINT,
+        port: 8080,
+        projectName: PROJECT,
+        containerName: PROJECT,
+        configurationSha256: PERSISTED_HASH,
+        ...overrides,
+      },
       lastHealthyAt: '2026-08-29T00:00:00.000Z',
-      ...overrides,
     },
     profiles: { existing: { mode: 'external', endpoint: 'https://existing.example/search' } },
   }
@@ -62,10 +67,10 @@ function managedState(overrides: Partial<NonNullable<StateV1['managed']>> = {}):
 
 function harness(options: HarnessOptions = {}) {
   const events: string[] = []
-  const writes: StateV1[] = []
+  const writes: StateV2[] = []
   const renders: Parameters<AssetRenderer['render']>[0][] = []
   const identities: ManagedIdentity[] = []
-  let state: StateV1 = structuredClone(options.state ?? { schemaVersion: 1, profiles: {} })
+  let state: StateV2 = structuredClone(options.state ?? { schemaVersion: 2, homeId: HOME_ID, profiles: {} })
   let readinessFailures = options.readinessFailures ?? 0
   let realSearchFailures = options.realSearchFailures ?? 0
   let profileEndpoint = 'before'
@@ -131,7 +136,7 @@ function harness(options: HarnessOptions = {}) {
     render: vi.fn(async (input) => {
       events.push('render')
       renders.push(input)
-      return { composePath: COMPOSE_PATH, configurationSha256: 'a'.repeat(64) }
+      return { composePath: COMPOSE_PATH, configurationSha256: RENDERED_HASH }
     }),
   }
   const searxng: SearxngProbe = {
@@ -225,15 +230,18 @@ describe('setup', () => {
     })
     expect(test.identities.at(-1)?.composePath).toBe(COMPOSE_PATH)
     expect(test.writes).toEqual([{
-      schemaVersion: 1,
+      schemaVersion: 2,
+      homeId: HOME_ID,
       managed: {
-        deploymentVersion: 1,
-        image: SEARXNG_IMAGE,
-        endpoint: ENDPOINT,
-        port: 8080,
-        homeId: HOME_ID,
-        projectName: PROJECT,
-        containerName: PROJECT,
+        current: {
+          deploymentVersion: 1,
+          image: SEARXNG_IMAGE,
+          endpoint: ENDPOINT,
+          port: 8080,
+          projectName: PROJECT,
+          containerName: PROJECT,
+          configurationSha256: RENDERED_HASH,
+        },
         lastHealthyAt: '2026-08-30T01:02:03.004Z',
       },
       profiles: { web: { mode: 'managed', endpoint: ENDPOINT } },
@@ -275,16 +283,17 @@ describe('setup', () => {
     expect(test.docker.up).not.toHaveBeenCalled()
     expect(test.docker.down).not.toHaveBeenCalled()
     expect(randomSecret).not.toHaveBeenCalled()
-    expect(test.state().managed).toMatchObject({
+    expect(test.state().homeId).toBe(HOME_ID)
+    expect(test.state().managed?.current).toMatchObject({
       deploymentVersion: 1,
       image: SEARXNG_IMAGE,
       endpoint: ENDPOINT,
       port: 8080,
-      homeId: HOME_ID,
       projectName: PROJECT,
       containerName: PROJECT,
-      lastHealthyAt: '2026-08-30T01:02:03.004Z',
+      configurationSha256: PERSISTED_HASH,
     })
+    expect(test.state().managed?.lastHealthyAt).toBe('2026-08-30T01:02:03.004Z')
   })
 
   it('does not restart when readiness passes but real search has an unclassified deterministic failure', async () => {
@@ -452,8 +461,9 @@ describe('setup', () => {
 
   it('is byte-level idempotent for an already attached matching external profile', async () => {
     const endpoint = 'https://search.example/path'
-    const initial: StateV1 = {
-      schemaVersion: 1,
+    const initial: StateV2 = {
+      schemaVersion: 2,
+      homeId: HOME_ID,
       profiles: { work: { mode: 'external', endpoint } },
     }
     const test = harness({ state: initial, profileAttached: true })
@@ -470,7 +480,7 @@ describe('setup', () => {
 
   it('rejects an external idempotent result after a same-byte inode replacement during provider validation', async () => {
     const endpoint = 'https://search.example/path'
-    const initial: StateV1 = { schemaVersion: 1, profiles: { work: { mode: 'external', endpoint } } }
+    const initial: StateV2 = { schemaVersion: 2, homeId: HOME_ID, profiles: { work: { mode: 'external', endpoint } } }
     const concurrent = new CliError(
       'E_PROFILE_CONCURRENT_MODIFICATION',
       'profile changed',
@@ -484,7 +494,7 @@ describe('setup', () => {
 
   it('rejects an external idempotent result after a same-byte manifest inode replacement during provider validation', async () => {
     const endpoint = 'https://search.example/path'
-    const initial: StateV1 = { schemaVersion: 1, profiles: { work: { mode: 'external', endpoint } } }
+    const initial: StateV2 = { schemaVersion: 2, homeId: HOME_ID, profiles: { work: { mode: 'external', endpoint } } }
     const concurrent = new CliError(
       'E_PROFILE_CONCURRENT_MODIFICATION',
       'manifest replaced',
@@ -577,8 +587,9 @@ describe('setup', () => {
 
   it('does not mistake an attached external profile with mismatched state for an idempotent setup', async () => {
     const endpoint = 'https://search.example/path'
-    const initial: StateV1 = {
-      schemaVersion: 1,
+    const initial: StateV2 = {
+      schemaVersion: 2,
+      homeId: HOME_ID,
       profiles: { work: { mode: 'external', endpoint: 'https://old.example' } },
     }
     const test = harness({ state: initial, profileAttached: true })
@@ -651,7 +662,7 @@ describe('setup', () => {
     await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toBeDefined()
     expect(test.events.slice(-3)).toEqual(['ownership', 'docker-down', 'unlock'])
     expect(test.docker.down).toHaveBeenCalledWith(expect.objectContaining({ composePath: COMPOSE_PATH }), true)
-    expect(test.state()).toEqual({ schemaVersion: 1, profiles: {} })
+    expect(test.state()).toEqual({ schemaVersion: 2, homeId: HOME_ID, profiles: {} })
   })
 
   it('rolls back transaction-created resources on cancellation after Docker mutation', async () => {
@@ -703,7 +714,7 @@ describe('setup', () => {
   })
 
   it('restores previous state after attach postcheck fails following a committed state write', async () => {
-    const previous: StateV1 = { schemaVersion: 1, profiles: { old: { mode: 'external', endpoint: 'https://old.example' } } }
+    const previous: StateV2 = { schemaVersion: 2, homeId: HOME_ID, profiles: { old: { mode: 'external', endpoint: 'https://old.example' } } }
     const postcheck = new CliError('E_PROFILE_WRITE', 'profile changed after validation', 'repair profile')
     const test = harness({ state: previous, postAttachError: postcheck, ownershipSequence: ['absent', 'owned'] })
     await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toBe(postcheck)
@@ -716,7 +727,7 @@ describe('setup', () => {
 
   it('restores previous state after a managed state write commits bytes and then throws', async () => {
     const credential = 'Bearer fail-after-private-token'
-    const previous: StateV1 = { schemaVersion: 1, profiles: { old: { mode: 'external', endpoint: 'https://old.example' } } }
+    const previous: StateV2 = { schemaVersion: 2, homeId: HOME_ID, profiles: { old: { mode: 'external', endpoint: 'https://old.example' } } }
     const test = harness({
       state: previous,
       writeBehaviors: ['fail-after', 'success'],
@@ -733,7 +744,7 @@ describe('setup', () => {
   })
 
   it('restores previous state after an external state write commits bytes and then throws', async () => {
-    const previous: StateV1 = { schemaVersion: 1, profiles: { old: { mode: 'external', endpoint: 'https://old.example' } } }
+    const previous: StateV2 = { schemaVersion: 2, homeId: HOME_ID, profiles: { old: { mode: 'external', endpoint: 'https://old.example' } } }
     const test = harness({ state: previous, writeBehaviors: ['fail-after', 'success'] })
     await expect(setup({ profile: 'web', port: 8080, url: 'https://search.example' }, test.deps))
       .rejects.toMatchObject({ code: 'E_INTERNAL' })

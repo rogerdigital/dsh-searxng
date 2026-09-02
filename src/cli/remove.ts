@@ -5,7 +5,7 @@ import type { DockerAdapter } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService } from './environment.ts'
 import type { ProfileManager } from './profile.ts'
-import type { StateStore, StateV1 } from './state.ts'
+import type { StateStore, StateV2 } from './state.ts'
 
 export interface RemoveInput { profile: string; service: boolean; purgeData: boolean; confirmed: boolean }
 export interface RemoveResult { profile: string; profileRemoved: boolean; serviceRemoved: boolean; dataPurged: boolean }
@@ -26,17 +26,17 @@ function removalFailed(message: string): CliError {
   return new CliError('E_INTERNAL', message, 'Run dsh-searxng doctor and retry the removal')
 }
 
-function identity(managedDir: string, managed: NonNullable<StateV1['managed']>, composePath?: string): ManagedIdentity {
+function identity(managedDir: string, homeId: string, managed: NonNullable<StateV2['managed']>, composePath?: string): ManagedIdentity {
   return {
     stateDir: managedDir,
     composePath: composePath ?? `${managedDir}/config-${'0'.repeat(64)}/compose.yml`,
-    homeId: managed.homeId,
-    projectName: managed.projectName,
-    containerName: managed.containerName,
+    homeId,
+    projectName: managed.current.projectName,
+    containerName: managed.current.containerName,
   }
 }
 
-async function writeWithRestore(state: StateStore, previous: StateV1, next: StateV1): Promise<void> {
+async function writeWithRestore(state: StateStore, previous: StateV2, next: StateV2): Promise<void> {
   try {
     await state.write(next)
   } catch (primary) {
@@ -77,7 +77,7 @@ export async function remove(
     if (input.service && otherManaged.length > 0) throw blocked(`Managed service is still attached to: ${otherManaged.join(', ')}`)
     if (input.service && (entry?.mode === 'external' || managed === undefined)) throw blocked('The selected profile does not own a managed service')
 
-    const volumes = managed === undefined ? [] : [`${managed.projectName}-cache`]
+    const volumes = managed === undefined ? [] : [`${managed.current.projectName}-cache`]
     if (input.purgeData && !input.confirmed && !await dependencies.confirmPurge(volumes)) {
       throw new CliError('E_USAGE', 'Permanent data deletion was not confirmed', 'Retry with --yes after reviewing the listed volume')
     }
@@ -85,9 +85,9 @@ export async function remove(
     let initialIdentity: ManagedIdentity | undefined
     if (input.service && managed !== undefined) {
       await dependencies.docker.preflight(signal)
-      const status = await dependencies.docker.deploymentStatus(identity(resolved.managedDir, managed), signal)
+      const status = await dependencies.docker.deploymentStatus(identity(resolved.managedDir, previous.homeId, managed), signal)
       if (status.ownership !== 'owned' || status.composePath === undefined) throw blocked('Managed Docker resources are absent or incomplete')
-      initialIdentity = identity(resolved.managedDir, managed, status.composePath)
+      initialIdentity = identity(resolved.managedDir, previous.homeId, managed, status.composePath)
     }
 
     await dependencies.environment.preflightDsh(signal)
@@ -95,7 +95,7 @@ export async function remove(
     if (profileRemoved) {
       const profiles = { ...previous.profiles }
       delete profiles[input.profile]
-      const next: StateV1 = { schemaVersion: 1, ...(managed === undefined ? {} : { managed }), profiles }
+      const next: StateV2 = { schemaVersion: 2, homeId: previous.homeId, ...(managed === undefined ? {} : { managed }), profiles }
       await writeWithRestore(dependencies.state, previous, next)
     }
     try {
@@ -109,9 +109,9 @@ export async function remove(
     await dependencies.profiles.uninstall(input.profile, signal)
 
     if (input.service && managed !== undefined && initialIdentity !== undefined) {
-      const finalStatus = await dependencies.docker.deploymentStatus(identity(resolved.managedDir, managed), signal)
+      const finalStatus = await dependencies.docker.deploymentStatus(identity(resolved.managedDir, previous.homeId, managed), signal)
       if (finalStatus.ownership !== 'owned' || finalStatus.composePath === undefined) throw blocked('Managed Docker ownership changed during removal')
-      await dependencies.docker.down(identity(resolved.managedDir, managed, finalStatus.composePath), input.purgeData, signal)
+      await dependencies.docker.down(identity(resolved.managedDir, previous.homeId, managed, finalStatus.composePath), input.purgeData, signal)
       if (input.purgeData) purgeDshHome = resolved.dshHome
     }
     return { profile: input.profile, profileRemoved, serviceRemoved: input.service, dataPurged: input.purgeData }

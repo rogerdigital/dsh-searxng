@@ -19,21 +19,55 @@ import {
   FileStateStore,
   type StateStore as StateStoreContract,
   type StateV1,
+  type StateV2,
 } from '../../src/cli/state.ts'
 
-const valid: StateV1 = {
-  schemaVersion: 1,
+const HOME_ID = '0123456789abcdef'
+
+const valid: StateV2 = {
+  schemaVersion: 2,
+  homeId: HOME_ID,
   profiles: { web: { mode: 'managed', endpoint: 'http://127.0.0.1:8080' } },
 }
 
-const populated: StateV1 = {
+const populated: StateV2 = {
+  schemaVersion: 2,
+  homeId: HOME_ID,
+  managed: {
+    current: {
+      deploymentVersion: 1,
+      image: 'searxng:latest',
+      endpoint: 'http://127.0.0.1:8080',
+      port: 8080,
+      projectName: 'dsh-searxng-web',
+      containerName: 'dsh-searxng-web-1',
+      configurationSha256: 'a'.repeat(64),
+    },
+    previous: {
+      deploymentVersion: 1,
+      image: 'searxng:previous',
+      endpoint: 'http://127.0.0.1:8080',
+      port: 8080,
+      projectName: 'dsh-searxng-web',
+      containerName: 'dsh-searxng-web-1',
+      configurationSha256: 'b'.repeat(64),
+    },
+    lastHealthyAt: '2026-08-30T12:00:00.000Z',
+  },
+  profiles: {
+    web: { mode: 'managed', endpoint: 'http://127.0.0.1:8080' },
+    external: { mode: 'external', endpoint: 'https://search.example' },
+  },
+}
+
+const legacyV1: StateV1 = {
   schemaVersion: 1,
   managed: {
     deploymentVersion: 1,
     image: 'searxng:latest',
     endpoint: 'http://127.0.0.1:8080',
     port: 8080,
-    homeId: '0123456789abcdef',
+    homeId: HOME_ID,
     projectName: 'dsh-searxng-web',
     containerName: 'dsh-searxng-web-1',
     lastHealthyAt: '2026-08-30T12:00:00.000Z',
@@ -42,6 +76,23 @@ const populated: StateV1 = {
     web: { mode: 'managed', endpoint: 'http://127.0.0.1:8080' },
     external: { mode: 'external', endpoint: 'https://search.example' },
   },
+}
+
+const migratedFromV1: StateV2 = {
+  schemaVersion: 2,
+  homeId: HOME_ID,
+  managed: {
+    current: {
+      deploymentVersion: 1,
+      image: 'searxng:latest',
+      endpoint: 'http://127.0.0.1:8080',
+      port: 8080,
+      projectName: 'dsh-searxng-web',
+      containerName: 'dsh-searxng-web-1',
+    },
+    lastHealthyAt: '2026-08-30T12:00:00.000Z',
+  },
+  profiles: legacyV1.profiles,
 }
 
 type HandleMethod = 'writeFile' | 'readFile' | 'stat' | 'sync' | 'close'
@@ -111,17 +162,21 @@ describe('StateStore schema', () => {
     await expect(store.withLock(async () => 42)).resolves.toBe(42)
   })
 
+  it('rejects an invalid store home identity before filesystem access', async () => {
+    expect(() => new FileStateStore('/tmp/dsh-searxng', 'not-a-home-id')).toThrowError(/home identity/i)
+  })
+
   it('returns an in-memory empty state without creating its missing directory', async () => {
     const root = join(tmpdir(), `dsh-state-missing-${process.pid}-${Date.now()}`)
     await rm(root, { recursive: true, force: true })
-    await expect(new FileStateStore(root).read()).resolves.toEqual({ schemaVersion: 1, profiles: {} })
+    await expect(new FileStateStore(root, HOME_ID).read()).resolves.toEqual({ schemaVersion: 2, homeId: HOME_ID, profiles: {} })
     await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('round-trips the exact populated StateV1 schema with a user-only state file', async () => {
+  it('round-trips the exact populated StateV2 schema with a user-only state file', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     try {
-      const store = new FileStateStore(root)
+      const store = new FileStateStore(root, HOME_ID)
       await store.write(populated)
       await expect(store.read()).resolves.toEqual(populated)
       if (process.platform !== 'win32') {
@@ -132,19 +187,35 @@ describe('StateStore schema', () => {
     }
   })
 
+  it('round-trips a migrated snapshot without a configuration hash', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    try {
+      const store = new FileStateStore(root, HOME_ID)
+      await store.write(migratedFromV1)
+      await expect(store.read()).resolves.toEqual(migratedFromV1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it.each([
-    ['future schema', { schemaVersion: 2, profiles: {} }],
-    ['missing profiles', { schemaVersion: 1 }],
-    ['non-object profiles', { schemaVersion: 1, profiles: [] }],
-    ['managed endpoint missing', { ...populated, managed: { ...populated.managed!, endpoint: undefined } }],
-    ['managed endpoint empty', { ...populated, managed: { ...populated.managed!, endpoint: '' } }],
-    ['managed endpoint invalid', { ...populated, managed: { ...populated.managed!, endpoint: 'file:///tmp/search' } }],
-    ['deployment version invalid', { ...populated, managed: { ...populated.managed!, deploymentVersion: 2 } }],
-    ['managed port invalid', { ...populated, managed: { ...populated.managed!, port: 0 } }],
-    ['managed home id invalid', { ...populated, managed: { ...populated.managed!, homeId: 'not-a-home-id' } }],
-    ['managed image empty', { ...populated, managed: { ...populated.managed!, image: '' } }],
-    ['managed project empty', { ...populated, managed: { ...populated.managed!, projectName: '' } }],
-    ['managed container empty', { ...populated, managed: { ...populated.managed!, containerName: '' } }],
+    ['future schema', { ...populated, schemaVersion: 3 }],
+    ['missing profiles', { schemaVersion: 2, homeId: HOME_ID }],
+    ['non-object profiles', { ...populated, profiles: [] }],
+    ['root home id invalid', { ...populated, homeId: 'not-a-home-id' }],
+    ['managed current missing', { ...populated, managed: { lastHealthyAt: populated.managed!.lastHealthyAt } }],
+    ['managed endpoint missing', { ...populated, managed: { ...populated.managed!, current: { ...populated.managed!.current, endpoint: undefined } } }],
+    ['managed endpoint empty', { ...populated, managed: { ...populated.managed!, current: { ...populated.managed!.current, endpoint: '' } } }],
+    ['managed endpoint invalid', { ...populated, managed: { ...populated.managed!, current: { ...populated.managed!.current, endpoint: 'file:///tmp/search' } } }],
+    ['deployment version invalid', { ...populated, managed: { ...populated.managed!, current: { ...populated.managed!.current, deploymentVersion: 0 } } }],
+    ['deployment version non-integer', { ...populated, managed: { ...populated.managed!, current: { ...populated.managed!.current, deploymentVersion: 1.5 } } }],
+    ['managed port invalid', { ...populated, managed: { ...populated.managed!, current: { ...populated.managed!.current, port: 0 } } }],
+    ['configuration hash invalid', { ...populated, managed: { ...populated.managed!, current: { ...populated.managed!.current, configurationSha256: 'z'.repeat(64) } } }],
+    ['configuration hash wrong length', { ...populated, managed: { ...populated.managed!, current: { ...populated.managed!.current, configurationSha256: 'a'.repeat(63) } } }],
+    ['managed image empty', { ...populated, managed: { ...populated.managed!, current: { ...populated.managed!.current, image: '' } } }],
+    ['managed project empty', { ...populated, managed: { ...populated.managed!, current: { ...populated.managed!.current, projectName: '' } } }],
+    ['managed container empty', { ...populated, managed: { ...populated.managed!, current: { ...populated.managed!.current, containerName: '' } } }],
+    ['previous snapshot invalid', { ...populated, managed: { ...populated.managed!, previous: { ...populated.managed!.previous!, port: 0 } } }],
     ['managed timestamp invalid', { ...populated, managed: { ...populated.managed!, lastHealthyAt: 'tomorrow' } }],
     ['profile endpoint invalid', { ...populated, profiles: { web: { mode: 'managed', endpoint: 'not-url' } } }],
     ['profile mode invalid', { ...populated, profiles: { web: { mode: 'other', endpoint: 'http://localhost' } } }],
@@ -155,14 +226,18 @@ describe('StateStore schema', () => {
     ['profile name backslash', { ...populated, profiles: { 'a\\b': valid.profiles.web } }],
     ['extra root field', { ...populated, extra: true }],
     ['extra managed field', { ...populated, managed: { ...populated.managed!, extra: true } }],
+    ['extra snapshot field', { ...populated, managed: { ...populated.managed!, current: { ...populated.managed!.current, extra: true } } }],
     ['extra profile field', { ...populated, profiles: { web: { ...populated.profiles.web, extra: true } } }],
+    ['legacy v1 future schema', { ...legacyV1, schemaVersion: 3 }],
+    ['legacy v1 managed home id invalid', { ...legacyV1, managed: { ...legacyV1.managed!, homeId: 'not-a-home-id' } }],
+    ['legacy v1 extra field', { ...legacyV1, extra: true }],
   ])('rejects %s while preserving the exact source bytes', async (_name, value) => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const statePath = join(root, 'state.json')
     const source = Buffer.from(` \n${JSON.stringify(value)}\n `)
     try {
       await writeFile(statePath, source)
-      await expect(new FileStateStore(root).read()).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+      await expect(new FileStateStore(root, HOME_ID).read()).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
       await expect(readFile(statePath)).resolves.toEqual(source)
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -175,7 +250,7 @@ describe('StateStore schema', () => {
     const source = Buffer.from([0, 255, 123, 34, 120, 34, 58])
     try {
       await writeFile(statePath, source)
-      await expect(new FileStateStore(root).read()).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+      await expect(new FileStateStore(root, HOME_ID).read()).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
       await expect(readFile(statePath)).resolves.toEqual(source)
     } finally {
       await rm(root, { recursive: true, force: true })
@@ -188,7 +263,7 @@ describe('StateStore schema', () => {
       const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
       const secret = 'private-state-path-and-token'
       const failure = Object.assign(new Error(secret), { code })
-      const store = new FileStateStore(root, { readFile: async () => { throw failure } })
+      const store = new FileStateStore(root, HOME_ID, { readFile: async () => { throw failure } })
       try {
         let reported: unknown
         try {
@@ -211,16 +286,85 @@ describe('StateStore schema', () => {
   )
 })
 
+describe('StateStore v1 to v2 migration', () => {
+  it('migrates a persisted v1 managed state in memory and persists v2 atomically', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const statePath = join(root, 'state.json')
+    const source = Buffer.from(`${JSON.stringify(legacyV1)}\n`)
+    try {
+      await writeFile(statePath, source, { mode: 0o600 })
+      const store = new FileStateStore(root, HOME_ID)
+      await expect(store.read()).resolves.toEqual(migratedFromV1)
+
+      const persisted = JSON.parse(await readFile(statePath, 'utf8')) as Record<string, unknown>
+      expect(persisted).toEqual({ ...migratedFromV1 })
+      if (process.platform !== 'win32') {
+        expect((await stat(statePath)).mode & 0o777).toBe(0o600)
+      }
+      await expect(store.read()).resolves.toEqual(migratedFromV1)
+      await expect(transactionArtifacts(root)).resolves.toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('migrates a v1 state without managed using the store home identity', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const statePath = join(root, 'state.json')
+    const legacy: StateV1 = { schemaVersion: 1, profiles: { web: { mode: 'external', endpoint: 'https://search.example' } } }
+    try {
+      await writeFile(statePath, `${JSON.stringify(legacy)}\n`, { mode: 0o600 })
+      await expect(new FileStateStore(root, 'fedcba9876543210').read()).resolves.toEqual({
+        schemaVersion: 2,
+        homeId: 'fedcba9876543210',
+        profiles: legacy.profiles,
+      })
+      const persisted = JSON.parse(await readFile(statePath, 'utf8')) as { schemaVersion: number }
+      expect(persisted.schemaVersion).toBe(2)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('prefers the home identity recorded by the v1 managed state over the store default', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const statePath = join(root, 'state.json')
+    const foreign = { ...legacyV1, managed: { ...legacyV1.managed!, homeId: 'fedcba9876543210' } }
+    try {
+      await writeFile(statePath, `${JSON.stringify(foreign)}\n`, { mode: 0o600 })
+      await expect(new FileStateStore(root, HOME_ID).read()).resolves.toMatchObject({ homeId: 'fedcba9876543210' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('leaves the v1 file untouched when persisting the migrated v2 state fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
+    const statePath = join(root, 'state.json')
+    const source = Buffer.from(`${JSON.stringify(legacyV1)}\n`)
+    try {
+      await writeFile(statePath, source, { mode: 0o600 })
+      const store = new FileStateStore(root, HOME_ID, {
+        rename: (async () => { throw new Error('migration commit failed') }) as typeof fsRename,
+      })
+      await expect(store.read()).rejects.toBeDefined()
+      await expect(readFile(statePath)).resolves.toEqual(source)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('StateStore atomic write', () => {
   async function preservesOriginalWhen(
-    createFacade: (root: string, statePath: string) => ConstructorParameters<typeof FileStateStore>[1],
+    createFacade: (root: string, statePath: string) => ConstructorParameters<typeof FileStateStore>[2],
   ): Promise<void> {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const statePath = join(root, 'state.json')
     const original = Buffer.from([0, 255, 1, 2, 3, 10])
     await writeFile(statePath, original, { mode: 0o600 })
     try {
-      await expect(new FileStateStore(root, createFacade(root, statePath)).write(valid)).rejects.toBeDefined()
+      await expect(new FileStateStore(root, HOME_ID, createFacade(root, statePath)).write(valid)).rejects.toBeDefined()
       await expect(readFile(statePath)).resolves.toEqual(original)
       await expect(transactionArtifacts(root)).resolves.toEqual([])
     } finally {
@@ -289,7 +433,7 @@ describe('StateStore atomic write', () => {
     const statePath = join(root, 'state.json')
     let syncs = 0
     try {
-      const store = new FileStateStore(root, { open: injectedOpen((path, flags, handle) => {
+      const store = new FileStateStore(root, HOME_ID, { open: injectedOpen((path, flags, handle) => {
         if (path !== root || flags !== constants.O_RDONLY) return handle
         return wrappedHandle(handle, { sync: async () => {
           syncs += 1
@@ -313,7 +457,7 @@ describe('StateStore atomic write', () => {
     await writeFile(statePath, original, { mode: 0o600 })
     let syncs = 0
     try {
-      const store = new FileStateStore(root, {
+      const store = new FileStateStore(root, HOME_ID, {
         open: injectedOpen((path, flags, handle) => path === root && flags === constants.O_RDONLY
           ? wrappedHandle(handle, { sync: async () => {
             syncs += 1
@@ -344,7 +488,7 @@ describe('StateStore atomic write', () => {
     const original = Buffer.from('original state bytes')
     await writeFile(statePath, original, { mode: 0o600 })
     try {
-      const store = new FileStateStore(root, {
+      const store = new FileStateStore(root, HOME_ID, {
         ...(marker === '.tmp-' ? {
           open: injectedOpen((path, _flags, handle) => path.includes('.tmp-')
             ? wrappedHandle(handle, { writeFile: async () => { throw new Error('temp write failed') } })
@@ -369,7 +513,7 @@ describe('StateStore exclusive lock', () => {
     const lockPath = join(root, 'state.lock')
     await chmod(root, 0o777)
     try {
-      await expect(new FileStateStore(root).withLock(async () => {
+      await expect(new FileStateStore(root, HOME_ID).withLock(async () => {
         if (process.platform !== 'win32') {
           expect((await stat(root)).mode & 0o777).toBe(0o700)
           expect((await stat(lockPath)).mode & 0o777).toBe(0o600)
@@ -389,7 +533,7 @@ describe('StateStore exclusive lock', () => {
 
   it('rejects a concurrent holder with wait-and-retry guidance and releases in finally', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
-    const store = new FileStateStore(root)
+    const store = new FileStateStore(root, HOME_ID)
     let finish!: () => void
     const held = new Promise<void>((resolve) => { finish = resolve })
     try {
@@ -413,7 +557,7 @@ describe('StateStore exclusive lock', () => {
     const foreign = Buffer.from('stale foreign lock')
     await writeFile(lockPath, foreign, { mode: 0o600 })
     try {
-      await expect(new FileStateStore(root).withLock(async () => undefined)).rejects.toMatchObject({
+      await expect(new FileStateStore(root, HOME_ID).withLock(async () => undefined)).rejects.toMatchObject({
         code: 'E_STATE_INVALID', action: 'Wait and retry',
       })
       await expect(readFile(lockPath)).resolves.toEqual(foreign)
@@ -431,7 +575,7 @@ describe('StateStore exclusive lock', () => {
       const replacementPath = join(root, 'state.lock.foreign')
       let foreign: Buffer | undefined
       try {
-        const store = new FileStateStore(root, {
+        const store = new FileStateStore(root, HOME_ID, {
           rename: (async (from: string, to: string) => {
             if (from === lockPath && to.includes('state.lock.release-') && foreign === undefined) {
               foreign = kind === 'same-token foreign inode' ? await readFile(from) : Buffer.from('not-json')
@@ -460,7 +604,7 @@ describe('StateStore exclusive lock', () => {
     const conflict = Buffer.from('new canonical conflict')
     let replaced = false
     try {
-      const store = new FileStateStore(root, {
+      const store = new FileStateStore(root, HOME_ID, {
         rename: (async (from: string, to: string) => {
           if (from === lockPath && to.includes('state.lock.release-') && !replaced) {
             await rm(from)
@@ -502,7 +646,7 @@ describe('StateStore exclusive lock', () => {
             } } : {}),
           })
         }) as typeof fsOpen
-        await expect(new FileStateStore(root, { open }).withLock(async () => 'done')).rejects.toBeDefined()
+        await expect(new FileStateStore(root, HOME_ID, { open }).withLock(async () => 'done')).rejects.toBeDefined()
         await expect(readFile(lockPath, 'utf8')).resolves.toContain('"identity"')
         expect((await readdir(root)).some((name) => name.startsWith('state.lock.release-'))).toBe(true)
       } finally {
@@ -528,7 +672,7 @@ describe('StateStore exclusive lock', () => {
             } } : {}),
           })
         })
-        await expect(new FileStateStore(root, { open }).withLock(async () => undefined)).rejects.toBeDefined()
+        await expect(new FileStateStore(root, HOME_ID, { open }).withLock(async () => undefined)).rejects.toBeDefined()
         await expect(lockArtifacts(root)).resolves.toEqual(failure === 'fstat' ? ['state.lock'] : [])
       } finally {
         await rm(root, { recursive: true, force: true })
@@ -548,7 +692,7 @@ describe('StateStore exclusive lock', () => {
           },
         })
       })
-      await expect(new FileStateStore(root, { open }).withLock(async () => undefined)).rejects.toThrow(
+      await expect(new FileStateStore(root, HOME_ID, { open }).withLock(async () => undefined)).rejects.toThrow(
         'partial lock write failed',
       )
       await expect(lockArtifacts(root)).resolves.toEqual([])
@@ -573,7 +717,7 @@ describe('StateStore exclusive lock', () => {
           },
         })
       })
-      await expectAggregate(new FileStateStore(root, { open }).withLock(async () => undefined), [
+      await expectAggregate(new FileStateStore(root, HOME_ID, { open }).withLock(async () => undefined), [
         'partial lock write failed',
         'Lock ownership changed during acquisition cleanup',
       ])
@@ -588,7 +732,7 @@ describe('StateStore exclusive lock', () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     const lockPath = join(root, 'state.lock')
     try {
-      const renameFailure = new FileStateStore(root, { rename: (async (from: string, to: string) => {
+      const renameFailure = new FileStateStore(root, HOME_ID, { rename: (async (from: string, to: string) => {
         if (from === lockPath && to.includes('state.lock.release-')) throw new Error('release rename failed')
         return fsRename(from, to)
       }) as typeof fsRename })
@@ -596,7 +740,7 @@ describe('StateStore exclusive lock', () => {
       await expect(readFile(lockPath, 'utf8')).resolves.toContain('"identity"')
       await rm(lockPath)
 
-      const removeFailure = new FileStateStore(root, { rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
+      const removeFailure = new FileStateStore(root, HOME_ID, { rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
         if (path.includes('state.lock.release-')) throw new Error('release remove failed')
         return rm(path, options)
       }) as typeof rm })
@@ -610,7 +754,7 @@ describe('StateStore exclusive lock', () => {
   it('aggregates operation and release cleanup failures', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-state-'))
     try {
-      const store = new FileStateStore(root, { rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
+      const store = new FileStateStore(root, HOME_ID, { rm: (async (path: string, options?: Parameters<typeof rm>[1]) => {
         if (path.includes('state.lock.release-')) throw new Error('release cleanup failed')
         return rm(path, options)
       }) as typeof rm })
