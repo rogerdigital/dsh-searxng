@@ -90,8 +90,9 @@ resources are refused.
 
 ### Recovery semantics
 
-Every lifecycle operation (setup, repair, update, remove) is journaled under
-`$DSH_HOME/dsh-searxng/journal.json` between its first mutation and its validated completion.
+`repair` and `update` journal their progress under
+`$DSH_HOME/dsh-searxng/journal.json` between the first mutation and validated completion; `setup`
+and `remove` read that journal to refuse during or clean up after an interruption.
 
 - `setup` refuses to run while an interrupted operation is recorded and points at `repair`.
 - `repair` takes over when a journal exists: it recomputes the recovery decision from disk (clear
