@@ -45,6 +45,12 @@ function harness(options: {
       resolve: vi.fn(async () => ({ dshHome: '/dsh', profileDir: '/dsh/profiles/web', managedDir: '/dsh/dsh-searxng', homeId: HOME_ID })),
       preflightDsh: vi.fn(async () => { if (options.dshError !== undefined) throw options.dshError }), preflightManaged: vi.fn(),
     },
+    journal: {
+      read: vi.fn(async () => undefined),
+      begin: vi.fn(),
+      transition: vi.fn(),
+      clear: vi.fn(),
+    },
     state: {
       read: vi.fn(async () => structuredClone(current)),
       write: vi.fn(async (next) => { events.push('state-write'); if (options.writeFailure) throw new Error('write'); current = structuredClone(next); writes.push(structuredClone(next)) }),

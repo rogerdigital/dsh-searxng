@@ -1,4 +1,5 @@
-import { lstat, readFile, rm, stat } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
+import { link, lstat, readFile, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { parse } from 'yaml'
 import type { AssetRenderer, ManagedIdentity } from './assets.ts'
@@ -85,8 +86,8 @@ export interface RecoveryPlan {
   endpoint: string
   ageMs: number
   decision: RecoveryDecision
-  /** Stale state lock observed during planning; only the executor may remove it. */
-  staleLock?: { pid: number }
+  /** Stale state lock observed during planning (pid and identity token); only the executor may remove it. */
+  staleLock?: { pid: number; identity: string }
   summary: string[]
 }
 
@@ -246,13 +247,16 @@ function recoveryIncomplete(error: unknown): CliError {
  * Conservative matrix for non-update kinds: this plan's verified recovery
  * paths are for updates. A prepared journal whose state is untouched cleared
  * trivially; anything further along blocks with clean-up guidance because
- * setup, remove, and repair have no journal-recorded rollback target.
+ * setup, remove, and repair have no journal-recorded rollback target. The
+ * guidance names the escape path that actually terminates: remove --service
+ * --purge-data clears the journal with the deployment, so the subsequent
+ * setup is not refused.
  */
 function nonUpdateInterrupted(journal: OperationJournal): CliError {
   return new CliError(
     'E_STATE_INVALID',
     `An interrupted ${journal.kind} operation is recorded in phase ${journal.phase}; automatic recovery only supports updates`,
-    'Run dsh-searxng doctor --json, then remove the deployment with dsh-searxng remove --service and re-create it with dsh-searxng setup',
+    'Run dsh-searxng doctor --json, then remove the interrupted deployment with dsh-searxng remove --service --purge-data and re-create it with dsh-searxng setup',
   )
 }
 
@@ -653,7 +657,22 @@ type StateLockObservation =
   | { kind: 'absent' }
   | { kind: 'live' }
   | { kind: 'unverifiable' }
-  | { kind: 'stale'; pid: number }
+  | { kind: 'stale'; pid: number; identity: string }
+
+/** Lock metadata exactly as the state store writes it: pid plus identity token. */
+function parseLockMetadata(source: string): { pid: number; identity: string } | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(source)
+  } catch {
+    return undefined
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+  const { pid, identity } = parsed as { pid?: unknown; identity?: unknown }
+  if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid < 1) return undefined
+  if (typeof identity !== 'string' || identity.length === 0) return undefined
+  return { pid, identity }
+}
 
 async function inspectStateLock(managedDir: string): Promise<StateLockObservation> {
   let source: string
@@ -663,14 +682,70 @@ async function inspectStateLock(managedDir: string): Promise<StateLockObservatio
     if (errorCode(error) === 'ENOENT') return { kind: 'absent' }
     return { kind: 'unverifiable' }
   }
-  let pid: unknown
+  const metadata = parseLockMetadata(source)
+  if (metadata === undefined) return { kind: 'unverifiable' }
+  return isProcessAlive(metadata.pid)
+    ? { kind: 'live' }
+    : { kind: 'stale', pid: metadata.pid, identity: metadata.identity }
+}
+
+/**
+ * Delete a recorded stale state lock without a blind unlink: rename it to an
+ * unpredictable quarantine name first (the same discipline as the state
+ * store's own release), then re-inspect the quarantined bytes. Only a lock
+ * that is still the exact stale lock observed during planning — same PID and
+ * identity token, owner still dead — is deleted. Anything else is linked back
+ * into place untouched (unless a newer lock already occupies the path, in
+ * which case the quarantined leftover is inert and simply disposed of), so a
+ * concurrent recovery can never delete another process's freshly acquired
+ * live lock and break mutual exclusion.
+ */
+async function quarantineStaleStateLock(managedDir: string, expected: { pid: number; identity: string }): Promise<void> {
+  const lockPath = join(managedDir, 'state.lock')
+  const quarantinePath = join(managedDir, `state.lock.recovery-${randomBytes(16).toString('hex')}`)
+  let quarantined = false
   try {
-    pid = (JSON.parse(source) as { pid?: unknown }).pid
-  } catch {
-    return { kind: 'unverifiable' }
+    await rename(lockPath, quarantinePath)
+    quarantined = true
+  } catch (error) {
+    // Another recovery already removed the stale lock; nothing to clean up.
+    if (errorCode(error) === 'ENOENT') return
+    throw staleLockRemovalFailed()
   }
-  if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid < 1) return { kind: 'unverifiable' }
-  return isProcessAlive(pid) ? { kind: 'live' } : { kind: 'stale', pid }
+
+  let metadata: { pid: number; identity: string } | undefined
+  try {
+    metadata = parseLockMetadata(await readFile(quarantinePath, 'utf8'))
+  } catch {
+    metadata = undefined
+  }
+  if (
+    metadata !== undefined &&
+    metadata.pid === expected.pid &&
+    metadata.identity === expected.identity &&
+    !isProcessAlive(metadata.pid)
+  ) {
+    try {
+      await rm(quarantinePath, { force: true })
+    } catch {
+      throw staleLockRemovalFailed()
+    }
+    return
+  }
+
+  // Not provably the recorded stale lock: restore it as the active lock. A
+  // newer lock having taken the path in the meantime is left in charge and
+  // the quarantined leftover disposed of.
+  try {
+    await link(quarantinePath, lockPath)
+  } catch (error) {
+    if (errorCode(error) !== 'EEXIST') throw staleLockRemovalFailed()
+  }
+  try {
+    await rm(quarantinePath, { force: true })
+  } catch {
+    throw staleLockRemovalFailed()
+  }
 }
 
 /** Configuration digest carried by a content-addressed bundle path, when the shape matches. */
@@ -816,6 +891,11 @@ async function classifyRecovery(
       return { type: 'resume-rollback', previous }
     }
     case 'validating': {
+      // Same reachability gate as the rollback phases: without the daemon the
+      // target probe would burn its retry budget against a dead runtime and
+      // the inevitable rollback could not run, advancing the journal to
+      // rolling-back for nothing. Start Docker and re-run repair instead.
+      if (!observation.reachable) return { type: 'blocked', error: dockerOffline() }
       if (hashMatches) {
         const catalogError = crossCheckCatalog(dependencies, state.schemaVersion, target)
         if (catalogError !== undefined) return { type: 'blocked', error: catalogError }
@@ -914,7 +994,7 @@ export async function planRecovery(
     endpoint,
     ageMs,
     decision,
-    ...(lock.kind === 'stale' ? { staleLock: { pid: lock.pid } } : {}),
+    ...(lock.kind === 'stale' ? { staleLock: { pid: lock.pid, identity: lock.identity } } : {}),
     summary: summarizeRecovery(journal, decision, lock),
   }
 }
@@ -1046,14 +1126,7 @@ export async function executeRecovery(
   try {
     const environment = await dependencies.environment.resolve(plan.profile)
     if (plan.staleLock !== undefined) {
-      const observation = await inspectStateLock(environment.managedDir)
-      if (observation.kind === 'stale' && observation.pid === plan.staleLock.pid) {
-        try {
-          await rm(join(environment.managedDir, 'state.lock'), { force: true })
-        } catch {
-          throw staleLockRemovalFailed()
-        }
-      }
+      await quarantineStaleStateLock(environment.managedDir, plan.staleLock)
     }
     return await dependencies.state.withLock(async () => {
       signal?.throwIfAborted()

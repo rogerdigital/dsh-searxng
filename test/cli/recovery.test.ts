@@ -14,6 +14,7 @@ import { FileStateStore, type DeploymentSnapshot, type StateV2 } from '../../src
 import type { DeploymentDefinition } from '../../src/cli/deployments.ts'
 import { diagnose, inspectSnapshot, type SnapshotDependencies } from '../../src/cli/diagnostics.ts'
 import { executeRepair, executeRecovery, planRecovery, type RecoveryDependencies, type RepairDependencies } from '../../src/cli/repair.ts'
+import { remove, removeManagedDirectory, type RemoveDependencies } from '../../src/cli/remove.ts'
 import { setup } from '../../src/cli/setup.ts'
 import { runCli } from '../../src/cli.ts'
 
@@ -337,6 +338,32 @@ describe('planRecovery classifies interrupted updates from on-disk state', () =>
     })
   })
 
+  it('blocks validating recovery while Docker is offline instead of burning validation retries', async () => {
+    await withWorld(
+      { phase: 'validating', state: managedState(), running: 'target', dockerOffline: true },
+      async (materialized, graph) => {
+        const plan = await planRecovery('web', materialized.journal, graph.dependencies)
+        expect(plan.decision).toMatchObject({ type: 'blocked', error: { code: 'E_DOCKER_OFFLINE' } })
+        expect(graph.searxng.readiness).not.toHaveBeenCalled()
+        await expect(stat(graph.journalPath)).resolves.toBeDefined()
+      },
+    )
+    // The post-commit crash window gets the same gate: no probe, no rollback attempt.
+    await withWorld(
+      {
+        phase: 'validating',
+        state: managedState(TARGET_SNAPSHOT, CURRENT_SNAPSHOT),
+        running: 'target',
+        beforeStateSha256: UNRELATED_HASH,
+        dockerOffline: true,
+      },
+      async (materialized, graph) => {
+        const plan = await planRecovery('web', materialized.journal, graph.dependencies)
+        expect(plan.decision).toMatchObject({ type: 'blocked', error: { code: 'E_DOCKER_OFFLINE' } })
+      },
+    )
+  })
+
   it('blocks when the target deployment is absent from the packaged catalog', async () => {
     await withWorld(
       { phase: 'validating', state: managedState(), running: 'target', catalog: [CATALOG[0]!] },
@@ -637,11 +664,38 @@ describe('state lock handling during recovery', () => {
       { phase: 'prepared', state: managedState(), lock: `${JSON.stringify({ pid, timestamp: START, identity: 'a'.repeat(32) })}\n` },
       async (materialized, graph) => {
         const plan = await planRecovery('web', materialized.journal, graph.dependencies)
-        expect(plan.staleLock).toEqual({ pid })
+        expect(plan.staleLock).toEqual({ pid, identity: 'a'.repeat(32) })
         const outcome = await executeRecovery(plan, graph.dependencies)
         expect(outcome.outcome).toBe('journal-cleared')
         await expect(stat(graph.lockPath)).rejects.toMatchObject({ code: 'ENOENT' })
         await expect(stat(graph.journalPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      },
+    )
+  })
+
+  it('never deletes a lock that was replaced after planning: it is restored and recovery blocks safely', async () => {
+    const pid = await deadPid()
+    await withWorld(
+      { phase: 'prepared', state: managedState(), lock: `${JSON.stringify({ pid, timestamp: START, identity: 'a'.repeat(32) })}\n` },
+      async (materialized, graph) => {
+        const plan = await planRecovery('web', materialized.journal, graph.dependencies)
+        expect(plan.staleLock).toBeDefined()
+        // Between the staleness check and the removal, the dead owner's lock
+        // file is replaced by a newly acquired live one.
+        await writeFile(
+          graph.lockPath,
+          `${JSON.stringify({ pid: process.pid, timestamp: START, identity: 'b'.repeat(32) })}\n`,
+          'utf8',
+        )
+        await expect(executeRecovery(plan, graph.dependencies)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+        // The live replacement is intact, byte for byte, and no quarantine leftovers remain.
+        await expect(readFile(graph.lockPath, 'utf8')).resolves.toBe(
+          `${JSON.stringify({ pid: process.pid, timestamp: START, identity: 'b'.repeat(32) })}\n`,
+        )
+        expect((await readdir(materialized.root)).filter((name) => name.startsWith('state.lock.recovery-'))).toEqual([])
+        // Evidence retained: nothing was recovered.
+        await expect(stat(graph.journalPath)).resolves.toBeDefined()
+        await expect(stateBytes(graph.statePath)).resolves.toBe(asBytes(managedState()))
       },
     )
   })
@@ -927,6 +981,165 @@ describe('setup respects an interrupted journal', () => {
       await expect(stateBytes(graph.statePath)).resolves.toBe(asBytes(managedState()))
       await expect(stat(graph.journalPath)).resolves.toBeDefined()
     })
+  })
+})
+
+describe('non-update journal escape path', () => {
+  function removeDeps(graph: ReturnType<typeof freshGraph>): RemoveDependencies {
+    return {
+      environment: graph.environment,
+      state: graph.dependencies.state,
+      journal: graph.dependencies.journal,
+      docker: graph.docker,
+      profiles: graph.profiles,
+      confirmPurge: vi.fn(async () => false),
+      removeManagedDirectory: vi.fn(async () => {}),
+    }
+  }
+
+  it('remove --service clears the journal after successful service removal', async () => {
+    await withWorld(
+      { phase: 'validating', kind: 'repair', state: managedState(), running: 'previous' },
+      async (materialized, graph) => {
+        const result = await remove(
+          { profile: 'web', service: true, purgeData: false, confirmed: false },
+          removeDeps(graph),
+        )
+        expect(result).toMatchObject({ profileRemoved: true, serviceRemoved: true })
+        expect(graph.docker.down).toHaveBeenCalledTimes(1)
+        // The journal's evidence purpose ended with the deployment.
+        await expect(stat(graph.journalPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      },
+    )
+  })
+
+  it('remove without --service never clears the journal: the deployment is still recorded', async () => {
+    await withWorld(
+      { phase: 'validating', kind: 'repair', state: managedState(), running: 'previous' },
+      async (materialized, graph) => {
+        await remove({ profile: 'web', service: false, purgeData: false, confirmed: false }, removeDeps(graph))
+        await expect(stat(graph.journalPath)).resolves.toBeDefined()
+      },
+    )
+  })
+
+  it('remove --service clears an interrupted journal even when no managed state remains', async () => {
+    const bare: StateV2 = { schemaVersion: 2, homeId: HOME_ID, profiles: {} }
+    await withWorld({ phase: 'mutating', kind: 'setup', state: bare }, async (materialized, graph) => {
+      const result = await remove(
+        { profile: 'web', service: true, purgeData: false, confirmed: false },
+        removeDeps(graph),
+      )
+      expect(result).toMatchObject({ serviceRemoved: true })
+      await expect(stat(graph.journalPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+  })
+
+  it('blocked guidance no longer loops: remove --service --purge-data lets setup succeed', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'dsh-searxng-escape-'))
+    try {
+      const dshHome = join(base, 'dsh')
+      const managedDir = join(dshHome, 'dsh-searxng')
+      await mkdir(managedDir, { recursive: true })
+      await writeFile(join(managedDir, 'state.json'), `${JSON.stringify(managedState())}\n`, 'utf8')
+      const journal = journalFixture('validating', { kind: 'repair', beforeStateSha256: stateSha256(managedState()) })
+      await writeFile(join(managedDir, 'journal.json'), `${JSON.stringify(journal)}\n`, 'utf8')
+
+      const environment: EnvironmentService = {
+        resolve: vi.fn(async () => ({ dshHome, profileDir: join(dshHome, 'profiles', 'web'), managedDir, homeId: HOME_ID })),
+        preflightManaged: vi.fn(async () => {}),
+        preflightDsh: vi.fn(async () => {}),
+      }
+      const composePath = join(managedDir, `config-${CURRENT_HASH}`, 'compose.yml')
+      const removeDocker: DockerAdapter = {
+        preflight: vi.fn(async () => ({ serverVersion: '27', composeVersion: '2.30' })),
+        inspectOwnership: vi.fn(async () => 'owned' as const),
+        up: vi.fn(async () => {}),
+        restart: vi.fn(),
+        down: vi.fn(async () => {}),
+        logs: vi.fn(async () => ''),
+        pull: vi.fn(),
+        imageExists: vi.fn(async () => true),
+        deploymentStatus: vi.fn(async () => ({ ownership: 'owned' as const, container: 'running' as const, composePath })),
+      }
+      // After the purge the deployment is gone: setup must see absent ownership.
+      const setupDocker: DockerAdapter = {
+        ...removeDocker,
+        inspectOwnership: vi.fn(async () => 'absent' as const),
+        deploymentStatus: vi.fn(async () => ({ ownership: 'absent' as const, container: 'absent' as const })),
+      }
+      const searxng: SearxngProbe = {
+        http: vi.fn(async () => {}),
+        readiness: vi.fn(async () => {}),
+        realSearch: vi.fn(async () => ({ endpoint: ENDPOINT, resultCount: 1, elapsedMs: 1 })),
+        providerSearch: vi.fn(async () => ({ endpoint: ENDPOINT, resultCount: 1, elapsedMs: 1 })),
+      }
+      const profiles: ProfileManager = {
+        inspect: vi.fn(),
+        preview: vi.fn(async () => ({ installed: false, attached: false, config: { baseURL: ENDPOINT } })),
+        validate: vi.fn(async (_profile: string, _endpoint: string, callback: (config: { baseURL: string }) => Promise<void>) => {
+          await callback({ baseURL: ENDPOINT })
+        }),
+        attach: vi.fn(async (_profile: string, endpoint: string, validate: (config: { baseURL: string }) => Promise<void>) => {
+          await validate({ baseURL: endpoint })
+        }),
+        detach: vi.fn(async () => {}),
+        uninstall: vi.fn(async () => {}),
+      }
+
+      // Step 1: recovery blocks with escape guidance that names remove --service.
+      const recoveryGraph: RecoveryDependencies = {
+        environment,
+        state: new FileStateStore(managedDir, HOME_ID),
+        journal: new FileJournalStore(managedDir),
+        docker: removeDocker,
+        searxng,
+        profiles,
+        now: () => new Date(RECOVERY_TIME),
+      }
+      const plan = await planRecovery('web', journal, recoveryGraph)
+      expect(plan.decision).toMatchObject({ type: 'blocked' })
+      expect((plan.decision as { error: CliError }).error.action).toContain('remove --service --purge-data')
+
+      // Step 2: remove --service --purge-data removes the deployment and journal.
+      const result = await remove(
+        { profile: 'web', service: true, purgeData: true, confirmed: true },
+        {
+          environment,
+          state: new FileStateStore(managedDir, HOME_ID),
+          journal: new FileJournalStore(managedDir),
+          docker: removeDocker,
+          profiles,
+          confirmPurge: vi.fn(async () => true),
+          removeManagedDirectory,
+        },
+      )
+      expect(result).toMatchObject({ serviceRemoved: true, dataPurged: true })
+      await expect(stat(managedDir)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      // Step 3: setup succeeds over the same world — no journal, no dead-loop.
+      const setupResult = await setup(
+        { profile: 'web', port: 8080, portExplicit: true },
+        {
+          environment,
+          state: new FileStateStore(managedDir, HOME_ID),
+          journal: new FileJournalStore(managedDir),
+          docker: setupDocker,
+          assets: {
+            render: vi.fn(async () => ({ composePath, configurationSha256: CURRENT_HASH })),
+          },
+          searxng,
+          profiles,
+          now: () => new Date(RECOVERY_TIME),
+        },
+      )
+      expect(setupResult).toEqual({ profile: 'web', endpoint: ENDPOINT, reused: false })
+      const recreated: StateV2 = JSON.parse(await readFile(join(managedDir, 'state.json'), 'utf8'))
+      expect(recreated.managed?.current).toMatchObject({ port: 8080, endpoint: ENDPOINT })
+      await expect(stat(join(managedDir, 'journal.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(base, { recursive: true, force: true })
+    }
   })
 })
 

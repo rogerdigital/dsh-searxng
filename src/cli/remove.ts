@@ -4,6 +4,7 @@ import type { ManagedIdentity } from './assets.ts'
 import type { DockerAdapter } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService } from './environment.ts'
+import type { JournalStore, OperationJournal } from './journal.ts'
 import { stateIdentity } from './managed.ts'
 import type { ProfileManager } from './profile.ts'
 import type { StateStore, StateV2 } from './state.ts'
@@ -13,6 +14,7 @@ export interface RemoveResult { profile: string; profileRemoved: boolean; servic
 export interface RemoveDependencies {
   environment: EnvironmentService
   state: StateStore
+  journal: JournalStore
   docker: DockerAdapter
   profiles: ProfileManager
   confirmPurge(volumes: readonly string[]): Promise<boolean>
@@ -66,11 +68,25 @@ export async function remove(
     const previous = await dependencies.state.read()
     const entry = previous.profiles[input.profile]
     const managed = previous.managed
+    // An unreadable journal never blocks removal itself: remove deletes the
+    // deployment, and --purge-data disposes of the damaged journal bytes.
+    let interrupted: OperationJournal | undefined
+    try {
+      interrupted = await dependencies.journal.read()
+    } catch {
+      interrupted = undefined
+    }
     const otherManaged = Object.entries(previous.profiles)
       .filter(([profile, value]) => profile !== input.profile && value.mode === 'managed')
       .map(([profile]) => profile)
     if (input.service && otherManaged.length > 0) throw blocked(`Managed service is still attached to: ${otherManaged.join(', ')}`)
-    if (input.service && (entry?.mode === 'external' || managed === undefined)) throw blocked('The selected profile does not own a managed service')
+    // Without a recorded interruption, --service against a state without a
+    // managed deployment is a likely mistake and stays blocked. With one, the
+    // operator is cleaning up after a crash (exactly what blocked recovery
+    // guidance directs), so removal is allowed to proceed and clear it.
+    if (input.service && (entry?.mode === 'external' || (managed === undefined && interrupted === undefined))) {
+      throw blocked('The selected profile does not own a managed service')
+    }
 
     const volumes = managed === undefined ? [] : [`${managed.current.projectName}-cache`]
     if (input.purgeData && !input.confirmed && !await dependencies.confirmPurge(volumes)) {
@@ -108,6 +124,13 @@ export async function remove(
       if (finalStatus.ownership !== 'owned' || finalStatus.composePath === undefined) throw blocked('Managed Docker ownership changed during removal')
       await dependencies.docker.down(identity(resolved.managedDir, previous.homeId, managed, finalStatus.composePath), input.purgeData, signal)
       if (input.purgeData) purgeDshHome = resolved.dshHome
+    }
+    // The journal's evidence purpose ends with the deployment: once service
+    // removal has succeeded under the lock, the interrupted operation is
+    // cleared so setup is not refused against a deployment that no longer
+    // exists. Every failure path above leaves it in place as evidence.
+    if (input.service && interrupted !== undefined) {
+      await dependencies.journal.clear(interrupted.id)
     }
     return { profile: input.profile, profileRemoved, serviceRemoved: input.service, dataPurged: input.purgeData }
   })
