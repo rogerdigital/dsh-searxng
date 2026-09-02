@@ -8,12 +8,14 @@ import { createInterface } from 'node:readline/promises'
 import { parseCliArgs } from './cli/args.ts'
 import { FileAssetRenderer } from './cli/assets.ts'
 import { CliDockerAdapter } from './cli/docker.ts'
-import { diagnose } from './cli/diagnostics.ts'
+import { diagnose, inspectSnapshot, type SnapshotDependencies } from './cli/diagnostics.ts'
 import { homeId, managedDir, NodeEnvironmentService, resolveDshHome, type PortChecker } from './cli/environment.ts'
 import { CliError } from './cli/errors.ts'
+import { FileJournalStore, type JournalStore } from './cli/journal.ts'
 import { presentError, presentSuccess } from './cli/presenter.ts'
 import { NodeProcessRunner, type CommandRunner } from './cli/process.ts'
 import { NodeProfileManager } from './cli/profile.ts'
+import { executeRepair, planRepair, type RepairDependencies } from './cli/repair.ts'
 import { remove, removeManagedDirectory, type RemoveDependencies } from './cli/remove.ts'
 import { DefaultSearxngProbe } from './cli/searxng.ts'
 import { setup, type SetupDependencies } from './cli/setup.ts'
@@ -32,6 +34,8 @@ export interface RunCliOptions {
 export interface CliDependencies extends SetupDependencies {
   confirmPurge: RemoveDependencies['confirmPurge']
   removeManagedDirectory: RemoveDependencies['removeManagedDirectory']
+  journal: JournalStore
+  probeAssets?: SnapshotDependencies['probeAssets']
 }
 
 export interface ProductionDependencyOptions {
@@ -70,12 +74,14 @@ Usage:
   dsh-searxng setup [--profile NAME] [--port PORT] [--url URL] [--json]
   dsh-searxng status [--profile NAME] [--json]
   dsh-searxng doctor [--profile NAME] [--json]
+  dsh-searxng repair [--profile NAME] [--json]
   dsh-searxng remove [--profile NAME] [--service] [--purge-data --yes] [--json]
 
 Commands:
   setup    Configure an external SearXNG endpoint or create an owned Docker service
   status   Stop at the first failed health check
   doctor   Report the complete ordered diagnostic chain
+  repair   Plan and execute ownership-safe repairs for the managed deployment
   remove   Detach a profile, optionally removing the owned service and data
 `
 
@@ -158,6 +164,7 @@ export function createProductionDependencies(options: ProductionDependencyOption
     now: () => new Date(),
     confirmPurge,
     removeManagedDirectory,
+    journal: new FileJournalStore(managedDir(dshHome)),
   }
 }
 
@@ -217,6 +224,55 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
           : new CliError(failure.code, failure.message, failure.action), presenter)
       }
       return result.healthy ? 0 : 1
+    }
+
+    if (command.command === 'repair') {
+      const extras = dependencies as Partial<CliDependencies>
+      if (extras.journal === undefined) {
+        throw new CliError('E_INTERNAL', 'The operation journal is unavailable', 'Reinstall dsh-searxng and retry')
+      }
+      const snapshotDependencies: SnapshotDependencies = {
+        environment: dependencies.environment,
+        state: dependencies.state,
+        docker: dependencies.docker,
+        profiles: dependencies.profiles,
+        searxng: dependencies.searxng,
+        journal: extras.journal,
+        ...(extras.probeAssets === undefined ? {} : { probeAssets: extras.probeAssets }),
+      }
+      const repairDependencies: RepairDependencies = {
+        environment: dependencies.environment,
+        state: dependencies.state,
+        docker: dependencies.docker,
+        assets: dependencies.assets,
+        searxng: dependencies.searxng,
+        profiles: dependencies.profiles,
+        journal: extras.journal,
+        diagnose: (profile) => inspectSnapshot(profile, snapshotDependencies, options.signal),
+        now: dependencies.now,
+      }
+      const plan = planRepair(await repairDependencies.diagnose(command.profile))
+      // The exact planned actions are shown to the operator before any mutation starts.
+      if (format === 'human') {
+        stdout([
+          `Repair plan for profile ${plan.profile}:`,
+          ...plan.summary.map((line) => `- ${line}`),
+          '',
+        ].join('\n'))
+      }
+      const result = await executeRepair(plan, repairDependencies, options.signal)
+      if (format === 'json') {
+        presentSuccess({ profile: command.profile, endpoint: plan.endpoint, healthy: true, actions: result.actions }, presenter)
+      } else {
+        stdout([
+          'SearXNG healthy',
+          `Profile: ${command.profile}`,
+          `Endpoint: ${plan.endpoint}`,
+          'Validation: real search and provider search passed',
+          '',
+        ].join('\n'))
+      }
+      return 0
     }
 
     if (command.command !== 'remove') throw usageError('Unsupported command')

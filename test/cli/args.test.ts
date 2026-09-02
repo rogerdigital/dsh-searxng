@@ -45,6 +45,18 @@ describe('parseCliArgs', () => {
     expect(parseCliArgs([command])).toEqual({ command, profile: 'web', json: false })
   })
 
+  it('parses repair with defaults', () => {
+    expect(parseCliArgs(['repair'])).toEqual({ command: 'repair', profile: 'web', json: false })
+  })
+
+  it('parses repair profile and JSON output', () => {
+    expect(parseCliArgs(['repair', '--profile', 'work', '--json'])).toEqual({
+      command: 'repair',
+      profile: 'work',
+      json: true,
+    })
+  })
+
   it('parses remove flags', () => {
     expect(parseCliArgs(['remove', '--service', '--purge-data', '--yes', '--json'])).toEqual({
       command: 'remove',
@@ -100,6 +112,11 @@ describe('parseCliArgs', () => {
     ['doctor purge-data', ['doctor', '--purge-data']],
     ['status yes', ['status', '--yes']],
     ['doctor yes', ['doctor', '--yes']],
+    ['repair port', ['repair', '--port', '8081']],
+    ['repair URL', ['repair', '--url', 'https://search.example']],
+    ['repair service', ['repair', '--service']],
+    ['repair purge-data', ['repair', '--purge-data']],
+    ['repair yes', ['repair', '--yes']],
     ['purge without service', ['remove', '--purge-data']],
   ] as const)('rejects %s', (_name, argv) => {
     expect(() => parseCliArgs(argv)).toThrow()

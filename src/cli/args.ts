@@ -16,6 +16,11 @@ export type CliCommand =
       json: boolean
     }
   | {
+      command: 'repair'
+      profile: string
+      json: boolean
+    }
+  | {
       command: 'remove'
       profile: string
       json: boolean
@@ -84,8 +89,8 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     }
     return { command: 'help' }
   }
-  if (!command || extra.length > 0 || !['setup', 'status', 'doctor', 'remove'].includes(command)) {
-    invalid('expected one command: setup, status, doctor, or remove')
+  if (!command || extra.length > 0 || !['setup', 'status', 'doctor', 'repair', 'remove'].includes(command)) {
+    invalid('expected one command: setup, status, doctor, repair, or remove')
   }
   const cliCommand = command as CliCommand['command']
 

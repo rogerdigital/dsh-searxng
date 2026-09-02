@@ -13,6 +13,12 @@ export interface DockerAdapter {
   down(identity: ManagedIdentity, volumes: boolean, signal?: AbortSignal): Promise<void>
   logs(identity: ManagedIdentity, tail: number, signal?: AbortSignal): Promise<string>
   deploymentStatus(identity: ManagedIdentity, signal?: AbortSignal): Promise<DockerDeploymentStatus>
+  /**
+   * Optional capability to delete a named temporary Docker resource after
+   * re-verifying this installation's ownership labels. Adapters without it
+   * make `remove-owned-temporary` repair actions fail closed.
+   */
+  removeOwnedResource?(resourceId: string, signal?: AbortSignal): Promise<void>
 }
 
 export interface DockerDeploymentStatus {
