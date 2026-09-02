@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Deferred / Not started — `repair`, transactional `update`, durable operation journals, state V2 migration, deployment catalogs, crash recovery, and three-platform Docker certification are not part of `0.2.1`. The unchecked boxes below remain the proposed future execution outline.
+**Status:** Implemented on `feat/managed-searxng-lifecycle` — durable operation journals with state V2 migration, ownership-safe `repair`, the versioned deployment catalog, transactional `update` with verified rollback, crash recovery through `doctor`/`repair`, and the packed-artifact certification runner are code-complete with the full suite and `pnpm verify` green. Remaining before a release claims the new lifecycle: run `certify:platform` on the three required environments per `docs/release-certification.md` (same tarball hash) and make `setup` select deployments from the catalog before any `deploymentVersion >= 2` entry ships. The unchecked boxes below preserve the original execution outline; this status line is authoritative.
 
 **Goal:** Add deterministic repair, crash recovery, transactional image updates with verified rollback, and release certification on every officially supported platform.
 
