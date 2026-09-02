@@ -11,6 +11,11 @@ on:
         required: false
         default: false
         type: boolean
+      run_certification:
+        description: Run the packed-artifact platform certification on Linux
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -48,7 +53,7 @@ jobs:
     name: Managed Docker journey
     if: github.event_name == 'workflow_dispatch' && inputs.run_docker_e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
@@ -65,6 +70,78 @@ jobs:
         run: DSH_SEARXNG_E2E=1 pnpm exec vitest run test/e2e/managed-setup.test.ts
       - name: Run Docker adapter integration
         run: DSH_SEARXNG_DOCKER_INTEGRATION=1 pnpm exec vitest run test/cli/docker.integration.test.ts
+      - name: Remove any labeled test resources
+        if: always()
+        shell: bash
+        run: |
+          docker ps -aq --filter label=io.dsh-searxng.managed=true | xargs -r docker rm -f
+          docker network ls -q --filter label=io.dsh-searxng.managed=true | xargs -r docker network rm
+          docker volume ls -q --filter label=io.dsh-searxng.managed=true | xargs -r docker volume rm
+
+  # Dispatch-only: runs the release certification runner against the packed
+  # tarball with real Docker Engine and Compose v2. CI images ship no real
+  # `dsh`, so a stub implementing the plugin add/remove surface sits on PATH
+  # (the same stand-in the Docker e2e journey uses). This automates the
+  # runner's mechanics on Linux only; it is not a formal release certification
+  # and provides no Docker Desktop coverage — those reports come from
+  # docs/release-certification.md.
+  certify-linux:
+    name: Linux packed-artifact certification
+    if: github.event_name == 'workflow_dispatch' && inputs.run_certification
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.23.0
+          run_install: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm pack:check
+      - name: Install a stub dsh
+        run: |
+          mkdir -p "$RUNNER_TEMP/stub-bin"
+          cat > "$RUNNER_TEMP/stub-bin/dsh" <<'EOF'
+          #!/usr/bin/env node
+          // CommonJS on purpose: the file lives outside the repository, so no
+          // package.json marks it as an ES module.
+          const { mkdir, readFile, writeFile } = require('node:fs/promises')
+          const { join } = require('node:path')
+          const args = process.argv.slice(2)
+          if (args[0] === '--version') { console.log('ci-stub'); process.exit(0) }
+          const profile = args[args.indexOf('--profile') + 1] || 'web'
+          const action = args.includes('add') ? 'add' : args.includes('remove') ? 'remove' : ''
+          if (!action) process.exit(2)
+          Promise.resolve().then(async () => {
+            const dir = join(process.env.DSH_HOME, 'profiles', profile)
+            await mkdir(dir, { recursive: true })
+            const path = join(dir, 'package.json')
+            let manifest = { dependencies: {} }
+            try { manifest = JSON.parse(await readFile(path, 'utf8')) } catch {}
+            manifest.dependencies ||= {}
+            if (action === 'add') manifest.dependencies['dsh-searxng'] = '0.1.1'
+            else delete manifest.dependencies['dsh-searxng']
+            await writeFile(path, JSON.stringify(manifest) + '\n')
+          }).catch(() => process.exit(2))
+          EOF
+          chmod +x "$RUNNER_TEMP/stub-bin/dsh"
+          echo "$RUNNER_TEMP/stub-bin" >> "$GITHUB_PATH"
+      - name: Certify the packed artifact
+        run: |
+          tarball="$(find node_modules/.cache/pack -maxdepth 1 -name '*.tgz' -print -quit)"
+          pnpm certify:platform -- --tarball "$tarball" | tee "$RUNNER_TEMP/certification-report.json"
+      - name: Upload certification report
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux-certification-report
+          path: ${{ runner.temp }}/certification-report.json
+          if-no-files-found: ignore
       - name: Remove any labeled test resources
         if: always()
         shell: bash
