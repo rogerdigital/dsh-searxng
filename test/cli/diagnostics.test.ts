@@ -125,6 +125,7 @@ function snapshotHarness(options: {
   container?: 'running' | 'stopped' | 'absent'
   dockerOffline?: boolean
   foreign?: boolean
+  deploymentOwnership?: 'owned' | 'absent' | 'foreign'
   assets?: 'valid' | 'missing' | 'invalid'
   portOccupied?: boolean
   authFailed?: boolean
@@ -134,6 +135,7 @@ function snapshotHarness(options: {
   currentEndpoint?: string
   journal?: OperationJournal
   profileMissing?: boolean
+  abortDuringPreview?: { controller: AbortController; reason: unknown }
 } = {}) {
   const mode = options.mode ?? 'managed'
   const calls: string[] = []
@@ -168,13 +170,21 @@ function snapshotHarness(options: {
       deploymentStatus: vi.fn(async () => {
         calls.push('ownership')
         if (options.foreign) throw new CliError('E_RESOURCE_FOREIGN', 'foreign', 'rename it')
-        return { ownership: 'owned' as const, container: options.container ?? 'running' as const, composePath: COMPOSE_PATH }
+        return {
+          ownership: options.deploymentOwnership ?? 'owned' as const,
+          container: options.container ?? 'running' as const,
+          composePath: COMPOSE_PATH,
+        }
       }),
     },
     profiles: {
       inspect: vi.fn(), attach: vi.fn(), detach: vi.fn(), uninstall: vi.fn(), validate: vi.fn(),
       preview: vi.fn(async () => {
         calls.push('profile')
+        if (options.abortDuringPreview !== undefined) {
+          options.abortDuringPreview.controller.abort(options.abortDuringPreview.reason)
+          throw options.abortDuringPreview.reason
+        }
         return {
           installed: options.attached ?? true,
           attached: options.attached ?? true,
@@ -317,5 +327,28 @@ describe('inspectSnapshot', () => {
   it('rejects a profile without a recorded attachment', async () => {
     const test = snapshotHarness({ profileMissing: true })
     await expect(inspectSnapshot('web', test.dependencies)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+  })
+
+  it('records an explicitly foreign inspection status as foreign ownership without probing', async () => {
+    const test = snapshotHarness({ deploymentOwnership: 'foreign' })
+    const snapshot = await inspectSnapshot('web', test.dependencies)
+    expect(snapshot).toMatchObject({ ownership: 'foreign', container: 'missing', endpoint: 'unreachable' })
+    expect(test.calls).not.toContain('http')
+  })
+
+  it('propagates cancellation raised while previewing the profile', async () => {
+    const cancellation = new DOMException('The operation was aborted', 'AbortError')
+    const controller = new AbortController()
+    const test = snapshotHarness({ dockerOffline: true, abortDuringPreview: { controller, reason: cancellation } })
+    await expect(inspectSnapshot('web', test.dependencies, controller.signal)).rejects.toBe(cancellation)
+    expect(test.calls).not.toContain('http')
+  })
+
+  it('feeds doctor an explicit foreign status as an E_RESOURCE_FOREIGN failure', async () => {
+    const test = snapshotHarness({ deploymentOwnership: 'foreign' })
+    const result = await diagnose('web', 'doctor', test.dependencies)
+    const ownership = result.checks.find((check) => check.id === 'ownership')
+    expect(ownership).toMatchObject({ status: 'fail', error: { code: 'E_RESOURCE_FOREIGN' } })
+    expect(result.healthy).toBe(false)
   })
 })

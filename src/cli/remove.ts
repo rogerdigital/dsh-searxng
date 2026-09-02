@@ -4,6 +4,7 @@ import type { ManagedIdentity } from './assets.ts'
 import type { DockerAdapter } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService } from './environment.ts'
+import { stateIdentity } from './managed.ts'
 import type { ProfileManager } from './profile.ts'
 import type { StateStore, StateV2 } from './state.ts'
 
@@ -26,14 +27,8 @@ function removalFailed(message: string): CliError {
   return new CliError('E_INTERNAL', message, 'Run dsh-searxng doctor and retry the removal')
 }
 
-function identity(managedDir: string, homeId: string, managed: NonNullable<StateV2['managed']>, composePath?: string): ManagedIdentity {
-  return {
-    stateDir: managedDir,
-    composePath: composePath ?? `${managedDir}/config-${'0'.repeat(64)}/compose.yml`,
-    homeId,
-    projectName: managed.current.projectName,
-    containerName: managed.current.containerName,
-  }
+function identity(managedDir: string, homeId: string, managed: NonNullable<StateV2['managed']>, composePath?: string) {
+  return stateIdentity(managedDir, homeId, managed.current, composePath)
 }
 
 async function writeWithRestore(state: StateStore, previous: StateV2, next: StateV2): Promise<void> {

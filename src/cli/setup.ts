@@ -1,9 +1,9 @@
 import { randomBytes } from 'node:crypto'
-import { join } from 'node:path'
 import { SEARXNG_IMAGE, type AssetRenderer, type ManagedIdentity } from './assets.ts'
 import type { DockerAdapter } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService, ResolvedEnvironment } from './environment.ts'
+import { canonicalIdentity, healthyTimestamp, isAbort } from './managed.ts'
 import type { ProfileManager } from './profile.ts'
 import type { SearxngProbe } from './searxng.ts'
 import type { DeploymentSnapshot, StateStore, StateV2 } from './state.ts'
@@ -86,15 +86,8 @@ function safeEndpoint(value: string): string {
   return url.toString().replace(/\/$/, '')
 }
 
-function canonicalIdentity(environment: ResolvedEnvironment): ManagedIdentity {
-  const name = `dsh-searxng-${environment.homeId}`
-  return {
-    stateDir: environment.managedDir,
-    composePath: join(environment.managedDir, `config-${'0'.repeat(64)}`, 'compose.yml'),
-    homeId: environment.homeId,
-    projectName: name,
-    containerName: name,
-  }
+function healthyTimestampFor(dependencies: SetupDependencies): string {
+  return healthyTimestamp(dependencies.now, setupFailed)
 }
 
 function isMatchingManagedState(
@@ -112,12 +105,6 @@ function isMatchingManagedState(
     managed.current.port === port &&
     managed.current.projectName === identity.projectName &&
     managed.current.containerName === identity.containerName
-}
-
-function healthyTimestamp(dependencies: SetupDependencies): string {
-  const timestamp = dependencies.now().toISOString()
-  if (new Date(timestamp).toISOString() !== timestamp) throw setupFailed()
-  return timestamp
 }
 
 function managedState(
@@ -144,7 +131,7 @@ function managedState(
     homeId: identity.homeId,
     managed: {
       current,
-      lastHealthyAt: healthyTimestamp(dependencies),
+      lastHealthyAt: healthyTimestampFor(dependencies),
     },
     profiles: { ...previous.profiles, [input.profile]: { mode: 'managed', endpoint } },
   }
@@ -245,11 +232,6 @@ async function cleanupCreatedDeployment(
   return failures
 }
 
-function isAbort(error: unknown, signal?: AbortSignal): boolean {
-  return signal?.aborted === true ||
-    (error !== null && typeof error === 'object' && 'name' in error && error.name === 'AbortError')
-}
-
 function isIncompleteRollback(error: unknown): error is CliError {
   return error instanceof CliError &&
     Array.isArray(error.details.rollbackFailures) &&
@@ -288,7 +270,7 @@ async function managedSetup(
   signal?: AbortSignal,
 ): Promise<SetupResult> {
   const endpoint = `http://127.0.0.1:${input.port}`
-  const placeholderIdentity = canonicalIdentity(environment)
+  const placeholderIdentity = canonicalIdentity(environment.managedDir, environment.homeId)
 
   await dependencies.docker.preflight(signal)
   const ownership = await dependencies.docker.inspectOwnership(placeholderIdentity, signal)

@@ -149,6 +149,37 @@ async function confirmPurge(volumes: readonly string[]): Promise<boolean> {
   }
 }
 
+/** Repair wiring mirrors setup/remove: snapshot deps and executor deps over the shared dependency object. */
+function createRepairDependencies(
+  dependencies: SetupDependencies,
+  extras: Partial<CliDependencies>,
+  signal?: AbortSignal,
+): RepairDependencies {
+  if (extras.journal === undefined) {
+    throw new CliError('E_INTERNAL', 'The operation journal is unavailable', 'Reinstall dsh-searxng and retry')
+  }
+  const snapshotDependencies: SnapshotDependencies = {
+    environment: dependencies.environment,
+    state: dependencies.state,
+    docker: dependencies.docker,
+    profiles: dependencies.profiles,
+    searxng: dependencies.searxng,
+    journal: extras.journal,
+    ...(extras.probeAssets === undefined ? {} : { probeAssets: extras.probeAssets }),
+  }
+  return {
+    environment: dependencies.environment,
+    state: dependencies.state,
+    docker: dependencies.docker,
+    assets: dependencies.assets,
+    searxng: dependencies.searxng,
+    profiles: dependencies.profiles,
+    journal: extras.journal,
+    diagnose: (profile) => inspectSnapshot(profile, snapshotDependencies, signal),
+    now: dependencies.now,
+  }
+}
+
 export function createProductionDependencies(options: ProductionDependencyOptions = {}): CliDependencies {
   const env = options.env ?? process.env
   const dshHome = resolveDshHome(env, options.homedir)
@@ -227,30 +258,7 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
     }
 
     if (command.command === 'repair') {
-      const extras = dependencies as Partial<CliDependencies>
-      if (extras.journal === undefined) {
-        throw new CliError('E_INTERNAL', 'The operation journal is unavailable', 'Reinstall dsh-searxng and retry')
-      }
-      const snapshotDependencies: SnapshotDependencies = {
-        environment: dependencies.environment,
-        state: dependencies.state,
-        docker: dependencies.docker,
-        profiles: dependencies.profiles,
-        searxng: dependencies.searxng,
-        journal: extras.journal,
-        ...(extras.probeAssets === undefined ? {} : { probeAssets: extras.probeAssets }),
-      }
-      const repairDependencies: RepairDependencies = {
-        environment: dependencies.environment,
-        state: dependencies.state,
-        docker: dependencies.docker,
-        assets: dependencies.assets,
-        searxng: dependencies.searxng,
-        profiles: dependencies.profiles,
-        journal: extras.journal,
-        diagnose: (profile) => inspectSnapshot(profile, snapshotDependencies, options.signal),
-        now: dependencies.now,
-      }
+      const repairDependencies = createRepairDependencies(dependencies, dependencies as Partial<CliDependencies>, options.signal)
       const plan = planRepair(await repairDependencies.diagnose(command.profile))
       // The exact planned actions are shown to the operator before any mutation starts.
       if (format === 'human') {

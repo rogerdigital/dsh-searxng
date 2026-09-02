@@ -62,8 +62,11 @@ class TransientProbeError extends Error {}
 const TLS_FAILURE_CODE = /^(?:ERR_TLS|ERR_SSL|UNABLE_TO_VERIFY_LEAF_SIGNATURE|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|CERT_HAS_EXPIRED|CERT_NOT_YET_VALID|CERT_SIGNATURE_FAILURE|EPROTO)/
 
 function isTlsFailure(error: unknown): boolean {
+  // Bounded walk: hostile or accidental cyclic/deep cause chains must
+  // terminate instead of spinning the event loop.
+  const MAX_CAUSE_DEPTH = 8
   let current: unknown = error
-  while (current !== null && typeof current === 'object') {
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && current !== null && typeof current === 'object'; depth += 1) {
     const code = (current as { code?: unknown }).code
     if (typeof code === 'string' && TLS_FAILURE_CODE.test(code)) return true
     current = (current as { cause?: unknown }).cause

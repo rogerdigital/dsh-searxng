@@ -1,13 +1,13 @@
 import { readFile, stat } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
-import type { ManagedIdentity } from './assets.ts'
+import { join } from 'node:path'
 import type { DockerAdapter, DockerDeploymentStatus } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService } from './environment.ts'
 import { stateSha256, type JournalStore, type OperationJournal } from './journal.ts'
-import type { ProfileAttachmentPreview, ProfileManager } from './profile.ts'
+import { bundleDirectory, rethrowCancellation, stateIdentity } from './managed.ts'
+import type { ProfileAttachmentConfig, ProfileAttachmentPreview, ProfileManager } from './profile.ts'
 import type { SearxngProbe } from './searxng.ts'
-import type { DeploymentSnapshot, StateStore, StateV2 } from './state.ts'
+import type { DeploymentSnapshot, StateStore } from './state.ts'
 
 export interface DiagnosticCheck {
   id: string
@@ -70,15 +70,6 @@ export interface SnapshotDependencies extends DiagnosticDependencies {
   probeAssets?(input: AssetProbeInput): Promise<AssetProbeStatus>
 }
 
-function isAbortError(error: unknown): boolean {
-  return error !== null && typeof error === 'object' && 'name' in error && error.name === 'AbortError'
-}
-
-function rethrowCancellation(error: unknown, signal?: AbortSignal): void {
-  if (signal?.aborted) signal.throwIfAborted()
-  if (isAbortError(error)) throw error
-}
-
 const EXPECTED_ENVIRONMENT: ReadonlyArray<readonly [string, (input: AssetProbeInput) => string]> = [
   ['DSH_SEARXNG_IMAGE', (input) => input.current.image],
   ['DSH_SEARXNG_PORT', (input) => String(input.current.port)],
@@ -94,9 +85,7 @@ const EXPECTED_ENVIRONMENT: ReadonlyArray<readonly [string, (input: AssetProbeIn
  * exist. The SearXNG secret itself is never read or compared here.
  */
 async function fileAssetProbe(input: AssetProbeInput): Promise<AssetProbeStatus> {
-  const bundleDir = input.current.configurationSha256 !== undefined
-    ? join(input.stateDir, `config-${input.current.configurationSha256}`)
-    : input.composePath === undefined ? undefined : dirname(input.composePath)
+  const bundleDir = bundleDirectory(input.stateDir, input.current, input.composePath)
   if (bundleDir === undefined) return 'missing'
   try {
     await stat(bundleDir)
@@ -156,12 +145,18 @@ export async function inspectSnapshot(
     if (docker === 'healthy') {
       try {
         const status = await dependencies.docker.deploymentStatus(
-          identity(environment.managedDir, state.homeId, managed),
+          stateIdentity(environment.managedDir, state.homeId, managed.current),
           signal,
         )
         ownership = status.ownership
         container = status.container === 'absent' ? 'missing' : status.container
         composePath = status.composePath
+        if (ownership === 'foreign') {
+          // A reported-foreign deployment is not ours: the container value is
+          // untrusted and its endpoint must not be probed as if it were.
+          container = 'missing'
+          probeEndpoint = false
+        }
       } catch (error) {
         rethrowCancellation(error, signal)
         ownership = 'foreign'
@@ -189,29 +184,11 @@ export async function inspectSnapshot(
     }
   }
 
-  let preview: ProfileAttachmentPreview | undefined
-  try {
-    preview = await dependencies.profiles.preview(profile, expectedEndpoint, signal)
-  } catch {
-    preview = undefined
-  }
+  const { preview } = await observeAttachment(dependencies.profiles, profile, expectedEndpoint, signal)
 
-  let endpointHealth: DiagnosticSnapshot['endpoint'] = 'healthy'
-  if (probeEndpoint) {
-    const config = preview?.config ?? { baseURL: expectedEndpoint }
-    try {
-      await dependencies.searxng.http(config, signal)
-      await dependencies.searxng.readiness({ ...config, attempts: 1, timeoutMs: 10_000 }, signal)
-      await dependencies.searxng.realSearch(config, signal)
-    } catch (error) {
-      rethrowCancellation(error, signal)
-      endpointHealth = error instanceof CliError && error.code === 'E_AUTH_FAILED'
-        ? 'auth-failed'
-        : error instanceof CliError && error.code === 'E_TLS_FAILED' ? 'tls-failed' : 'unreachable'
-    }
-  } else {
-    endpointHealth = 'unreachable'
-  }
+  const endpointHealth: DiagnosticSnapshot['endpoint'] = probeEndpoint
+    ? await probeEndpointHealth(dependencies.searxng, preview?.config ?? { baseURL: expectedEndpoint }, signal)
+    : 'unreachable'
 
   const attached = preview !== undefined && preview.installed && preview.attached
 
@@ -249,17 +226,67 @@ function invalidState(message: string): CliError {
   return new CliError('E_STATE_INVALID', message, 'Run dsh-searxng setup or repair the recorded attachment')
 }
 
-function identity(
-  managedDir: string,
-  homeId: string,
-  managed: NonNullable<Awaited<ReturnType<StateStore['read']>>['managed']>,
-): ManagedIdentity {
+function resourceForeign(): CliError {
+  return new CliError(
+    'E_RESOURCE_FOREIGN',
+    'A same-name Docker resource is not owned by this dsh-searxng installation',
+    'Rename or remove the foreign resource, then retry',
+  )
+}
+
+/**
+ * Shared attachment observation used by both `diagnose` and `inspectSnapshot`.
+ * `diagnose` previews the profile's recorded endpoint so doctor can report
+ * attachment drift; `inspectSnapshot` previews the state-truth endpoint
+ * (the managed deployment's) because repair plans against state. The preview
+ * call, its error handling, and the effective-config derivation are one
+ * pipeline so the two observers cannot drift.
+ */
+interface AttachmentObservation {
+  preview?: ProfileAttachmentPreview
+  previewError?: unknown
+}
+
+async function observeAttachment(
+  profiles: ProfileManager,
+  profile: string,
+  endpoint: string,
+  signal?: AbortSignal,
+): Promise<AttachmentObservation> {
+  let preview: ProfileAttachmentPreview | undefined
+  let previewError: unknown
+  try {
+    preview = await profiles.preview(profile, endpoint, signal)
+  } catch (error) {
+    rethrowCancellation(error, signal)
+    previewError = error
+  }
   return {
-    stateDir: managedDir,
-    composePath: `${managedDir}/config-${'0'.repeat(64)}/compose.yml`,
-    homeId,
-    projectName: managed.current.projectName,
-    containerName: managed.current.containerName,
+    ...(preview === undefined ? {} : { preview }),
+    ...(previewError === undefined ? {} : { previewError }),
+  }
+}
+
+/**
+ * Shared endpoint probe chain and classification. Doctor reports each stage
+ * as its own check; the snapshot consumes the same chain through this
+ * classifier so repair and doctor observe identical probe semantics.
+ */
+async function probeEndpointHealth(
+  searxng: SearxngProbe,
+  config: ProfileAttachmentConfig,
+  signal?: AbortSignal,
+): Promise<DiagnosticSnapshot['endpoint']> {
+  try {
+    await searxng.http(config, signal)
+    await searxng.readiness({ ...config, attempts: 1, timeoutMs: 10_000 }, signal)
+    await searxng.realSearch(config, signal)
+    return 'healthy'
+  } catch (error) {
+    rethrowCancellation(error, signal)
+    if (error instanceof CliError && error.code === 'E_AUTH_FAILED') return 'auth-failed'
+    if (error instanceof CliError && error.code === 'E_TLS_FAILED') return 'tls-failed'
+    return 'unreachable'
   }
 }
 
@@ -303,7 +330,9 @@ export async function diagnose(
   let preview: ProfileAttachmentPreview | undefined
   let previewError: unknown
   if (entry !== undefined) {
-    try { preview = await dependencies.profiles.preview(profile, entry.endpoint, signal) } catch (error) { previewError = error }
+    const observation = await observeAttachment(dependencies.profiles, profile, entry.endpoint, signal)
+    preview = observation.preview
+    previewError = observation.previewError
   }
 
   let deployment: DockerDeploymentStatus | undefined
@@ -312,7 +341,11 @@ export async function diagnose(
     if (blocked && kind === 'status') return { profile, mode: entry.mode, endpoint: entry.endpoint, healthy: false, checks }
     await record('ownership', 'Managed Docker resources have valid ownership labels', async () => {
       if (environment === undefined || state?.managed === undefined) throw invalidState('Managed deployment state is missing')
-      deployment = await dependencies.docker.deploymentStatus(identity(environment.managedDir, state.homeId, state.managed), signal)
+      deployment = await dependencies.docker.deploymentStatus(
+        stateIdentity(environment.managedDir, state.homeId, state.managed.current),
+        signal,
+      )
+      if (deployment.ownership === 'foreign') throw resourceForeign()
       if (deployment.ownership !== 'owned') throw invalidState('Managed Docker resources are absent')
     })
     if (blocked && kind === 'status') return { profile, mode: entry.mode, endpoint: entry.endpoint, healthy: false, checks }

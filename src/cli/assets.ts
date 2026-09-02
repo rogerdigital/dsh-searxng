@@ -61,7 +61,11 @@ function invalidInput(message: string): CliError {
 }
 
 function invalidBundle(message: string): CliError {
-  return new CliError('E_STATE_INVALID', message, 'Remove the damaged managed configuration bundle and retry')
+  // Dedicated damage signal: the existing content-addressed bundle directory
+  // is present but mismatched, incomplete, or unsafe. Consumers (repair)
+  // key deterministic rebuild decisions on exactly this code, so it must not
+  // be reused for unrelated invalid-state failures.
+  return new CliError('E_BUNDLE_DAMAGED', message, 'Remove the damaged managed configuration bundle and retry')
 }
 
 function errorCode(error: unknown): string | undefined {

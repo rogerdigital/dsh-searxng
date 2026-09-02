@@ -71,6 +71,21 @@ describe('SearXNG HTTP diagnostics', () => {
     await expect(probe.http({ baseURL: 'https://127.0.0.1:8443', fetch: vi.fn().mockRejectedValue(failure) }))
       .rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
   })
+
+  it('terminates a cyclic or overly deep cause chain without classifying it as TLS', async () => {
+    const cyclic = Object.assign(new Error('fetch failed'))
+    ;(cyclic as { cause?: unknown }).cause = cyclic
+    const probe = new DefaultSearxngProbe()
+    await expect(probe.http({ baseURL: 'https://127.0.0.1:8443', fetch: vi.fn().mockRejectedValue(cyclic) }))
+      .rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
+
+    let deep: Error = Object.assign(new Error('fetch failed'), { code: 'ECONNREFUSED' })
+    for (let index = 0; index < 50; index += 1) {
+      deep = Object.assign(new Error('chained'), { cause: deep, code: 'ECONNREFUSED' })
+    }
+    await expect(probe.http({ baseURL: 'https://127.0.0.1:8443', fetch: vi.fn().mockRejectedValue(deep) }))
+      .rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
+  })
 })
 
 describe('probeSearxng', () => {

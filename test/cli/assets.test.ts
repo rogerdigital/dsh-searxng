@@ -143,7 +143,7 @@ describe('Docker assets', () => {
     const first = await renderer.render(input)
     await writeFile(join(dirname(first.composePath), 'searxng', 'settings.yml'), 'damaged\n', { mode: 0o600 })
 
-    await expect(renderer.render(input)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+    await expect(renderer.render(input)).rejects.toMatchObject({ code: 'E_BUNDLE_DAMAGED' })
     expect((await readdir(stateDir)).filter((name) => name.startsWith('.staging-'))).toEqual([])
   })
 
@@ -184,7 +184,7 @@ describe('Docker assets', () => {
     await symlink(target, original, type)
 
     const error = await renderer.render(input).catch((caught: unknown) => caught)
-    expect(error).toMatchObject({ code: 'E_STATE_INVALID' })
+    expect(error).toMatchObject({ code: 'E_BUNDLE_DAMAGED' })
     const serialized = JSON.stringify((error as { toJSON(): unknown }).toJSON())
     expect(serialized).not.toContain('symlink-secret')
     expect(serialized).not.toContain(stateDir)
@@ -203,7 +203,7 @@ describe('Docker assets', () => {
       await rm(rendered.composePath)
       await mkdir(rendered.composePath, { mode: 0o700 })
     }
-    await expect(renderer.render(input)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+    await expect(renderer.render(input)).rejects.toMatchObject({ code: 'E_BUNDLE_DAMAGED' })
   })
 
   it.each([

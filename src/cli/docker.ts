@@ -22,7 +22,13 @@ export interface DockerAdapter {
 }
 
 export interface DockerDeploymentStatus {
-  ownership: 'absent' | 'owned'
+  /**
+   * 'foreign' is part of the contract so callers must refuse it explicitly.
+   * The production adapter additionally throws E_RESOURCE_FOREIGN during
+   * inspection rather than returning a partial status; adapters that return
+   * 'foreign' are equally valid and callers must enforce the gate themselves.
+   */
+  ownership: 'absent' | 'owned' | 'foreign'
   container: 'absent' | 'running' | 'stopped'
   composePath?: string
 }

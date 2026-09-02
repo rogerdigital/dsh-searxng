@@ -225,6 +225,7 @@ interface HarnessOptions {
   journal?: OperationJournal
   container?: 'running' | 'stopped' | 'absent'
   foreign?: boolean
+  ownership?: 'owned' | 'absent' | 'foreign'
   dockerOffline?: boolean
   realSearchError?: unknown
   readSecretError?: unknown
@@ -232,7 +233,9 @@ interface HarnessOptions {
   managedDir?: string
   assetsRenderer?: AssetRenderer
   renderFailures?: number
+  renderErrorCode?: 'E_BUNDLE_DAMAGED' | 'E_STATE_INVALID'
   useProductionSecretReader?: boolean
+  abortDuringPreview?: { controller: AbortController; reason: unknown }
 }
 
 function executorHarness(options: HarnessOptions = {}) {
@@ -263,20 +266,25 @@ function executorHarness(options: HarnessOptions = {}) {
     deploymentStatus: vi.fn(async () => {
       events.push('ownership')
       if (options.foreign) throw new CliError('E_RESOURCE_FOREIGN', 'foreign', 'rename it')
-      return { ownership: 'owned' as const, container: options.container ?? 'running' as const, composePath: COMPOSE_PATH }
+      return {
+        ownership: options.ownership ?? 'owned' as const,
+        container: options.container ?? 'running' as const,
+        composePath: COMPOSE_PATH,
+      }
     }),
   }
   if (options.supportRemoveOwnedResource) {
     docker.removeOwnedResource = vi.fn(async (resourceId: string) => { events.push(`remove-resource:${resourceId}`) })
   }
   let renderFailures = options.renderFailures ?? 0
+  const renderErrorCode = options.renderErrorCode ?? 'E_BUNDLE_DAMAGED'
   const assets: AssetRenderer = options.assetsRenderer ?? {
     render: vi.fn(async (input: { identity: { stateDir: string }; port: number }) => {
       events.push('render')
       expect(input.identity.stateDir).toBe(managedDir)
       if (renderFailures > 0) {
         renderFailures -= 1
-        throw new CliError('E_STATE_INVALID', 'Managed configuration bundle does not match its identity', 'repair the bundle')
+        throw new CliError(renderErrorCode, 'Managed configuration bundle does not match its identity', 'repair the bundle')
       }
       return { composePath: COMPOSE_PATH, configurationSha256: RENDERED_HASH }
     }),
@@ -293,7 +301,14 @@ function executorHarness(options: HarnessOptions = {}) {
   }
   const profiles: ProfileManager = {
     inspect: vi.fn(),
-    preview: vi.fn(async () => { events.push('profile-preview'); return { installed: true, attached: true, config: { baseURL: ENDPOINT } } }),
+    preview: vi.fn(async () => {
+      events.push('profile-preview')
+      if (options.abortDuringPreview !== undefined) {
+        options.abortDuringPreview.controller.abort(options.abortDuringPreview.reason)
+        throw options.abortDuringPreview.reason
+      }
+      return { installed: true, attached: true, config: { baseURL: ENDPOINT } }
+    }),
     validate: vi.fn(async (_profile, _endpoint, callback) => {
       events.push('profile-validate')
       await callback({ baseURL: ENDPOINT })
@@ -416,7 +431,7 @@ describe('executeRepair', () => {
   it('propagates a persistent bundle-render failure after the single rebuild retry', async () => {
     const test = executorHarness({ renderFailures: 3 })
     const plan = test.planFor({ generatedAssets: 'invalid', container: 'missing', port: 'available' })
-    await expect(executeRepair(plan, test.dependencies)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+    await expect(executeRepair(plan, test.dependencies)).rejects.toMatchObject({ code: 'E_BUNDLE_DAMAGED' })
     expect(test.assets.render).toHaveBeenCalledTimes(2)
     expect(test.journal.active()).toMatchObject({ kind: 'repair', phase: 'mutating' })
     expect(test.writes).toEqual([])
@@ -524,6 +539,43 @@ describe('executeRepair', () => {
     await expect(executeRepair(plan, test.dependencies)).rejects.toMatchObject({ code: 'E_RESOURCE_FOREIGN' })
     expect(test.events).toEqual(['lock', 'state-read', 'journal-read', 'environment', 'docker-preflight', 'ownership', 'unlock'])
     expect(test.journal.store.begin).not.toHaveBeenCalled()
+  })
+
+  it('refuses an explicitly foreign inspection status before journaling, without relying on the adapter throw', async () => {
+    const test = executorHarness({ ownership: 'foreign', container: 'stopped' })
+    const plan = test.planFor({ container: 'stopped', port: 'available' })
+    await expect(executeRepair(plan, test.dependencies)).rejects.toMatchObject({ code: 'E_RESOURCE_FOREIGN' })
+    expect(test.events).toEqual(['lock', 'state-read', 'journal-read', 'environment', 'docker-preflight', 'ownership', 'unlock'])
+    expect(test.journal.store.begin).not.toHaveBeenCalled()
+    expect(test.docker.restart).not.toHaveBeenCalled()
+  })
+
+  it('still repairs a legitimately absent deployment while enforcing the ownership gate', async () => {
+    const test = executorHarness({ ownership: 'absent', container: 'absent' })
+    const plan = test.planFor({ container: 'missing', port: 'available' })
+    const result = await executeRepair(plan, test.dependencies)
+    expect(result.actions).toEqual([{ type: 'recreate-runtime', preserveData: true }])
+    expect(test.docker.up).toHaveBeenCalledWith(expect.objectContaining({ composePath: COMPOSE_PATH }), undefined)
+  })
+
+  it('retries render only on the dedicated bundle-damage signal, never on generic invalid state', async () => {
+    const test = executorHarness({ renderFailures: 3, renderErrorCode: 'E_STATE_INVALID' })
+    const plan = test.planFor({ generatedAssets: 'invalid', container: 'missing', port: 'available' })
+    await expect(executeRepair(plan, test.dependencies)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+    expect(test.assets.render).toHaveBeenCalledTimes(1)
+    expect(test.journal.active()).toMatchObject({ kind: 'repair', phase: 'mutating' })
+    expect(test.writes).toEqual([])
+  })
+
+  it('propagates cancellation raised while previewing the profile during validation', async () => {
+    const cancellation = new DOMException('The operation was aborted', 'AbortError')
+    const controller = new AbortController()
+    const test = executorHarness({ abortDuringPreview: { controller, reason: cancellation } })
+    const plan = test.planFor({ container: 'stopped', port: 'available' })
+    await expect(executeRepair(plan, test.dependencies, controller.signal)).rejects.toBe(cancellation)
+    expect(test.events).toContain('docker-restart')
+    expect(test.journal.active()).toMatchObject({ kind: 'repair', phase: 'validating' })
+    expect(test.writes).toEqual([])
   })
 
   it('removes owned temporary resources through the adapter capability', async () => {

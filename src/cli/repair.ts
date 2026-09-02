@@ -6,9 +6,18 @@ import type { DockerAdapter } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService } from './environment.ts'
 import { recommendRecovery, stateSha256, type JournalStore, type OperationJournal, type RecoveryRecommendation } from './journal.ts'
+import {
+  bundleComposePath,
+  bundleDirectory,
+  healthyTimestamp,
+  isAbort,
+  isConfigBundleName,
+  rethrowCancellation,
+  stateIdentity,
+} from './managed.ts'
 import type { ProfileAttachmentPreview, ProfileManager } from './profile.ts'
 import type { SearxngProbe } from './searxng.ts'
-import type { DeploymentSnapshot, StateStore, StateV2 } from './state.ts'
+import type { StateStore, StateV2 } from './state.ts'
 import type { DiagnosticCheck, DiagnosticSnapshot } from './diagnostics.ts'
 
 export type RepairAction =
@@ -130,7 +139,7 @@ function unsafeBundleRemoval(): CliError {
  * child of the managed directory, never a symlink or any path outside it.
  */
 async function removeBundleForRebuild(managedDir: string, bundleDir: string): Promise<void> {
-  if (dirname(bundleDir) !== managedDir || !/^config-[a-f0-9]{64}$/.test(basename(bundleDir))) {
+  if (dirname(bundleDir) !== managedDir || !isConfigBundleName(basename(bundleDir))) {
     throw unsafeBundleRemoval()
   }
   let info: Awaited<ReturnType<typeof lstat>>
@@ -237,25 +246,8 @@ export function planRepair(snapshot: DiagnosticSnapshot): RepairPlan {
   return { ...base, actions, summary: summarize(actions) }
 }
 
-function managedIdentity(managedDir: string, homeId: string, current: DeploymentSnapshot): ManagedIdentity {
-  return {
-    stateDir: managedDir,
-    composePath: join(managedDir, `config-${'0'.repeat(64)}`, 'compose.yml'),
-    homeId,
-    projectName: current.projectName,
-    containerName: current.containerName,
-  }
-}
-
-function bundleDirectory(managedDir: string, current: DeploymentSnapshot, composePath?: string): string | undefined {
-  if (current.configurationSha256 !== undefined) return join(managedDir, `config-${current.configurationSha256}`)
-  return composePath === undefined ? undefined : dirname(composePath)
-}
-
-function bundleComposePath(managedDir: string, current: DeploymentSnapshot): string | undefined {
-  return current.configurationSha256 === undefined
-    ? undefined
-    : join(managedDir, `config-${current.configurationSha256}`, 'compose.yml')
+function managedIdentity(managedDir: string, homeId: string, current: Parameters<typeof stateIdentity>[2]): ManagedIdentity {
+  return stateIdentity(managedDir, homeId, current)
 }
 
 /**
@@ -281,24 +273,13 @@ export async function readPreservedSecretFromBundle(bundleDir: string): Promise<
   }
 }
 
-function isAbort(error: unknown, signal?: AbortSignal): boolean {
-  return signal?.aborted === true ||
-    (error !== null && typeof error === 'object' && 'name' in error && error.name === 'AbortError')
-}
-
-function healthyTimestamp(dependencies: RepairDependencies): string {
-  const timestamp = dependencies.now().toISOString()
-  if (Number.isNaN(Date.parse(timestamp)) || new Date(timestamp).toISOString() !== timestamp) throw repairFailed()
-  return timestamp
-}
-
 function repairedState(
   state: StateV2,
   plan: RepairPlan,
   dependencies: RepairDependencies,
   renderedConfigurationSha256?: string,
 ): StateV2 {
-  const timestamp = healthyTimestamp(dependencies)
+  const timestamp = healthyTimestamp(dependencies.now, repairFailed)
   return {
     ...state,
     ...(plan.mode === 'managed' && state.managed !== undefined ? {
@@ -323,7 +304,8 @@ async function validateRepaired(
   let preview: ProfileAttachmentPreview | undefined
   try {
     preview = await dependencies.profiles.preview(plan.profile, plan.endpoint, signal)
-  } catch {
+  } catch (error) {
+    rethrowCancellation(error, signal)
     preview = undefined
   }
   const config = preview?.config ?? { baseURL: plan.endpoint }
@@ -390,10 +372,12 @@ async function executeAction(
       try {
         return await dependencies.assets.render(input)
       } catch (error) {
-        // The content-addressed renderer refuses to overwrite a damaged bundle
-        // that carries the same digest; rebuild it deterministically from the
-        // recorded state and re-render with the preserved secret.
-        if (!(error instanceof CliError) || error.code !== 'E_STATE_INVALID') throw error
+        // Rebuild only on the renderer's dedicated damage signal: a damaged
+        // same-digest bundle must be removed and re-rendered with the
+        // preserved secret. Any other failure (including generic invalid
+        // state) propagates so a non-damage error can never delete a healthy
+        // bundle and lose the secret.
+        if (!(error instanceof CliError) || error.code !== 'E_BUNDLE_DAMAGED') throw error
         await removeBundleForRebuild(managedDir, bundleDir)
         return await dependencies.assets.render(input)
       }
@@ -462,7 +446,16 @@ export async function executeRepair(
         if (managed === undefined) throw inconsistentState('Managed deployment state is missing')
         identity = managedIdentity(environment.managedDir, state.homeId, managed.current)
         await dependencies.docker.preflight(signal)
-        inspectedComposePath = (await dependencies.docker.deploymentStatus(identity, signal)).composePath
+        const status = await dependencies.docker.deploymentStatus(identity, signal)
+        // Ownership gate (security contract): the executor may only mutate
+        // resources this installation owns. The production adapter throws
+        // E_RESOURCE_FOREIGN during inspection; an adapter that instead
+        // reports 'foreign' is refused here explicitly so the gate is visible
+        // at the call site rather than implicit in the adapter's throw.
+        // 'absent' is legitimate: it is exactly what a recreate-runtime plan
+        // repairs from the recorded bundle.
+        if (status.ownership === 'foreign') throw resourceForeign()
+        inspectedComposePath = status.composePath
       }
 
       const journal = await dependencies.journal.begin({
