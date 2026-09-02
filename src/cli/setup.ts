@@ -3,6 +3,7 @@ import { SEARXNG_IMAGE, type AssetRenderer, type ManagedIdentity } from './asset
 import type { DockerAdapter } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService, ResolvedEnvironment } from './environment.ts'
+import type { JournalStore, OperationKind } from './journal.ts'
 import { canonicalIdentity, healthyTimestamp, isAbort } from './managed.ts'
 import type { ProfileManager } from './profile.ts'
 import type { SearxngProbe } from './searxng.ts'
@@ -11,6 +12,7 @@ import type { DeploymentSnapshot, StateStore, StateV2 } from './state.ts'
 export interface SetupDependencies {
   environment: EnvironmentService
   state: StateStore
+  journal: JournalStore
   docker: DockerAdapter
   assets: AssetRenderer
   searxng: SearxngProbe
@@ -48,6 +50,20 @@ function portMigrationRequired(): CliError {
     'E_STATE_INVALID',
     'The requested port differs from the existing managed deployment',
     'Run dsh-searxng doctor and use an explicit repair or migration workflow',
+  )
+}
+
+/**
+ * Setup refuses while any journal is recorded: a journal exists exactly while
+ * an operation is between its first mutation and its validated completion,
+ * and setup must not silently clear or run around that invariant. Recovery
+ * belongs to repair.
+ */
+function setupInterrupted(kind: OperationKind): CliError {
+  return new CliError(
+    'E_STATE_INVALID',
+    `An interrupted ${kind} operation is recorded in the journal; setup refuses to run until it is recovered`,
+    'Run dsh-searxng repair to recover the interrupted operation, then retry setup',
   )
 }
 
@@ -363,6 +379,8 @@ export function createSetup(options: SetupFactoryOptions = {}) {
     try {
       return await dependencies.state.withLock(async () => {
         signal?.throwIfAborted()
+        const journal = await dependencies.journal.read()
+        if (journal !== undefined) throw setupInterrupted(journal.kind)
         const environment = await dependencies.environment.resolve(input.profile)
         const previous = await dependencies.state.read()
         if (input.url !== undefined) {

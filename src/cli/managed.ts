@@ -47,6 +47,16 @@ export function isConfigBundleName(name: string): boolean {
   return /^config-[a-f0-9]{64}$/.test(name)
 }
 
+/**
+ * Staging directory name used by the content-addressed renderer while
+ * publishing a bundle: `.staging-<pid>-<16 hex>`. A crash between staging and
+ * the atomic rename can leave exactly this shape orphaned under the managed
+ * directory; anything else is not ours to sweep or remove.
+ */
+export function isStagingDirectoryName(name: string): boolean {
+  return /^\.staging-[1-9][0-9]*-[a-f0-9]{16}$/.test(name)
+}
+
 /** Recorded bundle directory: the digest-addressed bundle, else the inspected Compose path's bundle. */
 export function bundleDirectory(
   stateDir: string,

@@ -26,8 +26,9 @@ export interface DockerAdapter {
   imageExists(image: string, signal?: AbortSignal): Promise<boolean>
   /**
    * Optional capability to delete a named temporary Docker resource after
-   * re-verifying this installation's ownership labels. Adapters without it
-   * make `remove-owned-temporary` repair actions fail closed.
+   * re-verifying this installation's ownership labels. Reserved: the repair
+   * executor currently removes orphaned filesystem staging directories only
+   * and does not call this method.
    */
   removeOwnedResource?(resourceId: string, signal?: AbortSignal): Promise<void>
 }

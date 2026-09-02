@@ -9,14 +9,14 @@ import { parseCliArgs } from './cli/args.ts'
 import { FileAssetRenderer, type StagingAssetRenderer } from './cli/assets.ts'
 import { CliDockerAdapter } from './cli/docker.ts'
 import { loadDeploymentCatalog, type DeploymentDefinition } from './cli/deployments.ts'
-import { diagnose, inspectSnapshot, type SnapshotDependencies } from './cli/diagnostics.ts'
+import { diagnose, formatAge, inspectSnapshot, type SnapshotDependencies } from './cli/diagnostics.ts'
 import { homeId, managedDir, NodeEnvironmentService, resolveDshHome, type PortChecker } from './cli/environment.ts'
 import { CliError } from './cli/errors.ts'
 import { FileJournalStore, type JournalStore } from './cli/journal.ts'
 import { presentError, presentSuccess } from './cli/presenter.ts'
 import { NodeProcessRunner, type CommandRunner } from './cli/process.ts'
 import { NodeProfileManager } from './cli/profile.ts'
-import { executeRepair, planRepair, type RepairDependencies } from './cli/repair.ts'
+import { executeRepair, executeRecovery, planRecovery, planRepair, type RecoveryOutcome, type RepairDependencies, type RecoveryPlan } from './cli/repair.ts'
 import { remove, removeManagedDirectory, type RemoveDependencies } from './cli/remove.ts'
 import { DefaultSearxngProbe } from './cli/searxng.ts'
 import { setup, type SetupDependencies } from './cli/setup.ts'
@@ -194,8 +194,25 @@ function createRepairDependencies(
     searxng: dependencies.searxng,
     profiles: dependencies.profiles,
     journal: extras.journal,
+    // Recovery cross-checks commit decisions against the packaged catalog,
+    // exactly like update's wiring: injected override first, packaged default
+    // second, so real invocations never silently skip the check.
+    catalog: extras.catalog ?? loadDeploymentCatalog(),
     diagnose: (profile) => inspectSnapshot(profile, snapshotDependencies, signal),
     now: dependencies.now,
+  }
+}
+
+function recoveryEnvelope(plan: RecoveryPlan, outcome: RecoveryOutcome) {
+  return {
+    interrupted: {
+      id: plan.journal.id,
+      kind: plan.journal.kind,
+      phase: plan.journal.phase,
+      ageMs: plan.ageMs,
+    },
+    decision: outcome.decision,
+    outcome: outcome.outcome,
   }
 }
 
@@ -315,6 +332,49 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
 
     if (command.command === 'repair') {
       const repairDependencies = createRepairDependencies(dependencies, dependencies as Partial<CliDependencies>, options.signal)
+      // An interrupted operation takes over the whole repair invocation: the
+      // recovery decision is computed from disk, displayed, then executed
+      // before any ordinary planning. Only a cleared prepared journal falls
+      // through to ordinary repair in the same run.
+      const interrupted = await repairDependencies.journal.read()
+      let recovered: { plan: RecoveryPlan; outcome: RecoveryOutcome } | undefined
+      if (interrupted !== undefined) {
+        const recoveryPlan = await planRecovery(command.profile, interrupted, repairDependencies, options.signal)
+        if (format === 'human') {
+          stdout([
+            `Interrupted operation: ${recoveryPlan.journal.kind} (${recoveryPlan.journal.phase}), started ${formatAge(recoveryPlan.ageMs)} ago`,
+            'Recovery plan:',
+            ...recoveryPlan.summary.map((line) => `- ${line}`),
+            '',
+          ].join('\n'))
+        }
+        if (recoveryPlan.decision.type === 'blocked') throw recoveryPlan.decision.error
+        const outcome = await executeRecovery(recoveryPlan, repairDependencies, options.signal)
+        recovered = { plan: recoveryPlan, outcome }
+        if (recoveryPlan.decision.type !== 'clear-prepared') {
+          if (format === 'json') {
+            presentSuccess({
+              profile: command.profile,
+              endpoint: recoveryPlan.endpoint,
+              healthy: true,
+              recovery: recoveryEnvelope(recoveryPlan, outcome),
+              actions: [],
+              checks: outcome.checks,
+            }, presenter)
+          } else {
+            stdout([
+              `Recovery complete: ${outcome.outcome}`,
+              'SearXNG healthy',
+              `Profile: ${command.profile}`,
+              `Endpoint: ${recoveryPlan.endpoint}`,
+              'Validation: readiness, real search, and provider search passed',
+              '',
+            ].join('\n'))
+          }
+          return 0
+        }
+        if (format === 'human') stdout('Journal cleared; no managed resources were mutated\n\n')
+      }
       const plan = planRepair(await repairDependencies.diagnose(command.profile))
       // The exact planned actions are shown to the operator before any mutation starts.
       if (format === 'human') {
@@ -326,7 +386,14 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
       }
       const result = await executeRepair(plan, repairDependencies, options.signal)
       if (format === 'json') {
-        presentSuccess({ profile: command.profile, endpoint: plan.endpoint, healthy: true, actions: result.actions, checks: result.checks }, presenter)
+        presentSuccess({
+          profile: command.profile,
+          endpoint: plan.endpoint,
+          healthy: true,
+          actions: result.actions,
+          checks: result.checks,
+          ...(recovered === undefined ? {} : { recovery: recoveryEnvelope(recovered.plan, recovered.outcome) }),
+        }, presenter)
       } else {
         stdout([
           'SearXNG healthy',

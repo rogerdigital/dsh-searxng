@@ -199,6 +199,12 @@ function harness(options: HarnessOptions = {}) {
   const deps: SetupDependencies = {
     environment,
     state: stateStore,
+    journal: {
+      read: vi.fn(async () => undefined),
+      begin: vi.fn(),
+      transition: vi.fn(),
+      clear: vi.fn(),
+    },
     docker,
     assets,
     searxng,

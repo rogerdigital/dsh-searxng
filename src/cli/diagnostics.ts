@@ -1,10 +1,10 @@
-import { readFile, stat } from 'node:fs/promises'
+import { readdir, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { DockerAdapter, DockerDeploymentStatus } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService } from './environment.ts'
-import { stateSha256, type JournalStore, type OperationJournal } from './journal.ts'
-import { bundleDirectory, rethrowCancellation, stateIdentity } from './managed.ts'
+import { stateSha256, type JournalStore, type OperationJournal, type OperationKind, type OperationPhase } from './journal.ts'
+import { bundleDirectory, isStagingDirectoryName, rethrowCancellation, stateIdentity } from './managed.ts'
 import type { ProfileAttachmentConfig, ProfileAttachmentPreview, ProfileManager } from './profile.ts'
 import type { SearxngProbe } from './searxng.ts'
 import type { DeploymentSnapshot, StateStore } from './state.ts'
@@ -16,12 +16,22 @@ export interface DiagnosticCheck {
   error?: ReturnType<CliError['toJSON']>
 }
 
+/** Doctor's redacted view of an interrupted operation: digests and ids only, never secrets. */
+export interface InterruptedOperationReport {
+  id: string
+  kind: OperationKind
+  phase: OperationPhase
+  startedAt: string
+  ageMs: number
+}
+
 export interface DiagnosticResult {
   profile: string
   mode?: 'managed' | 'external'
   endpoint?: string
   healthy: boolean
   checks: DiagnosticCheck[]
+  interruptedOperation?: InterruptedOperationReport
 }
 
 export interface DiagnosticDependencies {
@@ -30,6 +40,9 @@ export interface DiagnosticDependencies {
   docker: DockerAdapter
   profiles: ProfileManager
   searxng: SearxngProbe
+  /** When provided, doctor additionally reports an interrupted operation from the journal. */
+  journal?: JournalStore
+  now?: () => Date
 }
 
 /**
@@ -53,6 +66,23 @@ export interface DiagnosticSnapshot {
   profileEndpoint?: { profile: string; expected: string; actual?: string }
   ownedTemporaryResourceIds: string[]
   interruptedOperation?: OperationJournal
+}
+
+/**
+ * Bounded sweep for orphaned renderer staging directories: direct children of
+ * the managed directory matching the exact `.staging-<pid>-<hex>` shape. The
+ * scan never recurses and never leaves the managed directory; any failure to
+ * read simply reports no orphans (the same unreadable directory fails the
+ * state and bundle probes, which carry the actionable error).
+ */
+async function listOrphanedStagingDirectories(managedDir: string): Promise<string[]> {
+  let names: string[]
+  try {
+    names = await readdir(managedDir)
+  } catch {
+    return []
+  }
+  return names.filter(isStagingDirectoryName).sort()
 }
 
 export interface AssetProbeInput {
@@ -212,7 +242,7 @@ export async function inspectSnapshot(
           : {}),
       },
     }),
-    ownedTemporaryResourceIds: [],
+    ownedTemporaryResourceIds: await listOrphanedStagingDirectories(environment.managedDir),
     ...(interruptedOperation === undefined ? {} : { interruptedOperation }),
   }
 }
@@ -337,6 +367,18 @@ export async function validateEndToEnd(
   return checks
 }
 
+/** Coarse human duration for report lines; machine consumers read `ageMs`. */
+export function formatAge(ageMs: number): string {
+  const seconds = Math.max(0, Math.round(ageMs / 1000))
+  if (seconds < 60) return `${seconds} second${seconds === 1 ? '' : 's'}`
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'}`
+  const hours = Math.round(minutes / 60)
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'}`
+  const days = Math.round(hours / 24)
+  return `${days} day${days === 1 ? '' : 's'}`
+}
+
 export async function diagnose(
   profile: string,
   kind: 'status' | 'doctor',
@@ -358,6 +400,44 @@ export async function diagnose(
       signal?.throwIfAborted()
       const failure = normalized(error)
       checks.push({ id, status: 'fail', message: failure.message, error: failure.toJSON() })
+      blocked = true
+    }
+  }
+
+  // Doctor reads the journal first: an interrupted operation is the headline
+  // finding, reported without secrets (ids, kinds, phases, and age only). A
+  // validly recorded interruption fails this check without blocking the rest
+  // of the chain — the service may still be healthy and repair decides what
+  // happens next — while an unreadable journal means the state directory is
+  // untrustworthy and skips everything downstream.
+  let interruptedOperation: InterruptedOperationReport | undefined
+  if (kind === 'doctor' && dependencies.journal !== undefined) {
+    try {
+      signal?.throwIfAborted()
+      const journal = await dependencies.journal.read()
+      if (journal === undefined) {
+        checks.push({ id: 'journal', status: 'pass', message: 'No interrupted operation is recorded' })
+      } else {
+        const now = dependencies.now?.() ?? new Date()
+        const ageMs = Math.max(0, now.getTime() - Date.parse(journal.startedAt))
+        interruptedOperation = {
+          id: journal.id,
+          kind: journal.kind,
+          phase: journal.phase,
+          startedAt: journal.startedAt,
+          ageMs,
+        }
+        const failure = new CliError(
+          'E_STATE_INVALID',
+          `An interrupted ${journal.kind} operation is recorded in phase ${journal.phase} (started ${formatAge(ageMs)} ago)`,
+          'Run dsh-searxng repair to recover the interrupted operation',
+        )
+        checks.push({ id: 'journal', status: 'fail', message: failure.message, error: failure.toJSON() })
+      }
+    } catch (error) {
+      signal?.throwIfAborted()
+      const failure = normalized(error)
+      checks.push({ id: 'journal', status: 'fail', message: failure.message, error: failure.toJSON() })
       blocked = true
     }
   }
@@ -439,5 +519,6 @@ export async function diagnose(
     ...(entry === undefined ? {} : { mode: entry.mode, endpoint: entry.endpoint }),
     healthy: !checks.some((check) => check.status === 'fail'),
     checks,
+    ...(interruptedOperation === undefined ? {} : { interruptedOperation }),
   }
 }

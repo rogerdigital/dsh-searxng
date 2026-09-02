@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -580,19 +580,36 @@ describe('executeRepair', () => {
     expect(test.writes).toEqual([])
   })
 
-  it('removes owned temporary resources through the adapter capability', async () => {
-    const test = executorHarness({ supportRemoveOwnedResource: true })
-    const plan = test.planFor({ ownedTemporaryResourceIds: ['tmp-a'] })
-    await executeRepair(plan, test.dependencies)
-    expect(test.docker.removeOwnedResource).toHaveBeenCalledWith('tmp-a', undefined)
-    expect(test.events).toContain('remove-resource:tmp-a')
+  it('removes orphaned staging directories under the managed directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-searxng-staging-'))
+    try {
+      const staging = '.staging-4242-0123456789abcdef'
+      await mkdir(join(root, staging), { recursive: true })
+      const test = executorHarness({ managedDir: root })
+      const plan = test.planFor({ ownedTemporaryResourceIds: [staging] })
+      await executeRepair(plan, test.dependencies)
+      expect(await readdir(root)).toEqual([])
+      expect(test.docker.removeOwnedResource).toBeUndefined()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
-  it('reports an operational error when the adapter cannot remove temporary resources', async () => {
-    const test = executorHarness()
-    const plan = test.planFor({ ownedTemporaryResourceIds: ['tmp-a'] })
-    await expect(executeRepair(plan, test.dependencies)).rejects.toMatchObject({ code: 'E_INTERNAL' })
-    expect(test.journal.active()).toMatchObject({ kind: 'repair', phase: 'mutating' })
+  it('refuses to remove a staging entry that is not a safe directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-searxng-staging-'))
+    try {
+      const staging = '.staging-4242-0123456789abcdef'
+      const outside = await mkdtemp(join(tmpdir(), 'dsh-searxng-outside-'))
+      await symlink(outside, join(root, staging))
+      const test = executorHarness({ managedDir: root })
+      const plan = test.planFor({ ownedTemporaryResourceIds: [staging] })
+      await expect(executeRepair(plan, test.dependencies)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+      expect(test.journal.active()).toMatchObject({ kind: 'repair', phase: 'mutating' })
+      await expect(stat(join(root, staging))).resolves.toBeDefined()
+      await rm(outside, { recursive: true, force: true })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('propagates cancellation before acquiring any dependency work', async () => {
