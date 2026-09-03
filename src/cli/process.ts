@@ -84,7 +84,10 @@ export class NodeProcessRunner implements CommandRunner {
     return new Promise((resolve, reject) => {
       let child: ChildProcess
       try {
-        child = this.spawnProcess(command, [...args], { cwd: options.cwd, env: options.env, shell: false })
+        // stdin is closed on purpose: subprocesses are non-interactive, and an
+        // unexpected prompt (for example Docker Compose asking to recreate a
+        // volume) must hit EOF instead of blocking forever on an open pipe.
+        child = this.spawnProcess(command, [...args], { cwd: options.cwd, env: options.env, shell: false, stdio: ['ignore', 'pipe', 'pipe'] })
       } catch (cause) {
         reject(new ProcessExecutionError('spawn', 'Unable to start command'))
         return

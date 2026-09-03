@@ -33,10 +33,15 @@ describe('Docker assets', () => {
     })
     expect(service.labels).toEqual(labels)
     expect(service.networks).toEqual(['dsh-searxng'])
+    // Persistent resources deliberately omit the deployment-version label: a
+    // version bump must not change their compose configuration, or Docker
+    // Compose would ask to recreate them (losing the cache volume's data).
+    const persistentLabels = { ...labels }
+    delete persistentLabels['io.dsh-searxng.deployment-version']
     expect(compose.volumes['searxng-cache'].name).toBe('${DSH_SEARXNG_CACHE_VOLUME}')
-    expect(compose.volumes['searxng-cache'].labels).toEqual(labels)
+    expect(compose.volumes['searxng-cache'].labels).toEqual(persistentLabels)
     expect(compose.networks['dsh-searxng'].name).toBe('${DSH_SEARXNG_NETWORK}')
-    expect(compose.networks['dsh-searxng'].labels).toEqual(labels)
+    expect(compose.networks['dsh-searxng'].labels).toEqual(persistentLabels)
   })
 
   it('contains the required settings and exactly one secret token', () => {

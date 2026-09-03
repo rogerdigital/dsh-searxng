@@ -152,6 +152,26 @@ describe('CliDockerAdapter ownership', () => {
     await expect(new CliDockerAdapter(new FakeRunner(...ownedResourceResults())).inspectOwnership(identity)).resolves.toBe('owned')
   })
 
+  it('accepts volumes and networks without a deployment-version label', async () => {
+    // Persistent resources deliberately omit the version label so a version
+    // bump never changes their compose configuration; ownership is the home
+    // identity. (inspectOwnership inspects container, network, then volume.)
+    const bareLabels = { ...ownedLabels }
+    delete bareLabels['io.dsh-searxng.deployment-version']
+    const results = [
+      ok(JSON.stringify([{ Config: { Labels: ownedLabels } }])),
+      ok(JSON.stringify([{ Labels: bareLabels }])),
+      ok(JSON.stringify([{ Labels: bareLabels }])),
+    ]
+    await expect(new CliDockerAdapter(new FakeRunner(...results)).inspectOwnership(identity)).resolves.toBe('owned')
+  })
+
+  it('still accepts legacy persistent resources that carry the version label', async () => {
+    // Resources created before the label was scoped to containers keep it;
+    // they must remain owned rather than be orphaned by an upgrade.
+    await expect(new CliDockerAdapter(new FakeRunner(...ownedResourceResults())).inspectOwnership(identity)).resolves.toBe('owned')
+  })
+
   it('accepts resources from any deployment version of this home identity', async () => {
     // An updated deployment relabels its resources with the new version; it is
     // still owned by this installation and must remain operable (rollbacks
