@@ -539,8 +539,11 @@ export async function runCertification(input) {
 
   /** Docker ids whose labels carry this run's ownership labels. */
   async function listOwned(kind) {
-    const result = await docker([kind, 'ls', '-aq', '--filter', `label=${MANAGED_LABEL}=true`, '--filter', `label=${HOME_ID_LABEL}=${homeId}`])
-    if (result.spawnFailed || result.code !== 0) throw stepFailure(`Could not list ${kind} resources for cleanup`, { command: ['docker', kind, 'ls', '-aq'], result })
+    // Docker CLI 29 removed `-a` from `network ls` and `volume ls` (neither
+    // has a stopped state); only `container ls` keeps it.
+    const all = kind === 'container' ? ['-a'] : []
+    const result = await docker([kind, 'ls', ...all, '-q', '--filter', `label=${MANAGED_LABEL}=true`, '--filter', `label=${HOME_ID_LABEL}=${homeId}`])
+    if (result.spawnFailed || result.code !== 0) throw stepFailure(`Could not list ${kind} resources for cleanup`, { command: ['docker', kind, 'ls', ...all, '-q'], result })
     return result.stdout.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
   }
 
