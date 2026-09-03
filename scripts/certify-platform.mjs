@@ -228,6 +228,7 @@ function stepFailure(message, detail = {}) {
   error.name = 'StepFailure'
   error.command = detail.command
   error.result = detail.result
+  error.state = detail.state
   return error
 }
 
@@ -250,6 +251,7 @@ export function redactText(text) {
 function describeFailure(error) {
   const failure = { message: error instanceof Error ? error.message : String(error) }
   if (error?.command !== undefined) failure.command = error.command
+  if (error?.state !== undefined) failure.state = error.state
   if (error?.result !== undefined) {
     failure.exitCode = error.result.code
     failure.stdout = redactText(error.result.stdout)
@@ -342,8 +344,8 @@ export async function runCertification(input) {
   async function currentDeployment() {
     const state = await readState()
     const current = state?.managed?.current
-    assert(current !== undefined && typeof current === 'object', 'Managed deployment state is missing')
-    assert(typeof current.containerName === 'string' && current.containerName.length > 0, 'Managed container name is missing from state')
+    assert(current !== undefined && typeof current === 'object', 'Managed deployment state is missing', { state })
+    assert(typeof current.containerName === 'string' && current.containerName.length > 0, 'Managed container name is missing from state', { state })
     return current
   }
 
@@ -596,10 +598,16 @@ export async function runCertification(input) {
     } catch (error) {
       cleanupProblems.push(error instanceof Error ? error.message : String(error))
     }
-    try {
-      await fileSystem.removeTree(tempRoot)
-    } catch (error) {
-      cleanupProblems.push(`temporary directory removal failed: ${error instanceof Error ? error.message : String(error)}`)
+    if (diagnostics !== undefined) {
+      // A step failed: keep the temporary root for forensics instead of
+      // deleting the evidence with it.
+      cleanupProblems.push(`temporary directory preserved for forensics: ${tempRoot}`)
+    } else {
+      try {
+        await fileSystem.removeTree(tempRoot)
+      } catch (error) {
+        cleanupProblems.push(`temporary directory removal failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
     if (cleanupProblems.length > 0) {
       cleanup = 'fail'

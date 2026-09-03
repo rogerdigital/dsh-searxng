@@ -397,7 +397,10 @@ describe('runCertification', () => {
     expect(exitCode).toBe(1)
     expect(report.checks.setup).toBe('fail')
     for (const name of CERTIFY_CHECKS.filter((name) => name !== 'setup')) expect(report.checks[name]).toBe('skip')
-    expect(report.checks.cleanup).toBe('pass')
+    // A failed step keeps the temporary root for forensics; owned resources
+    // are still swept, but cleanup honestly reports the preserved directory.
+    expect(report.checks.cleanup).toBe('fail')
+    expect(report.cleanupProblems?.some((problem) => problem.includes('preserved for forensics'))).toBe(true)
     expect(report.diagnostics?.message).toContain('setup did not complete')
     expect(report.diagnostics?.stderr).toContain('E_DOCKER_OFFLINE')
 
