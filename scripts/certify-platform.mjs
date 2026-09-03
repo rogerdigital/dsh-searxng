@@ -358,11 +358,24 @@ export async function runCertification(input) {
   }
 
   async function requireDoctorHealthy(what, timeoutMs = TIMEOUTS.doctor) {
-    const result = await runCli(['doctor', '--profile', profile, '--json'], { timeoutMs })
-    const report = result.code === 0 ? parseJson(result.stdout, 'doctor', { command: doctorCommand(), result }) : undefined
-    assert(result.code === 0 && report?.healthy === true, `${what}: doctor is not healthy`, { command: doctorCommand(), result })
-    assert(report.interruptedOperation === undefined, `${what}: doctor reports an interrupted operation`, { command: doctorCommand(), result })
-    return report
+    // Public search engines cool down under the journey's own search volume;
+    // a search-only unhealthy verdict is retried a bounded number of times
+    // before it fails the gate. Every other unhealthy reason fails fast.
+    for (let attempt = 1; ; attempt += 1) {
+      const result = await runCli(['doctor', '--profile', profile, '--json'], { timeoutMs })
+      const report = result.code === 0 ? parseJson(result.stdout, 'doctor', { command: doctorCommand(), result }) : undefined
+      const checks = Array.isArray(report?.checks) ? report.checks : []
+      const searchOnly = checks.some((check) => check?.id === 'search' && check?.status === 'fail') &&
+        checks.every((check) => check?.id === 'search' || check?.id === 'profile' || check?.id === 'provider' || check?.status !== 'fail')
+      if (searchOnly && attempt < 3) {
+        log(`${what}: doctor search check cooled down upstream; retrying in 20s (attempt ${attempt} of 3)`)
+        await sleep(20_000)
+        continue
+      }
+      assert(result.code === 0 && report?.healthy === true, `${what}: doctor is not healthy`, { command: doctorCommand(), result })
+      assert(report.interruptedOperation === undefined, `${what}: doctor reports an interrupted operation`, { command: doctorCommand(), result })
+      return report
+    }
   }
 
   function doctorCommand() {

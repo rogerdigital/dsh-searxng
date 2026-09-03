@@ -193,7 +193,8 @@ describe('probeSearxng', () => {
     })
     await expect(probeSearxng({ baseURL: BASE, fetch: fetchMock })).resolves.toMatchObject({ resultCount: 1 })
     expect(fetchMock).toHaveBeenCalledTimes(2)
-    expect(queries).toEqual(['deepseek harness', 'deepseek harness 2'])
+    expect(queries[0]).toBe('deepseek harness')
+    expect(queries[1]).toMatch(/^deepseek harness [0-9a-f]{8}$/)
   })
 
   it('gives up on persistently empty real-search results after three varied attempts', async () => {

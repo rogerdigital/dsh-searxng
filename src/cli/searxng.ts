@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { CliError } from './errors.ts'
 import {
   requestJsonWithRetry,
@@ -13,6 +14,8 @@ const READINESS_ATTEMPT_TIMEOUT_MS = 5_000
 const DEFAULT_ATTEMPTS = 1
 const DEFAULT_SEARCH_ATTEMPTS = 3
 const READINESS_RETRY_DELAY_MS = 250
+/** Cooled-down upstream engines need seconds, not milliseconds, to recover. */
+const SEARCH_RETRY_DELAY_MS = 2_000
 const RETRYABLE_STATUS = new Set([502, 503, 504])
 
 export interface ProbeOptions {
@@ -174,7 +177,7 @@ async function runProbe(
         : toCliError(error)
       if (!isTransientFailure(error)) throw lastError
       if (attempt === attempts) throw lastError
-      await delay(READINESS_RETRY_DELAY_MS, signal)
+      await delay(allowEmptyResults ? READINESS_RETRY_DELAY_MS : SEARCH_RETRY_DELAY_MS, signal)
     }
   }
   throw lastError instanceof EmptySearchResultsError ? searchFailed('SearXNG returned no usable search result') : toCliError(lastError)
@@ -277,9 +280,9 @@ function validateEndpoint(baseURL: string): string {
 function buildProbeUrl(endpoint: string, options: ProbeOptions, attempt = 1): string {
   const url = new URL(endpoint)
   url.pathname = `${url.pathname.replace(/\/+$/, '')}/search`
-  // Retries vary the query: upstream engines cool down per exact query, so an
-  // identical second request can return zero results moments after success.
-  const query = attempt === 1 ? PROBE_QUERY : `${PROBE_QUERY} ${attempt}`
+  // Retries vary the query with a random suffix: upstream engines cool down
+  // per exact query, so sequential validations must not reuse the same strings.
+  const query = attempt === 1 ? PROBE_QUERY : `${PROBE_QUERY} ${randomBytes(4).toString('hex')}`
   const params = new URLSearchParams({ q: query, format: 'json' })
   for (const key of ['language', 'engines', 'categories'] as const) {
     const value = options[key]
