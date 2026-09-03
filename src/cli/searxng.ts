@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { CliError } from './errors.ts'
 import {
   requestJsonWithRetry,
@@ -11,7 +12,10 @@ const DEFAULT_PROBE_TIMEOUT_MS = 10_000
 const DEFAULT_READINESS_TIMEOUT_MS = 60_000
 const READINESS_ATTEMPT_TIMEOUT_MS = 5_000
 const DEFAULT_ATTEMPTS = 1
+const DEFAULT_SEARCH_ATTEMPTS = 3
 const READINESS_RETRY_DELAY_MS = 250
+/** Cooled-down upstream engines need seconds, not milliseconds, to recover. */
+const SEARCH_RETRY_DELAY_MS = 2_000
 const RETRYABLE_STATUS = new Set([502, 503, 504])
 
 export interface ProbeOptions {
@@ -57,6 +61,11 @@ interface ProbeAttemptResult {
 }
 
 class TransientProbeError extends Error {}
+
+/** Upstream engines occasionally cool down for a repeated query and answer
+ * with zero results moments after the same search succeeded; retrying with a
+ * varied query distinguishes that from a genuinely broken search path. */
+class EmptySearchResultsError extends TransientProbeError {}
 
 /** Node fetch reports TLS failures as cause chains carrying OpenSSL-style codes. */
 const TLS_FAILURE_CODE = /^(?:ERR_TLS|ERR_SSL|UNABLE_TO_VERIFY_LEAF_SIGNATURE|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|CERT_HAS_EXPIRED|CERT_NOT_YET_VALID|CERT_SIGNATURE_FAILURE|EPROTO)/
@@ -150,7 +159,7 @@ async function runProbe(
   signal?: AbortSignal,
 ): Promise<ProbeAttemptResult> {
   const endpoint = validateEndpoint(options.baseURL)
-  const attempts = options.attempts ?? DEFAULT_ATTEMPTS
+  const attempts = options.attempts ?? (allowEmptyResults ? DEFAULT_ATTEMPTS : DEFAULT_SEARCH_ATTEMPTS)
   const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS
   if (!Number.isSafeInteger(attempts) || attempts < 1) throw searchFailed('Probe attempts must be a positive safe integer')
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw searchFailed('Probe timeout must be a positive safe integer')
@@ -160,16 +169,18 @@ async function runProbe(
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     signal?.throwIfAborted()
     try {
-      return await probeAttempt(options, endpoint, timeoutMs, allowEmptyResults, startedAt, signal)
+      return await probeAttempt(options, endpoint, timeoutMs, allowEmptyResults, startedAt, attempt, signal)
     } catch (error) {
       rethrowCancellation(error, signal)
-      lastError = toCliError(error)
+      lastError = error instanceof EmptySearchResultsError
+        ? searchFailed('SearXNG returned no usable search result')
+        : toCliError(error)
       if (!isTransientFailure(error)) throw lastError
       if (attempt === attempts) throw lastError
-      await delay(READINESS_RETRY_DELAY_MS, signal)
+      await delay(allowEmptyResults ? READINESS_RETRY_DELAY_MS : SEARCH_RETRY_DELAY_MS, signal)
     }
   }
-  throw toCliError(lastError)
+  throw lastError instanceof EmptySearchResultsError ? searchFailed('SearXNG returned no usable search result') : toCliError(lastError)
 }
 
 async function runReadiness(options: ProbeOptions, signal?: AbortSignal): Promise<void> {
@@ -197,6 +208,7 @@ async function runReadiness(options: ProbeOptions, signal?: AbortSignal): Promis
         Math.min(READINESS_ATTEMPT_TIMEOUT_MS, remainingMs),
         true,
         startedAt,
+        attempt,
         signal,
       )
       return
@@ -218,10 +230,11 @@ async function probeAttempt(
   timeoutMs: number,
   allowEmptyResults: boolean,
   startedAt: number,
+  attempt: number,
   signal?: AbortSignal,
 ): Promise<ProbeAttemptResult> {
   const request = await requestJsonWithRetry({
-    url: buildProbeUrl(endpoint, options),
+    url: buildProbeUrl(endpoint, options, attempt),
     headers: {
       accept: 'application/json',
       ...(options.authHeader !== undefined && options.authHeader.length > 0
@@ -237,7 +250,10 @@ async function probeAttempt(
   const results = parseResults(request.payload)
   const resultCount = results.filter(hasValidHttpUrl).length
   if (results.length > 0 && resultCount === 0) throw new MalformedProbeResponseError()
-  if (!allowEmptyResults && resultCount === 0) throw searchFailed('SearXNG returned no usable search result')
+  if (!allowEmptyResults && resultCount === 0) {
+    const error = new EmptySearchResultsError('SearXNG returned no usable search result')
+    throw error
+  }
   return { endpoint, resultCount, elapsedMs: Math.max(0, Date.now() - startedAt) }
 }
 
@@ -261,10 +277,13 @@ function validateEndpoint(baseURL: string): string {
   return url.toString().replace(/\/$/, '')
 }
 
-function buildProbeUrl(endpoint: string, options: ProbeOptions): string {
+function buildProbeUrl(endpoint: string, options: ProbeOptions, attempt = 1): string {
   const url = new URL(endpoint)
   url.pathname = `${url.pathname.replace(/\/+$/, '')}/search`
-  const params = new URLSearchParams({ q: PROBE_QUERY, format: 'json' })
+  // Retries vary the query with a random suffix: upstream engines cool down
+  // per exact query, so sequential validations must not reuse the same strings.
+  const query = attempt === 1 ? PROBE_QUERY : `${PROBE_QUERY} ${randomBytes(4).toString('hex')}`
+  const params = new URLSearchParams({ q: query, format: 'json' })
   for (const key of ['language', 'engines', 'categories'] as const) {
     const value = options[key]
     if (value !== undefined && value.length > 0) params.set(key, value)

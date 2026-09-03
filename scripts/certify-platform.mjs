@@ -116,6 +116,7 @@ export function parseCertifyArgs(argv) {
   let tarball
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]
+    if (argument === '--') continue // pnpm run forwards the script separator verbatim
     if (argument === '--tarball') {
       if (tarball !== undefined) throw usage('--tarball may be passed only once')
       const value = argv[index + 1]
@@ -227,6 +228,7 @@ function stepFailure(message, detail = {}) {
   error.name = 'StepFailure'
   error.command = detail.command
   error.result = detail.result
+  error.state = detail.state
   return error
 }
 
@@ -249,6 +251,7 @@ export function redactText(text) {
 function describeFailure(error) {
   const failure = { message: error instanceof Error ? error.message : String(error) }
   if (error?.command !== undefined) failure.command = error.command
+  if (error?.state !== undefined) failure.state = error.state
   if (error?.result !== undefined) {
     failure.exitCode = error.result.code
     failure.stdout = redactText(error.result.stdout)
@@ -340,9 +343,10 @@ export async function runCertification(input) {
 
   async function currentDeployment() {
     const state = await readState()
+    assert(state?.schemaVersion === 2, 'the packed CLI wrote an unexpected state schema; rebuild before packing', { state })
     const current = state?.managed?.current
-    assert(current !== undefined && typeof current === 'object', 'Managed deployment state is missing')
-    assert(typeof current.containerName === 'string' && current.containerName.length > 0, 'Managed container name is missing from state')
+    assert(current !== undefined && typeof current === 'object', 'Managed deployment state is missing', { state })
+    assert(typeof current.containerName === 'string' && current.containerName.length > 0, 'Managed container name is missing from state', { state })
     return current
   }
 
@@ -354,11 +358,24 @@ export async function runCertification(input) {
   }
 
   async function requireDoctorHealthy(what, timeoutMs = TIMEOUTS.doctor) {
-    const result = await runCli(['doctor', '--profile', profile, '--json'], { timeoutMs })
-    const report = result.code === 0 ? parseJson(result.stdout, 'doctor', { command: doctorCommand(), result }) : undefined
-    assert(result.code === 0 && report?.healthy === true, `${what}: doctor is not healthy`, { command: doctorCommand(), result })
-    assert(report.interruptedOperation === undefined, `${what}: doctor reports an interrupted operation`, { command: doctorCommand(), result })
-    return report
+    // Public search engines cool down under the journey's own search volume;
+    // a search-only unhealthy verdict is retried a bounded number of times
+    // before it fails the gate. Every other unhealthy reason fails fast.
+    for (let attempt = 1; ; attempt += 1) {
+      const result = await runCli(['doctor', '--profile', profile, '--json'], { timeoutMs })
+      const report = result.code === 0 ? parseJson(result.stdout, 'doctor', { command: doctorCommand(), result }) : undefined
+      const checks = Array.isArray(report?.checks) ? report.checks : []
+      const searchOnly = checks.some((check) => check?.id === 'search' && check?.status === 'fail') &&
+        checks.every((check) => check?.id === 'search' || check?.id === 'profile' || check?.id === 'provider' || check?.status !== 'fail')
+      if (searchOnly && attempt < 3) {
+        log(`${what}: doctor search check cooled down upstream; retrying in 20s (attempt ${attempt} of 3)`)
+        await sleep(20_000)
+        continue
+      }
+      assert(result.code === 0 && report?.healthy === true, `${what}: doctor is not healthy`, { command: doctorCommand(), result })
+      assert(report.interruptedOperation === undefined, `${what}: doctor reports an interrupted operation`, { command: doctorCommand(), result })
+      return report
+    }
   }
 
   function doctorCommand() {
@@ -535,8 +552,11 @@ export async function runCertification(input) {
 
   /** Docker ids whose labels carry this run's ownership labels. */
   async function listOwned(kind) {
-    const result = await docker([kind, 'ls', '-aq', '--filter', `label=${MANAGED_LABEL}=true`, '--filter', `label=${HOME_ID_LABEL}=${homeId}`])
-    if (result.spawnFailed || result.code !== 0) throw stepFailure(`Could not list ${kind} resources for cleanup`, { command: ['docker', kind, 'ls', '-aq'], result })
+    // Docker CLI 29 removed `-a` from `network ls` and `volume ls` (neither
+    // has a stopped state); only `container ls` keeps it.
+    const all = kind === 'container' ? ['-a'] : []
+    const result = await docker([kind, 'ls', ...all, '-q', '--filter', `label=${MANAGED_LABEL}=true`, '--filter', `label=${HOME_ID_LABEL}=${homeId}`])
+    if (result.spawnFailed || result.code !== 0) throw stepFailure(`Could not list ${kind} resources for cleanup`, { command: ['docker', kind, 'ls', ...all, '-q'], result })
     return result.stdout.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
   }
 
@@ -595,10 +615,16 @@ export async function runCertification(input) {
     } catch (error) {
       cleanupProblems.push(error instanceof Error ? error.message : String(error))
     }
-    try {
-      await fileSystem.removeTree(tempRoot)
-    } catch (error) {
-      cleanupProblems.push(`temporary directory removal failed: ${error instanceof Error ? error.message : String(error)}`)
+    if (diagnostics !== undefined) {
+      // A step failed: keep the temporary root for forensics instead of
+      // deleting the evidence with it.
+      cleanupProblems.push(`temporary directory preserved for forensics: ${tempRoot}`)
+    } else {
+      try {
+        await fileSystem.removeTree(tempRoot)
+      } catch (error) {
+        cleanupProblems.push(`temporary directory removal failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
     if (cleanupProblems.length > 0) {
       cleanup = 'fail'

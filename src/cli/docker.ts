@@ -157,16 +157,22 @@ function resourceLabels(value: unknown, kind: ResourceKind): Record<string, stri
   return labels as Record<string, string>
 }
 
-function hasExpectedLabels(labels: Record<string, string>, homeId: string): boolean {
+function hasExpectedLabels(labels: Record<string, string>, homeId: string, kind: 'container' | 'network' | 'volume'): boolean {
   // Ownership is the home identity, not the deployment version: any resource
   // carrying this homeId was created by this installation, whatever packaged
   // deployment version rendered it. Requiring a fixed version here would
   // misclassify (and refuse to roll back) our own updated deployments.
-  const deploymentVersion = labels[RESOURCE_LABELS.deploymentVersion]
-  return labels[RESOURCE_LABELS.managed] === 'true' &&
+  // The deployment-version label is required only on containers: persistent
+  // volumes and networks deliberately keep a version-stable compose
+  // configuration, so a version bump never asks Docker Compose to recreate
+  // them (legacy resources that still carry the label stay owned).
+  const base = labels[RESOURCE_LABELS.managed] === 'true' &&
     labels[RESOURCE_LABELS.homeId] === homeId &&
-    labels[RESOURCE_LABELS.schema] === '1' &&
-    typeof deploymentVersion === 'string' && /^\d+$/.test(deploymentVersion) && Number(deploymentVersion) >= 1
+    labels[RESOURCE_LABELS.schema] === '1'
+  if (!base) return false
+  if (kind !== 'container') return true
+  const deploymentVersion = labels[RESOURCE_LABELS.deploymentVersion]
+  return typeof deploymentVersion === 'string' && /^\d+$/.test(deploymentVersion) && Number(deploymentVersion) >= 1
 }
 
 function absentMessage(kind: ResourceKind, output: string): boolean {
@@ -390,7 +396,7 @@ export class CliDockerAdapter implements DockerAdapter {
     try { parsed = JSON.parse(result.stdout) } catch { throw foreignResource() }
     if (!Array.isArray(parsed) || parsed.length !== 1) throw foreignResource()
     const labels = resourceLabels(parsed[0], kind)
-    if (labels === undefined || !hasExpectedLabels(labels, identity.homeId)) throw foreignResource()
+    if (labels === undefined || !hasExpectedLabels(labels, identity.homeId, kind)) throw foreignResource()
     return 'owned'
   }
 
@@ -414,7 +420,7 @@ export class CliDockerAdapter implements DockerAdapter {
     }
     const record = parsed[0] as Record<string, unknown>
     const labels = resourceLabels(record, 'container')
-    if (labels === undefined || !hasExpectedLabels(labels, identity.homeId)) throw foreignResource()
+    if (labels === undefined || !hasExpectedLabels(labels, identity.homeId, 'container')) throw foreignResource()
     return record
   }
 

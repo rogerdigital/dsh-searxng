@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "platform": "darwin-arm64",
+  "node": "v24.16.0",
+  "docker": "29.7.2",
+  "compose": "5.5.0",
+  "packageVersion": "0.3.0",
+  "tarball": "/Users/Roger/Code/personal/dsh-searxng/node_modules/.cache/pack/dsh-searxng-0.3.0.tgz",
+  "tarballSha256": "2ed8860dd79b913f682e9a2efe13b35795a0472ee8c4f7965407316f980dfe8d",
+  "profile": "web",
+  "startedAt": "2026-09-03T15:50:27.275Z",
+  "durationMs": 128086,
+  "checks": {
+    "setup": "pass",
+    "repeatSetup": "pass",
+    "status": "pass",
+    "doctor": "pass",
+    "dockerRestart": "pass",
+    "repair": "pass",
+    "updateRollback": "pass",
+    "remove": "pass",
+    "cleanup": "pass"
+  },
+  "notes": [
+    "updateRollback: synthetic deployment version 2 (same digest-pinned image, settings template with the json search format removed) was injected into this run's temporary installed copy only, so update ran a real transaction whose failed validation forced the verified rollback",
+    "repair: the generated bundle .env was deleted (settings.yml intact) to force the render-assets rebuild path",
+    "cleanup: only Docker resources whose inspect output carries io.dsh-searxng.managed=true and io.dsh-searxng.home-id=975809bb86168056 are removed"
+  ]
+}
