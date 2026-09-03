@@ -116,6 +116,7 @@ export function parseCertifyArgs(argv) {
   let tarball
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]
+    if (argument === '--') continue // pnpm run forwards the script separator verbatim
     if (argument === '--tarball') {
       if (tarball !== undefined) throw usage('--tarball may be passed only once')
       const value = argv[index + 1]

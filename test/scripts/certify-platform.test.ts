@@ -208,6 +208,11 @@ describe('parseCertifyArgs', () => {
     expect(parseCertifyArgs(['--tarball', '/a.tgz'])).toEqual({ tarball: '/a.tgz' })
     expect(parseCertifyArgs(['--tarball=/a.tgz'])).toEqual({ tarball: '/a.tgz' })
   })
+
+  it('ignores the bare `--` separator pnpm forwards after the script name', () => {
+    expect(parseCertifyArgs(['--', '--tarball', '/a.tgz'])).toEqual({ tarball: '/a.tgz' })
+    expect(parseCertifyArgs(['--tarball', '/a.tgz', '--'])).toEqual({ tarball: '/a.tgz' })
+  })
 })
 
 describe('certifyHomeId', () => {
