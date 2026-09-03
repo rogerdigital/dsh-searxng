@@ -171,7 +171,7 @@ describe('probeSearxng', () => {
 
   it('retries an empty real-search result with a varied query before failing', async () => {
     const urls: string[] = []
-    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+    const fetchMock = vi.fn().mockImplementation((input: unknown) => {
       urls.push(String(input))
       return Promise.resolve(jsonResponse({ results: [{ url: 'https://example.com/result' }] }))
     })
@@ -183,7 +183,7 @@ describe('probeSearxng', () => {
   it('recovers when upstream engines cool down for the repeated probe query', async () => {
     let calls = 0
     const queries: string[] = []
-    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+    const fetchMock = vi.fn().mockImplementation((input: unknown) => {
       calls += 1
       const url = new URL(String(input))
       queries.push(url.searchParams.get('q') ?? '')
@@ -199,7 +199,7 @@ describe('probeSearxng', () => {
 
   it('gives up on persistently empty real-search results after three varied attempts', async () => {
     const queries: string[] = []
-    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+    const fetchMock = vi.fn().mockImplementation((input: unknown) => {
       queries.push(new URL(String(input)).searchParams.get('q') ?? '')
       return Promise.resolve(jsonResponse({ results: [] }))
     })

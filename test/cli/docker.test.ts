@@ -156,8 +156,7 @@ describe('CliDockerAdapter ownership', () => {
     // Persistent resources deliberately omit the version label so a version
     // bump never changes their compose configuration; ownership is the home
     // identity. (inspectOwnership inspects container, network, then volume.)
-    const bareLabels = { ...ownedLabels }
-    delete bareLabels['io.dsh-searxng.deployment-version']
+    const { 'io.dsh-searxng.deployment-version': _version, ...bareLabels } = ownedLabels
     const results = [
       ok(JSON.stringify([{ Config: { Labels: ownedLabels } }])),
       ok(JSON.stringify([{ Labels: bareLabels }])),

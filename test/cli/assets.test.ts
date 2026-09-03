@@ -36,8 +36,7 @@ describe('Docker assets', () => {
     // Persistent resources deliberately omit the deployment-version label: a
     // version bump must not change their compose configuration, or Docker
     // Compose would ask to recreate them (losing the cache volume's data).
-    const persistentLabels = { ...labels }
-    delete persistentLabels['io.dsh-searxng.deployment-version']
+    const { 'io.dsh-searxng.deployment-version': _version, ...persistentLabels } = labels
     expect(compose.volumes['searxng-cache'].name).toBe('${DSH_SEARXNG_CACHE_VOLUME}')
     expect(compose.volumes['searxng-cache'].labels).toEqual(persistentLabels)
     expect(compose.networks['dsh-searxng'].name).toBe('${DSH_SEARXNG_NETWORK}')
@@ -325,7 +324,7 @@ describe('FileAssetRenderer stage', () => {
         identity,
         port: 8080,
         secret: 'stable-secret',
-        definition: entry,
+        definition: entry!,
       })
       expect(staged.configurationSha256).toMatch(/^[a-f0-9]{64}$/)
       expect(staged.definition).toBe(entry)
