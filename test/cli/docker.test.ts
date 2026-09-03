@@ -152,6 +152,27 @@ describe('CliDockerAdapter ownership', () => {
     await expect(new CliDockerAdapter(new FakeRunner(...ownedResourceResults())).inspectOwnership(identity)).resolves.toBe('owned')
   })
 
+  it('accepts resources from any deployment version of this home identity', async () => {
+    // An updated deployment relabels its resources with the new version; it is
+    // still owned by this installation and must remain operable (rollbacks
+    // down/up these resources) rather than classified as foreign.
+    const updatedLabels = { ...ownedLabels, 'io.dsh-searxng.deployment-version': '2' }
+    const updatedResults = [
+      ok(JSON.stringify([{ Config: { Labels: updatedLabels } }])),
+      ok(JSON.stringify([{ Labels: updatedLabels }])),
+      ok(JSON.stringify([{ Labels: updatedLabels }])),
+    ]
+    await expect(new CliDockerAdapter(new FakeRunner(...updatedResults)).inspectOwnership(identity)).resolves.toBe('owned')
+  })
+
+  it.each(['0', 'x', ''] as const)('rejects an invalid deployment version label %s', async (version) => {
+    const invalidLabels = { ...ownedLabels, 'io.dsh-searxng.deployment-version': version }
+    await expectCode(
+      new CliDockerAdapter(new FakeRunner(ok(JSON.stringify([{ Config: { Labels: invalidLabels } }])))).inspectOwnership(identity),
+      'E_RESOURCE_FOREIGN',
+    )
+  })
+
   it.each([
     JSON.stringify([{ Config: { Labels: {} } }]),
     JSON.stringify([{ Config: { Labels: { 'io.dsh-searxng.managed': 'true', 'io.dsh-searxng.home-id': 'ffffffffffffffff' } } }]),
@@ -404,5 +425,48 @@ describe('CliDockerAdapter Compose operations', () => {
     const runner = new FakeRunner(...absentResourceResults())
     await expect(new CliDockerAdapter(runner).logs(identity, 50)).resolves.toBe('')
     expect(runner.invocations).toHaveLength(3)
+  })
+})
+
+describe('CliDockerAdapter image operations', () => {
+  const image = `ghcr.io/searxng/searxng:2026.8.20-8d3dd0cd4@sha256:${'a'.repeat(64)}`
+
+  it('pulls the exact image reference and maps a nonzero exit without leaking output', async () => {
+    const signal = new AbortController().signal
+    const runner = new FakeRunner(ok('Pulled'))
+    await new CliDockerAdapter(runner).pull(image, signal)
+    expect(runner.invocations).toEqual([{ command: 'docker', args: ['image', 'pull', image], options: { signal } }])
+
+    const failedRunner = new FakeRunner(failed('authentication required for secret=a:b#c'))
+    const error = await new CliDockerAdapter(failedRunner).pull(image).catch((caught: unknown) => caught)
+    expect(error).toMatchObject({ code: 'E_INTERNAL' })
+    expect(JSON.stringify((error as CliError).toJSON())).not.toContain('a:b#c')
+  })
+
+  it('rejects invalid image references before invoking Docker', async () => {
+    for (const invalid of ['', 'image with spaces', `image\n${image}`, 'image\ttag']) {
+      const runner = new FakeRunner()
+      await expectCode(new CliDockerAdapter(runner).pull(invalid), 'E_USAGE')
+      expect(runner.invocations).toHaveLength(0)
+    }
+  })
+
+  it('propagates pull cancellation without reclassification', async () => {
+    const aborted = new Error('cancelled')
+    aborted.name = 'AbortError'
+    await expect(new CliDockerAdapter(new FakeRunner(aborted)).pull(image)).rejects.toBe(aborted)
+  })
+
+  it('reports local image presence and absence', async () => {
+    const present = new FakeRunner(ok(JSON.stringify([{ Id: 'sha256:abc' }])))
+    await expect(new CliDockerAdapter(present).imageExists(image)).resolves.toBe(true)
+    expect(present.invocations[0]).toMatchObject({ command: 'docker', args: ['image', 'inspect', image] })
+
+    const absent = new FakeRunner(failed('Error response from daemon: no such image'))
+    await expect(new CliDockerAdapter(absent).imageExists(image)).resolves.toBe(false)
+  })
+
+  it('does not interpret an unrelated image inspect failure as absence', async () => {
+    await expectCode(new CliDockerAdapter(new FakeRunner(failed('permission denied'))).imageExists(image), 'E_INTERNAL')
   })
 })

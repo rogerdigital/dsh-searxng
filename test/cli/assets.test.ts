@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { parse as parseYaml } from 'yaml'
-import { FileAssetRenderer, SEARXNG_IMAGE, type ManagedIdentity } from '../../src/cli/assets.ts'
+import { FileAssetRenderer, SEARXNG_IMAGE, type ManagedIdentity, type StageInput } from '../../src/cli/assets.ts'
+import type { DeploymentDefinition } from '../../src/cli/deployments.ts'
 
 const compose = parseYaml(readFileSync(new URL('../../assets/docker/compose.yml', import.meta.url), 'utf8')) as Record<string, any>
 const settings = parseYaml(readFileSync(new URL('../../assets/docker/settings.yml.template', import.meta.url), 'utf8')) as Record<string, any>
@@ -143,7 +144,7 @@ describe('Docker assets', () => {
     const first = await renderer.render(input)
     await writeFile(join(dirname(first.composePath), 'searxng', 'settings.yml'), 'damaged\n', { mode: 0o600 })
 
-    await expect(renderer.render(input)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+    await expect(renderer.render(input)).rejects.toMatchObject({ code: 'E_BUNDLE_DAMAGED' })
     expect((await readdir(stateDir)).filter((name) => name.startsWith('.staging-'))).toEqual([])
   })
 
@@ -184,7 +185,7 @@ describe('Docker assets', () => {
     await symlink(target, original, type)
 
     const error = await renderer.render(input).catch((caught: unknown) => caught)
-    expect(error).toMatchObject({ code: 'E_STATE_INVALID' })
+    expect(error).toMatchObject({ code: 'E_BUNDLE_DAMAGED' })
     const serialized = JSON.stringify((error as { toJSON(): unknown }).toJSON())
     expect(serialized).not.toContain('symlink-secret')
     expect(serialized).not.toContain(stateDir)
@@ -203,7 +204,7 @@ describe('Docker assets', () => {
       await rm(rendered.composePath)
       await mkdir(rendered.composePath, { mode: 0o700 })
     }
-    await expect(renderer.render(input)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+    await expect(renderer.render(input)).rejects.toMatchObject({ code: 'E_BUNDLE_DAMAGED' })
   })
 
   it.each([
@@ -290,6 +291,113 @@ async function renderedFixture(secret: string): Promise<{
 async function publishedBundles(stateDir: string): Promise<string[]> {
   return (await readdir(stateDir)).filter((name) => name.startsWith('config-')).sort()
 }
+
+const V2_IMAGE = `ghcr.io/searxng/searxng:2027.1.1-aaaaaaaa@sha256:${'1'.repeat(64)}`
+
+function deploymentV2(overrides: Partial<DeploymentDefinition> = {}): DeploymentDefinition {
+  return {
+    deploymentVersion: 2,
+    image: V2_IMAGE,
+    composeAsset: 'docker/compose.yml',
+    settingsAsset: 'docker/settings.yml.template',
+    stateSchemas: [2],
+    ...overrides,
+  }
+}
+
+describe('FileAssetRenderer stage', () => {
+  async function stagingFixture() {
+    const stateDir = await mkdtemp(join(tmpdir(), 'dsh-searxng-stage-'))
+    const identity: ManagedIdentity = {
+      stateDir,
+      composePath: join(stateDir, 'compose.yml'),
+      homeId: '0123456789abcdef',
+      projectName: 'dsh-searxng-0123456789abcdef',
+      containerName: 'dsh-searxng-0123456789abcdef',
+    }
+    // Staging resolves catalog-relative asset paths (docker/...) against the
+    // packaged assets root; the active v1 bundle renders through the default
+    // docker-root renderer exactly as setup does.
+    const renderer = new FileAssetRenderer({ assetRoot: new URL('../../assets/', import.meta.url) })
+    const active = new FileAssetRenderer({ assetRoot: new URL('../../assets/docker/', import.meta.url) })
+    const v1 = await active.render({ stateDir, identity, image: SEARXNG_IMAGE, port: 8080, secret: 'stable-secret' })
+    return { stateDir, identity, renderer, v1 }
+  }
+
+  it('stages a version-2 bundle beside the active one without editing it', async () => {
+    const { stateDir, identity, renderer, v1 } = await stagingFixture()
+    try {
+      const v1Bytes = await readBundle(v1.composePath)
+      const staged = await renderer.stage({
+        stateDir,
+        identity,
+        port: 8080,
+        secret: 'stable-secret',
+        definition: deploymentV2(),
+      })
+
+      expect(staged.definition.deploymentVersion).toBe(2)
+      expect(staged.directory).toBe(join(stateDir, `config-${staged.configurationSha256}`))
+      expect(staged.configurationSha256).not.toBe(v1.configurationSha256)
+      // The active v1 bundle is immutable and retained as the rollback target.
+      expect(await readBundle(v1.composePath)).toEqual(v1Bytes)
+      expect(await publishedBundles(stateDir)).toEqual(
+        [`config-${v1.configurationSha256}`, `config-${staged.configurationSha256}`].sort(),
+      )
+      const environment = await readFile(join(staged.directory, '.env'), 'utf8')
+      expect(environment).toContain(`DSH_SEARXNG_IMAGE=${V2_IMAGE}\n`)
+      expect(environment).toContain('DSH_SEARXNG_DEPLOYMENT_VERSION=2\n')
+      expect(environment).toContain(`DSH_SEARXNG_SETTINGS_DIR=./config-${staged.configurationSha256}/searxng\n`)
+      const settings = parseYaml(await readFile(join(staged.directory, 'searxng', 'settings.yml'), 'utf8')) as Record<string, any>
+      expect(settings.server.secret_key).toBe('stable-secret')
+    } finally {
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  it('verifies an identical staged bundle instead of republishing', async () => {
+    const { stateDir, identity, renderer } = await stagingFixture()
+    try {
+      const input: StageInput = { stateDir, identity, port: 8080, secret: 'stable-secret', definition: deploymentV2() }
+      const first = await renderer.stage(input)
+      const second = await renderer.stage(input)
+      expect(second).toEqual(first)
+      expect(await publishedBundles(stateDir)).toHaveLength(2)
+      expect((await readdir(stateDir)).filter((name) => name.startsWith('.staging-'))).toEqual([])
+    } finally {
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  it('signals a damaged pre-existing target bundle with its digest-only name', async () => {
+    const { stateDir, identity, renderer } = await stagingFixture()
+    try {
+      const input: StageInput = { stateDir, identity, port: 8080, secret: 'stable-secret', definition: deploymentV2() }
+      const staged = await renderer.stage(input)
+      await writeFile(join(staged.directory, '.env'), 'tampered\n', { mode: 0o600 })
+
+      const error = await renderer.stage(input).catch((caught: unknown) => caught)
+      expect(error).toMatchObject({ code: 'E_BUNDLE_DAMAGED', details: { bundle: basename(staged.directory) } })
+      expect(JSON.stringify((error as { toJSON(): unknown }).toJSON())).not.toContain(stateDir)
+    } finally {
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['unsafe compose asset', deploymentV2({ composeAsset: '../compose.yml' })],
+    ['unsafe settings asset', deploymentV2({ settingsAsset: '/etc/passwd' })],
+    ['unpinned image', deploymentV2({ image: 'ghcr.io/searxng/searxng:latest' })],
+    ['invalid version', deploymentV2({ deploymentVersion: 0 })],
+  ] as const)('rejects a %s before reading any packaged asset', async (_name, definition) => {
+    const { stateDir, identity, renderer } = await stagingFixture()
+    try {
+      await expect(renderer.stage({ stateDir, identity, port: 8080, secret: 's', definition })).rejects.toMatchObject({ code: 'E_USAGE' })
+    } finally {
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
+})
 
 async function expectPublishFailure(failure: 'rename' | 'parent-sync'): Promise<void> {
   const stateDir = await mkdtemp(join(tmpdir(), `dsh-searxng-assets-${failure}-`))

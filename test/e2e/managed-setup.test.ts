@@ -35,7 +35,7 @@ async function dockerOwned(kind: 'container' | 'network' | 'volume', name: strin
 }
 
 describe.skipIf(!enabled)('packed managed setup journey', () => {
-  it('creates, reuses, diagnoses, restarts, queries, and removes only its owned deployment', async () => {
+  it('creates, reuses, diagnoses, restarts, repairs, rolls back an update, and removes only its owned deployment', async () => {
     const temporary = await mkdtemp(join(tmpdir(), 'dsh-searxng-e2e-'))
     const dshHome = join(temporary, 'dsh-home')
     const fakeBin = join(temporary, 'bin')
@@ -103,6 +103,58 @@ await writeFile(path, JSON.stringify(manifest) + '\\n')
       await exec('docker', ['container', 'restart', project])
       await exec(cli, ['setup', '--profile', 'web'], { env: environment, timeout: 180_000 })
       await exec(cli, ['doctor', '--profile', 'web'], { env: environment, timeout: 60_000 })
+
+      // Repair leg: injure the generated bundle by deleting its .env while
+      // settings.yml (and therefore the secret) stays intact, then require
+      // repair to rebuild it through the render-assets path.
+      const digest = bundle.replace(/^config-/, '')
+      const bundleEnv = join(managedDir, bundle, '.env')
+      await rm(bundleEnv)
+      const repair = JSON.parse((await exec(cli, ['repair', '--profile', 'web', '--json'], { env: environment, timeout: 180_000 })).stdout) as { actions?: Array<{ type?: string }> }
+      expect(repair.actions?.map((action) => action.type)).toContain('render-assets')
+      expect(JSON.parse(await readFile(join(managedDir, 'state.json'), 'utf8'))).toMatchObject({ managed: { current: { configurationSha256: digest } } })
+      await exec(cli, ['doctor', '--profile', 'web'], { env: environment, timeout: 60_000 })
+
+      // Update-rollback leg: the shipped catalog has one deployment version,
+      // so a real update transaction needs a synthetic version 2 injected
+      // into this test's installed copy only — same digest-pinned image, but
+      // a settings template without the json search format. The update must
+      // fail validation and roll back to the previous deployment.
+      const packageRoot = join(installDir, 'node_modules', 'dsh-searxng')
+      const catalogPath = join(packageRoot, 'assets', 'deployments', 'v1.json')
+      const catalog = JSON.parse(await readFile(catalogPath, 'utf8')) as {
+        deployments: Array<{ deploymentVersion: number; image: string; composeAsset: string; settingsAsset: string; stateSchemas: number[] }>
+      }
+      expect(catalog.deployments).toHaveLength(1)
+      const current = catalog.deployments[0]
+      if (current === undefined) throw new Error('Installed deployment catalog is empty')
+      const template = await readFile(join(packageRoot, 'assets', current.settingsAsset), 'utf8')
+      expect(template.match(/^[ \t]*-[ \t]*json[ \t]*$/gm)?.length ?? 0).toBe(1)
+      const faultAsset = 'docker/settings.e2e-fault.yml.template'
+      await writeFile(join(packageRoot, 'assets', faultAsset), template.replace(/^[ \t]*-[ \t]*json[ \t]*(?:\r?\n|$)/m, ''))
+      await writeFile(catalogPath, `${JSON.stringify({
+        ...catalog,
+        deployments: [...catalog.deployments, {
+          deploymentVersion: 2,
+          image: current.image,
+          composeAsset: current.composeAsset,
+          settingsAsset: faultAsset,
+          stateSchemas: [...current.stateSchemas],
+        }],
+      }, null, 2)}\n`)
+      const updateFailure = await exec(cli, ['update', '--profile', 'web', '--deployment-version', '2', '--json'], { env: environment, timeout: 240_000 })
+        .then(() => undefined, (error) => error)
+      expect(updateFailure).toBeDefined()
+      expect(updateFailure?.code).toBe(1)
+      const envelope = JSON.parse(updateFailure?.stderr ?? '') as { code?: string; rolledBack?: boolean; targetVersion?: number }
+      expect(envelope.code).toBe('E_JSON_DISABLED')
+      expect(envelope.rolledBack).toBe(true)
+      expect(envelope.targetVersion).toBe(2)
+      await exec(cli, ['doctor', '--profile', 'web'], { env: environment, timeout: 60_000 })
+      expect(JSON.parse(await readFile(join(managedDir, 'state.json'), 'utf8'))).toMatchObject({
+        managed: { current: { deploymentVersion: 1, configurationSha256: digest } },
+      })
+
       await exec(cli, ['remove', '--profile', 'web', '--service', '--purge-data', '--yes'], { env: environment, timeout: 60_000 })
       expect(await dockerOwned('container', project, expectedHomeId)).toBe(false)
       expect(await dockerOwned('network', network, expectedHomeId)).toBe(false)
@@ -117,5 +169,5 @@ await writeFile(path, JSON.stringify(manifest) + '\\n')
       }
       await rm(temporary, { recursive: true, force: true })
     }
-  }, 300_000)
+  }, 480_000)
 })

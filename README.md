@@ -67,6 +67,12 @@ npx dsh-searxng status --profile web
 # Ordered environment, Docker, ownership, HTTP, JSON, search, profile, and provider checks.
 npx dsh-searxng doctor --profile web
 
+# Plan and execute ownership-safe repairs for the managed deployment.
+npx dsh-searxng repair --profile web
+
+# Move the managed deployment to a packaged version with verified rollback.
+npx dsh-searxng update --profile web
+
 # Detach the profile and remove the plugin package from that profile.
 npx dsh-searxng remove --profile web
 
@@ -78,8 +84,27 @@ npx dsh-searxng remove --profile web --service --purge-data
 ```
 
 Permanent deletion prompts on an interactive terminal. Automation must add `--yes`. `--json` is
-available on setup, status, doctor, and remove. Destructive Docker operations run only after the
-container, network, and volume labels match this DSH home; same-name foreign resources are refused.
+available on setup, status, doctor, repair, update, and remove. Destructive Docker operations run
+only after the container, network, and volume labels match this DSH home; same-name foreign
+resources are refused.
+
+### Recovery semantics
+
+`repair` and `update` journal their progress under
+`$DSH_HOME/dsh-searxng/journal.json` between the first mutation and validated completion; `setup`
+and `remove` read that journal to refuse during or clean up after an interruption.
+
+- `setup` refuses to run while an interrupted operation is recorded and points at `repair`.
+- `repair` takes over when a journal exists: it recomputes the recovery decision from disk (clear
+  the journal, validate the target, or resume the rollback) before any ordinary repair, and also
+  removes quarantined stale locks left by dead processes. `doctor` reports the interrupted
+  operation's id, kind, phase, and age.
+- `update` is transactional: the current deployment stays authoritative until the target passes
+  readiness, real-search, and provider validation. Any failure after the first Docker mutation
+  rolls back to the previous image and configuration and revalidates them; same-version updates
+  are rejected with `E_DEPLOYMENT_UNSUPPORTED`.
+- `remove --service` clears the journal once the deployment is gone, so a subsequent `setup` is
+  not refused.
 
 ## Provider configuration
 
@@ -103,9 +128,16 @@ If several DSH search providers are available, select this one with
 - `E_COMPOSE_UNSUPPORTED`: enable Docker Compose v2.
 - `E_JSON_DISABLED`: add `json` to SearXNG `search.formats`.
 - `E_AUTH_FAILED`: check the external instance's `authHeader` configuration.
+- `E_TLS_FAILED`: the endpoint's TLS certificate failed validation; check the certificate chain
+  and retry.
 - `E_RATE_LIMITED`: adjust the instance limiter or upstream engine selection.
 - `E_RESOURCE_FOREIGN`: a same-name Docker resource does not carry this installation's ownership
   labels; it is never modified automatically.
+- `E_BUNDLE_DAMAGED`: the generated configuration bundle is incomplete or mismatched; `repair`
+  rebuilds it from the packaged assets while preserving the existing secret.
+- `E_DEPLOYMENT_UNSUPPORTED`: the packaged deployment catalog cannot satisfy the request (unknown
+  or same version requested, or an entry incompatible with the current state); upgrade
+  dsh-searxng or choose an available version.
 - `E_PROFILE_CONCURRENT_MODIFICATION`: the DSH profile changed during the operation; review it and
   retry.
 
@@ -114,13 +146,24 @@ If several DSH search providers are available, select this one with
 ## Runtime support
 
 - Node.js: 20 and newer.
-- CLI, tests, build, and packed artifact: verified on Linux, macOS, and Windows.
-- Managed Docker journey and Docker adapter integration: verified in Linux CI with Docker Engine
-  and Compose v2.
-- Docker Desktop on macOS and Windows is supported but has not completed formal release
-  certification.
-- External SearXNG mode does not require Docker.
+- CLI, tests, build, and packed artifact: verified on Linux, macOS, and Windows in CI.
+- Managed Docker journey (including repair and update rollback) and Docker adapter integration:
+  verified in opt-in Linux CI with Docker Engine and Compose v2. The release certification runner
+  is also exercised there; CI provides no Docker Desktop and uses a stub `dsh`, so it is not a
+  formal certification.
+- **Certified** Docker environments per release: only those with a complete passing report from
+  the release tarball in [docs/release-certification.md](docs/release-certification.md) — one
+  each from macOS + Docker Desktop, Windows + Docker Desktop + WSL2, and Linux + Docker Engine +
+  Compose v2.
+- Docker Desktop on macOS and Windows is compatible (same engine, same Compose v2 plugin) but
+  uncertified until its report exists for a given release.
+- External SearXNG mode does not require Docker and works on any platform with Node.js 20+.
 - Podman and Podman Compose are not supported in the managed path.
+
+Release prerequisites: before any deployment catalog entry beyond version 1 ships, `setup` must
+select deployments from the packaged catalog instead of the compiled-in default pin, so a new
+catalog entry is installable without an intermediate CLI upgrade (tracked follow-up from the
+lifecycle work).
 
 dsh is in developer preview with breaking changes expected. Version 0.2.1 supports
 `@deepseek-ai/dsh-web >=0.1.0-rc.6 <0.2.0` and
@@ -139,8 +182,15 @@ validates the final provider before activation. The opt-in Linux CI job runs bot
 release checks:
 
 ```sh
-DSH_SEARXNG_E2E=1 pnpm test -- test/e2e/managed-setup.test.ts
+DSH_SEARXNG_E2E=1 pnpm test:e2e
 DSH_SEARXNG_DOCKER_INTEGRATION=1 pnpm test -- test/cli/docker.integration.test.ts
+```
+
+Platform certification of a packed tarball runs on each release host:
+
+```sh
+pnpm pack --pack-destination ./node_modules/.cache/pack
+pnpm certify:platform -- --tarball ./node_modules/.cache/pack/dsh-searxng-<version>.tgz
 ```
 
 ## License

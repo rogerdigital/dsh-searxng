@@ -13,10 +13,34 @@ export interface DockerAdapter {
   down(identity: ManagedIdentity, volumes: boolean, signal?: AbortSignal): Promise<void>
   logs(identity: ManagedIdentity, tail: number, signal?: AbortSignal): Promise<string>
   deploymentStatus(identity: ManagedIdentity, signal?: AbortSignal): Promise<DockerDeploymentStatus>
+  /**
+   * Pull the exact digest-pinned image before any deployment mutation, so a
+   * pull failure never leaves a half-updated runtime behind.
+   */
+  pull(image: string, signal?: AbortSignal): Promise<void>
+  /**
+   * Report whether the exact image reference is present in the local store.
+   * Reserved for crash-recovery decisions (lifecycle Task 5); the update
+   * transaction always pulls unconditionally.
+   */
+  imageExists(image: string, signal?: AbortSignal): Promise<boolean>
+  /**
+   * Optional capability to delete a named temporary Docker resource after
+   * re-verifying this installation's ownership labels. Reserved: the repair
+   * executor currently removes orphaned filesystem staging directories only
+   * and does not call this method.
+   */
+  removeOwnedResource?(resourceId: string, signal?: AbortSignal): Promise<void>
 }
 
 export interface DockerDeploymentStatus {
-  ownership: 'absent' | 'owned'
+  /**
+   * 'foreign' is part of the contract so callers must refuse it explicitly.
+   * The production adapter additionally throws E_RESOURCE_FOREIGN during
+   * inspection rather than returning a partial status; adapters that return
+   * 'foreign' are equally valid and callers must enforce the gate themselves.
+   */
+  ownership: 'absent' | 'owned' | 'foreign'
   container: 'absent' | 'running' | 'stopped'
   composePath?: string
 }
@@ -50,6 +74,22 @@ function restartFailed(): CliError {
   return new CliError('E_INTERNAL', 'Docker container restart failed', 'Run dsh-searxng doctor and repair the managed deployment')
 }
 
+function imageReferenceInvalid(): CliError {
+  return new CliError('E_USAGE', 'Image reference is invalid', 'Use a digest-pinned image reference')
+}
+
+function pullFailed(): CliError {
+  return new CliError('E_INTERNAL', 'Docker image pull failed', 'Check network access to the image registry, then retry')
+}
+
+function imageInspectFailed(): CliError {
+  return new CliError('E_INTERNAL', 'Docker image inspection failed', 'Run dsh-searxng doctor and inspect Docker status')
+}
+
+function validateImageReference(image: string): void {
+  if (typeof image !== 'string' || image.length === 0 || /[\s\u0000-\u001f\u007f]/.test(image)) throw imageReferenceInvalid()
+}
+
 function incompleteManagedResources(): CliError {
   return new CliError(
     'E_STATE_INVALID',
@@ -66,7 +106,12 @@ function composeMajor(version: string): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined
 }
 
-const RESOURCE_LABELS = {
+/**
+ * Ownership labels stamped on every managed Docker resource. Exported for the
+ * certification runner's contract test, which pins the runner's copy of the
+ * label keys so cleanup can never silently become a no-op through drift.
+ */
+export const RESOURCE_LABELS = {
   managed: 'io.dsh-searxng.managed',
   homeId: 'io.dsh-searxng.home-id',
   schema: 'io.dsh-searxng.schema',
@@ -113,10 +158,15 @@ function resourceLabels(value: unknown, kind: ResourceKind): Record<string, stri
 }
 
 function hasExpectedLabels(labels: Record<string, string>, homeId: string): boolean {
+  // Ownership is the home identity, not the deployment version: any resource
+  // carrying this homeId was created by this installation, whatever packaged
+  // deployment version rendered it. Requiring a fixed version here would
+  // misclassify (and refuse to roll back) our own updated deployments.
+  const deploymentVersion = labels[RESOURCE_LABELS.deploymentVersion]
   return labels[RESOURCE_LABELS.managed] === 'true' &&
     labels[RESOURCE_LABELS.homeId] === homeId &&
     labels[RESOURCE_LABELS.schema] === '1' &&
-    labels[RESOURCE_LABELS.deploymentVersion] === '1'
+    typeof deploymentVersion === 'string' && /^\d+$/.test(deploymentVersion) && Number(deploymentVersion) >= 1
 }
 
 function absentMessage(kind: ResourceKind, output: string): boolean {
@@ -275,6 +325,36 @@ export class CliDockerAdapter implements DockerAdapter {
       ? (redacted as Record<string, unknown>).output
       : undefined
     return capUtf8(typeof output === 'string' ? output : '[REDACTED]', this.maxLogBytes)
+  }
+
+  async pull(image: string, signal?: AbortSignal): Promise<void> {
+    validateImageReference(image)
+    signal?.throwIfAborted()
+    let result: CommandResult
+    try {
+      result = await this.runner.run('docker', ['image', 'pull', image], { signal })
+      signal?.throwIfAborted()
+    } catch (error) {
+      cancellation(error, signal)
+      throw pullFailed()
+    }
+    if (result.exitCode !== 0) throw pullFailed()
+  }
+
+  async imageExists(image: string, signal?: AbortSignal): Promise<boolean> {
+    validateImageReference(image)
+    signal?.throwIfAborted()
+    let result: CommandResult
+    try {
+      result = await this.runner.run('docker', ['image', 'inspect', image], { signal })
+      signal?.throwIfAborted()
+    } catch (error) {
+      cancellation(error, signal)
+      throw imageInspectFailed()
+    }
+    if (result.exitCode === 0) return true
+    if (/no such image/i.test(`${result.stdout}\n${result.stderr}`)) return false
+    throw imageInspectFailed()
   }
 
   private composeArgs(identity: ManagedIdentity, operation: readonly string[]): string[] {

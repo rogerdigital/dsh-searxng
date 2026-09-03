@@ -6,18 +6,22 @@ import { fileURLToPath } from 'node:url'
 import { resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { parseCliArgs } from './cli/args.ts'
-import { FileAssetRenderer } from './cli/assets.ts'
+import { FileAssetRenderer, type StagingAssetRenderer } from './cli/assets.ts'
 import { CliDockerAdapter } from './cli/docker.ts'
-import { diagnose } from './cli/diagnostics.ts'
-import { managedDir, NodeEnvironmentService, resolveDshHome, type PortChecker } from './cli/environment.ts'
+import { loadDeploymentCatalog, type DeploymentDefinition } from './cli/deployments.ts'
+import { diagnose, formatAge, inspectSnapshot, type SnapshotDependencies } from './cli/diagnostics.ts'
+import { homeId, managedDir, NodeEnvironmentService, resolveDshHome, type PortChecker } from './cli/environment.ts'
 import { CliError } from './cli/errors.ts'
+import { FileJournalStore, type JournalStore } from './cli/journal.ts'
 import { presentError, presentSuccess } from './cli/presenter.ts'
 import { NodeProcessRunner, type CommandRunner } from './cli/process.ts'
 import { NodeProfileManager } from './cli/profile.ts'
+import { executeRepair, executeRecovery, planRecovery, planRepair, type RecoveryOutcome, type RepairDependencies, type RecoveryPlan } from './cli/repair.ts'
 import { remove, removeManagedDirectory, type RemoveDependencies } from './cli/remove.ts'
 import { DefaultSearxngProbe } from './cli/searxng.ts'
 import { setup, type SetupDependencies } from './cli/setup.ts'
 import { FileStateStore } from './cli/state.ts'
+import { updateManagedService, type UpdateDependencies, type UpdatePhase } from './cli/update.ts'
 
 type Writer = (text: string) => void
 
@@ -32,6 +36,12 @@ export interface RunCliOptions {
 export interface CliDependencies extends SetupDependencies {
   confirmPurge: RemoveDependencies['confirmPurge']
   removeManagedDirectory: RemoveDependencies['removeManagedDirectory']
+  journal: JournalStore
+  probeAssets?: SnapshotDependencies['probeAssets']
+  /** Overrides the packaged deployment catalog; production loads assets/deployments. */
+  catalog?: readonly DeploymentDefinition[]
+  /** Overrides the bundle secret reader; production preserves the existing secret. */
+  readPreservedSecret?: UpdateDependencies['readPreservedSecret']
 }
 
 export interface ProductionDependencyOptions {
@@ -70,14 +80,29 @@ Usage:
   dsh-searxng setup [--profile NAME] [--port PORT] [--url URL] [--json]
   dsh-searxng status [--profile NAME] [--json]
   dsh-searxng doctor [--profile NAME] [--json]
+  dsh-searxng repair [--profile NAME] [--json]
+  dsh-searxng update [--profile NAME] [--deployment-version N] [--json]
   dsh-searxng remove [--profile NAME] [--service] [--purge-data --yes] [--json]
 
 Commands:
   setup    Configure an external SearXNG endpoint or create an owned Docker service
   status   Stop at the first failed health check
   doctor   Report the complete ordered diagnostic chain
+  repair   Plan and execute ownership-safe repairs for the managed deployment
+  update   Move the managed deployment to a packaged version with verified rollback
   remove   Detach a profile, optionally removing the owned service and data
 `
+
+const UPDATE_PHASE_NARRATION: Readonly<Record<UpdatePhase, string>> = {
+  diagnosing: 'Verifying the current deployment is healthy',
+  'target-selected': 'Target deployment selected',
+  pulling: 'Pulling the target image',
+  staging: 'Staging the target configuration',
+  activating: 'Activating the target deployment',
+  validating: 'Validating the target deployment',
+  'rolling-back': 'Update failed; rolling back to the previous deployment',
+  'rolled-back': 'Rolled back to the previous deployment',
+}
 
 export function createLoopbackPortChecker(serverFactory: () => Server = createServer): PortChecker {
   return async (port, signal) => {
@@ -143,6 +168,91 @@ async function confirmPurge(volumes: readonly string[]): Promise<boolean> {
   }
 }
 
+/** Repair wiring mirrors setup/remove: snapshot deps and executor deps over the shared dependency object. */
+function createRepairDependencies(
+  dependencies: SetupDependencies,
+  extras: Partial<CliDependencies>,
+  signal?: AbortSignal,
+): RepairDependencies {
+  if (extras.journal === undefined) {
+    throw new CliError('E_INTERNAL', 'The operation journal is unavailable', 'Reinstall dsh-searxng and retry')
+  }
+  const snapshotDependencies: SnapshotDependencies = {
+    environment: dependencies.environment,
+    state: dependencies.state,
+    docker: dependencies.docker,
+    profiles: dependencies.profiles,
+    searxng: dependencies.searxng,
+    journal: extras.journal,
+    ...(extras.probeAssets === undefined ? {} : { probeAssets: extras.probeAssets }),
+  }
+  return {
+    environment: dependencies.environment,
+    state: dependencies.state,
+    docker: dependencies.docker,
+    assets: dependencies.assets,
+    searxng: dependencies.searxng,
+    profiles: dependencies.profiles,
+    journal: extras.journal,
+    // Recovery cross-checks commit decisions against the packaged catalog,
+    // exactly like update's wiring: injected override first, packaged default
+    // second, so real invocations never silently skip the check.
+    catalog: extras.catalog ?? loadDeploymentCatalog(),
+    diagnose: (profile) => inspectSnapshot(profile, snapshotDependencies, signal),
+    now: dependencies.now,
+  }
+}
+
+function recoveryEnvelope(plan: RecoveryPlan, outcome: RecoveryOutcome) {
+  return {
+    interrupted: {
+      id: plan.journal.id,
+      kind: plan.journal.kind,
+      phase: plan.journal.phase,
+      ageMs: plan.ageMs,
+    },
+    decision: outcome.decision,
+    outcome: outcome.outcome,
+  }
+}
+
+/** Update wiring mirrors repair, plus the packaged deployment catalog and the staging renderer capability. */
+function createUpdateDependencies(
+  dependencies: SetupDependencies,
+  extras: Partial<CliDependencies>,
+  signal?: AbortSignal,
+): UpdateDependencies {
+  if (extras.journal === undefined) {
+    throw new CliError('E_INTERNAL', 'The operation journal is unavailable', 'Reinstall dsh-searxng and retry')
+  }
+  const assets = dependencies.assets as Partial<StagingAssetRenderer>
+  if (typeof assets.stage !== 'function') {
+    throw new CliError('E_INTERNAL', 'The asset renderer cannot stage deployments', 'Reinstall dsh-searxng and retry')
+  }
+  const snapshotDependencies: SnapshotDependencies = {
+    environment: dependencies.environment,
+    state: dependencies.state,
+    docker: dependencies.docker,
+    profiles: dependencies.profiles,
+    searxng: dependencies.searxng,
+    journal: extras.journal,
+    ...(extras.probeAssets === undefined ? {} : { probeAssets: extras.probeAssets }),
+  }
+  return {
+    environment: dependencies.environment,
+    state: dependencies.state,
+    journal: extras.journal,
+    docker: dependencies.docker,
+    assets: assets as StagingAssetRenderer,
+    searxng: dependencies.searxng,
+    profiles: dependencies.profiles,
+    catalog: extras.catalog ?? loadDeploymentCatalog(),
+    diagnose: (profile) => inspectSnapshot(profile, snapshotDependencies, signal),
+    ...(extras.readPreservedSecret === undefined ? {} : { readPreservedSecret: extras.readPreservedSecret }),
+    now: dependencies.now,
+  }
+}
+
 export function createProductionDependencies(options: ProductionDependencyOptions = {}): CliDependencies {
   const env = options.env ?? process.env
   const dshHome = resolveDshHome(env, options.homedir)
@@ -150,7 +260,7 @@ export function createProductionDependencies(options: ProductionDependencyOption
   const portChecker = options.portChecker ?? createLoopbackPortChecker()
   return {
     environment: new NodeEnvironmentService({ env, homedir: options.homedir, portChecker, commandRunner: runner }),
-    state: new FileStateStore(managedDir(dshHome)),
+    state: new FileStateStore(managedDir(dshHome), homeId(dshHome)),
     docker: new CliDockerAdapter(runner),
     assets: new FileAssetRenderer(),
     searxng: new DefaultSearxngProbe(),
@@ -158,6 +268,7 @@ export function createProductionDependencies(options: ProductionDependencyOption
     now: () => new Date(),
     confirmPurge,
     removeManagedDirectory,
+    journal: new FileJournalStore(managedDir(dshHome)),
   }
 }
 
@@ -217,6 +328,108 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
           : new CliError(failure.code, failure.message, failure.action), presenter)
       }
       return result.healthy ? 0 : 1
+    }
+
+    if (command.command === 'repair') {
+      const repairDependencies = createRepairDependencies(dependencies, dependencies as Partial<CliDependencies>, options.signal)
+      // An interrupted operation takes over the whole repair invocation: the
+      // recovery decision is computed from disk, displayed, then executed
+      // before any ordinary planning. Only a cleared prepared journal falls
+      // through to ordinary repair in the same run.
+      const interrupted = await repairDependencies.journal.read()
+      let recovered: { plan: RecoveryPlan; outcome: RecoveryOutcome } | undefined
+      if (interrupted !== undefined) {
+        const recoveryPlan = await planRecovery(command.profile, interrupted, repairDependencies, options.signal)
+        if (format === 'human') {
+          stdout([
+            `Interrupted operation: ${recoveryPlan.journal.kind} (${recoveryPlan.journal.phase}), started ${formatAge(recoveryPlan.ageMs)} ago`,
+            'Recovery plan:',
+            ...recoveryPlan.summary.map((line) => `- ${line}`),
+            '',
+          ].join('\n'))
+        }
+        if (recoveryPlan.decision.type === 'blocked') throw recoveryPlan.decision.error
+        const outcome = await executeRecovery(recoveryPlan, repairDependencies, options.signal)
+        recovered = { plan: recoveryPlan, outcome }
+        if (recoveryPlan.decision.type !== 'clear-prepared') {
+          if (format === 'json') {
+            presentSuccess({
+              profile: command.profile,
+              endpoint: recoveryPlan.endpoint,
+              healthy: true,
+              recovery: recoveryEnvelope(recoveryPlan, outcome),
+              actions: [],
+              checks: outcome.checks,
+            }, presenter)
+          } else {
+            stdout([
+              `Recovery complete: ${outcome.outcome}`,
+              'SearXNG healthy',
+              `Profile: ${command.profile}`,
+              `Endpoint: ${recoveryPlan.endpoint}`,
+              'Validation: readiness, real search, and provider search passed',
+              '',
+            ].join('\n'))
+          }
+          return 0
+        }
+        if (format === 'human') stdout('Journal cleared; no managed resources were mutated\n\n')
+      }
+      const plan = planRepair(await repairDependencies.diagnose(command.profile))
+      // The exact planned actions are shown to the operator before any mutation starts.
+      if (format === 'human') {
+        stdout([
+          `Repair plan for profile ${plan.profile}:`,
+          ...plan.summary.map((line) => `- ${line}`),
+          '',
+        ].join('\n'))
+      }
+      const result = await executeRepair(plan, repairDependencies, options.signal)
+      if (format === 'json') {
+        presentSuccess({
+          profile: command.profile,
+          endpoint: plan.endpoint,
+          healthy: true,
+          actions: result.actions,
+          checks: result.checks,
+          ...(recovered === undefined ? {} : { recovery: recoveryEnvelope(recovered.plan, recovered.outcome) }),
+        }, presenter)
+      } else {
+        stdout([
+          'SearXNG healthy',
+          `Profile: ${command.profile}`,
+          `Endpoint: ${plan.endpoint}`,
+          'Validation: real search and provider search passed',
+          '',
+        ].join('\n'))
+      }
+      return 0
+    }
+
+    if (command.command === 'update') {
+      const updateDependencies = createUpdateDependencies(dependencies, dependencies as Partial<CliDependencies>, options.signal)
+      const narrate = format === 'human' ? (phase: UpdatePhase) => stdout(`${UPDATE_PHASE_NARRATION[phase]}\n`) : undefined
+      const result = await updateManagedService(
+        {
+          profile: command.profile,
+          ...(command.deploymentVersion === undefined ? {} : { deploymentVersion: command.deploymentVersion }),
+        },
+        narrate === undefined ? updateDependencies : { ...updateDependencies, report: narrate },
+        options.signal,
+      )
+      if (format === 'json') {
+        presentSuccess(result, presenter)
+      } else {
+        stdout([
+          'SearXNG updated',
+          `Profile: ${result.profile}`,
+          `Endpoint: ${result.endpoint}`,
+          `Deployment: ${result.from} -> ${result.to}`,
+          'Validation: readiness, real search, and provider search passed',
+          '',
+        ].join('\n'))
+      }
+      return 0
     }
 
     if (command.command !== 'remove') throw usageError('Unsupported command')

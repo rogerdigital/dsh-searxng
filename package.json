@@ -35,6 +35,8 @@
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:e2e": "vitest run test/e2e/managed-setup.test.ts",
+    "certify:platform": "node scripts/certify-platform.mjs",
     "pack:check": "pnpm pack --pack-destination ./node_modules/.cache/pack",
     "pack:test": "node scripts/check-packed-cli.mjs",
     "verify": "pnpm typecheck && pnpm test && pnpm build && pnpm pack:check && pnpm pack:test",

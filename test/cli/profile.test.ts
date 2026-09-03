@@ -127,8 +127,36 @@ describe('ProfileManager contract and discovery', () => {
         categories: 'general',
         authHeader: 'Bearer private-token',
       },
+      current: {
+        baseURL: 'http://old.invalid',
+        language: 'zh-CN',
+        engines: 'bing,google',
+        categories: 'general',
+        authHeader: 'Bearer private-token',
+      },
     })
     await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(patch)
+  })
+
+  it('exposes the live attachment endpoint when it differs from the preview target', async () => {
+    const drifted = `# dsh-searxng managed attachment
+- id: web-search-searxng
+  config:
+    baseURL: http://drifted.invalid
+    language: en
+`
+    const driftedProfile = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.1.1' } },
+      patch: drifted,
+    })
+    const driftedPreview = await driftedProfile.manager.preview('web', 'http://127.0.0.1:8080')
+    expect(driftedPreview.attached).toBe(false)
+    expect(driftedPreview.current).toEqual({ baseURL: 'http://drifted.invalid', language: 'en' })
+
+    const absent = await fixture({ packageJson: { dependencies: { 'dsh-searxng': '0.1.1' } } })
+    const absentPreview = await absent.manager.preview('web', 'http://127.0.0.1:8080')
+    expect(absentPreview.attached).toBe(false)
+    expect(absentPreview.current).toBeUndefined()
   })
 
   it('recognizes only the final effective correctly managed attachment', async () => {
