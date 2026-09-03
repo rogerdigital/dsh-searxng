@@ -23,6 +23,7 @@ and must not be advertised as certified.
 On each certification host (Node.js 20+, `dsh` on PATH, Docker running):
 
 ```sh
+pnpm verify   # rebuilds lib/ first — pnpm pack alone would ship whatever lib/ currently holds
 pnpm pack --pack-destination ./node_modules/.cache/pack
 sha256sum ./node_modules/.cache/pack/dsh-searxng-<version>.tgz
 pnpm certify:platform -- --tarball "$PWD/node_modules/.cache/pack/dsh-searxng-<version>.tgz" > <environment>-report.json

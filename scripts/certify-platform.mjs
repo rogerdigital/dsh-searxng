@@ -343,6 +343,7 @@ export async function runCertification(input) {
 
   async function currentDeployment() {
     const state = await readState()
+    assert(state?.schemaVersion === 2, 'the packed CLI wrote an unexpected state schema; rebuild before packing', { state })
     const current = state?.managed?.current
     assert(current !== undefined && typeof current === 'object', 'Managed deployment state is missing', { state })
     assert(typeof current.containerName === 'string' && current.containerName.length > 0, 'Managed container name is missing from state', { state })
