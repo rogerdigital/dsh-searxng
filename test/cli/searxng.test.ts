@@ -163,8 +163,48 @@ describe('probeSearxng', () => {
     { results: [{ url: 'not a URL' }] },
     {},
   ])('rejects a final response without a valid non-empty HTTP result URL', async (body) => {
-    const attempt = probeSearxng({ baseURL: BASE, fetch: vi.fn().mockResolvedValue(jsonResponse(body)) })
+    // A fresh Response per call: empty results retry with a varied query, and
+    // a Response body can be read only once.
+    const attempt = probeSearxng({ baseURL: BASE, fetch: vi.fn().mockImplementation(() => jsonResponse(body)) })
     await expect(attempt).rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
+  })
+
+  it('retries an empty real-search result with a varied query before failing', async () => {
+    const urls: string[] = []
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      urls.push(String(input))
+      return Promise.resolve(jsonResponse({ results: [{ url: 'https://example.com/result' }] }))
+    })
+    await expect(probeSearxng({ baseURL: BASE, fetch: fetchMock })).resolves.toMatchObject({ resultCount: 1 })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(urls[0]).toContain('deepseek+harness')
+  })
+
+  it('recovers when upstream engines cool down for the repeated probe query', async () => {
+    let calls = 0
+    const queries: string[] = []
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      calls += 1
+      const url = new URL(String(input))
+      queries.push(url.searchParams.get('q') ?? '')
+      // First query cooled down upstream: zero results; the varied retry works.
+      const empty = calls === 1
+      return Promise.resolve(jsonResponse(empty ? { results: [] } : { results: [{ url: 'https://example.com/recovered' }] }))
+    })
+    await expect(probeSearxng({ baseURL: BASE, fetch: fetchMock })).resolves.toMatchObject({ resultCount: 1 })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(queries).toEqual(['deepseek harness', 'deepseek harness 2'])
+  })
+
+  it('gives up on persistently empty real-search results after three varied attempts', async () => {
+    const queries: string[] = []
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      queries.push(new URL(String(input)).searchParams.get('q') ?? '')
+      return Promise.resolve(jsonResponse({ results: [] }))
+    })
+    await expect(probeSearxng({ baseURL: BASE, fetch: fetchMock })).rejects.toMatchObject({ code: 'E_SEARCH_FAILED' })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(new Set(queries).size).toBe(3)
   })
 
   it.each([
