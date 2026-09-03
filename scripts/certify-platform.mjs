@@ -1,5 +1,8 @@
-#!/usr/bin/env node
 /**
+ * NOTE: no shebang on purpose — vitest's SSR transform hoists imports above a
+ * hashbang (vitejs/vite#23034); this module is imported by the contract test and
+ * executed via `node scripts/certify-platform.mjs`.
+ *
  * Platform certification runner for the packed dsh-searxng artifact.
  *
  * Installs an explicitly passed tarball into a throwaway npm project with an

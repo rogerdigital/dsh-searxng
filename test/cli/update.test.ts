@@ -16,7 +16,7 @@ import { updateManagedService, type UpdateDependencies } from '../../src/cli/upd
 import { runCli } from '../../src/cli.ts'
 
 const HOME_ID = '0123456789abcdef'
-const MANAGED_DIR = '/tmp/dsh/dsh-searxng'
+const MANAGED_DIR = join(tmpdir(), 'dsh-searxng')
 const PROJECT = `dsh-searxng-${HOME_ID}`
 const ENDPOINT = 'http://127.0.0.1:8080'
 const START = '2026-09-01T00:00:00.000Z'

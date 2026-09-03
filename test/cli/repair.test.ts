@@ -15,7 +15,7 @@ import { executeRepair, planRepair, readPreservedSecretFromBundle, type RepairDe
 import { runCli } from '../../src/cli.ts'
 
 const HOME_ID = '0123456789abcdef'
-const MANAGED_DIR = '/tmp/dsh/dsh-searxng'
+const MANAGED_DIR = join(tmpdir(), 'dsh-searxng')
 const PROJECT = `dsh-searxng-${HOME_ID}`
 const ENDPOINT = 'http://127.0.0.1:8080'
 const EXTERNAL_ENDPOINT = 'https://search.example'

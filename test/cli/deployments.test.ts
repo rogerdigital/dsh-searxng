@@ -94,7 +94,7 @@ describe('packaged deployment catalog', () => {
     expect(deployment.composeAsset).toBe('docker/compose.yml')
     expect(deployment.settingsAsset).toBe('docker/settings.yml.template')
     expect(deployment.stateSchemas).toEqual([1, CURRENT_STATE_SCHEMA])
-    expect(fileURLToPath(new URL(deployment.composeAsset, REPO_ASSET_ROOT))).toContain('assets/docker/compose.yml')
+    expect(fileURLToPath(new URL(deployment.composeAsset, REPO_ASSET_ROOT))).toContain(join('assets', 'docker', 'compose.yml'))
   })
 
   it('resolves the packaged asset root by default from source and installed layouts', () => {
