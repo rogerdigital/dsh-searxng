@@ -71,6 +71,8 @@ const realFileSystem: AssetFileSystem = { chmod, lstat, mkdir, open, readFile, r
 
 export interface FileAssetRendererOptions {
   assetRoot?: URL
+  /** Root that deployment-catalog asset paths (docker/...) resolve against. */
+  catalogAssetRoot?: URL
   fileSystem?: Partial<AssetFileSystem>
 }
 
@@ -171,10 +173,15 @@ function finalEnvironment(base: string, bundleName: string): string {
 
 export class FileAssetRenderer implements AssetRenderer {
   private readonly assetRoot: URL
+  private readonly catalogAssetRoot: URL
   private readonly fs: AssetFileSystem
 
   constructor(options: FileAssetRendererOptions = {}) {
     this.assetRoot = options.assetRoot ?? DEFAULT_ASSET_ROOT
+    // Catalog asset paths are relative to the packaged assets root (assets/),
+    // the same root the deployment catalog validates against — the renderer's
+    // own root is the docker subdirectory that render()'s fixed names use.
+    this.catalogAssetRoot = options.catalogAssetRoot ?? new URL('..', DEFAULT_ASSET_ROOT)
     this.fs = { ...realFileSystem, ...options.fileSystem }
   }
 
@@ -210,7 +217,7 @@ export class FileAssetRenderer implements AssetRenderer {
       port: input.port,
       secret: input.secret,
     })
-    const [compose, template] = await this.readAssets(definition.composeAsset, definition.settingsAsset)
+    const [compose, template] = await this.readAssets(definition.composeAsset, definition.settingsAsset, this.catalogAssetRoot)
     const published = await this.publishBundle({
       stateDir: input.stateDir,
       identity: input.identity,
@@ -228,11 +235,11 @@ export class FileAssetRenderer implements AssetRenderer {
     }
   }
 
-  private async readAssets(composePath: string, settingsPath: string): Promise<[string, string]> {
+  private async readAssets(composePath: string, settingsPath: string, root: URL = this.assetRoot): Promise<[string, string]> {
     try {
       return await Promise.all([
-        this.fs.readFile(new URL(composePath, this.assetRoot), 'utf8'),
-        this.fs.readFile(new URL(settingsPath, this.assetRoot), 'utf8'),
+        this.fs.readFile(new URL(composePath, root), 'utf8'),
+        this.fs.readFile(new URL(settingsPath, root), 'utf8'),
       ])
     } catch {
       throw invalidAssets('Packaged Docker assets are unavailable')

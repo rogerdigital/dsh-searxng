@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { parse as parseYaml } from 'yaml'
 import { FileAssetRenderer, SEARXNG_IMAGE, type ManagedIdentity, type StageInput } from '../../src/cli/assets.ts'
+import { loadDeploymentCatalog } from '../../src/cli/deployments.ts'
 import type { DeploymentDefinition } from '../../src/cli/deployments.ts'
 
 const compose = parseYaml(readFileSync(new URL('../../assets/docker/compose.yml', import.meta.url), 'utf8')) as Record<string, any>
@@ -306,6 +307,27 @@ function deploymentV2(overrides: Partial<DeploymentDefinition> = {}): Deployment
 }
 
 describe('FileAssetRenderer stage', () => {
+
+  // Regression: the packed artifact's stage path must resolve the catalog's
+  // asset paths (docker/...) against the packaged assets root, not the
+  // renderer's docker root. Production update stages exactly this entry.
+  it('stages the real packaged catalog entry through default renderer roots', async () => {
+    const { stateDir, identity, renderer } = await stagingFixture()
+    try {
+      const [entry] = loadDeploymentCatalog()
+      const staged = await renderer.stage({
+        stateDir,
+        identity,
+        port: 8080,
+        secret: 'stable-secret',
+        definition: entry,
+      })
+      expect(staged.configurationSha256).toMatch(/^[a-f0-9]{64}$/)
+      expect(staged.definition).toBe(entry)
+    } finally {
+      await rm(stateDir, { recursive: true, force: true })
+    }
+  })
   async function stagingFixture() {
     const stateDir = await mkdtemp(join(tmpdir(), 'dsh-searxng-stage-'))
     const identity: ManagedIdentity = {
@@ -315,12 +337,15 @@ describe('FileAssetRenderer stage', () => {
       projectName: 'dsh-searxng-0123456789abcdef',
       containerName: 'dsh-searxng-0123456789abcdef',
     }
-    // Staging resolves catalog-relative asset paths (docker/...) against the
-    // packaged assets root; the active v1 bundle renders through the default
-    // docker-root renderer exactly as setup does.
-    const renderer = new FileAssetRenderer({ assetRoot: new URL('../../assets/', import.meta.url) })
-    const active = new FileAssetRenderer({ assetRoot: new URL('../../assets/docker/', import.meta.url) })
-    const v1 = await active.render({ stateDir, identity, image: SEARXNG_IMAGE, port: 8080, secret: 'stable-secret' })
+    // One renderer with the packed layout's two roots: render() reads through
+    // the docker root, stage() resolves catalog-relative asset paths
+    // (docker/...) through the assets root. Source layout needs the explicit
+    // URLs; production defaults resolve the same pair from the packed lib/.
+    const renderer = new FileAssetRenderer({
+      assetRoot: new URL('../../assets/docker/', import.meta.url),
+      catalogAssetRoot: new URL('../../assets/', import.meta.url),
+    })
+    const v1 = await renderer.render({ stateDir, identity, image: SEARXNG_IMAGE, port: 8080, secret: 'stable-secret' })
     return { stateDir, identity, renderer, v1 }
   }
 
