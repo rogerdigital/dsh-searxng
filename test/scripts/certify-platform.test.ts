@@ -1,4 +1,5 @@
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { describe, expect, it } from 'vitest'
 import { RESOURCE_LABELS } from '../../src/cli/docker.ts'
 import { homeId } from '../../src/cli/environment.ts'
@@ -55,7 +56,7 @@ class FakeWorld {
   }
 }
 
-const tempRoot = '/tmp/cert-root'
+const tempRoot = join(tmpdir(), 'cert-root')
 const dshHome = join(tempRoot, 'dsh-home')
 const installRoot = join(tempRoot, 'install')
 const packageRoot = join(installRoot, 'node_modules', 'dsh-searxng')
