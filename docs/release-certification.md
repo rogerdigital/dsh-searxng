@@ -82,6 +82,21 @@ Two faults are injected deliberately, and `notes` documents them:
 Copy the block below once per release and fill every field. `Report path` is
 where the full JSON report is archived (for example, attached to the release).
 
+### v0.3.0
+
+| Field | macOS + Docker Desktop | Windows + Docker Desktop + WSL2 | Linux + Docker Engine |
+|---|---|---|---|
+| Tarball SHA-256 | `2ed8860dd79b913f682e9a2efe13b35795a0472ee8c4f7965407316f980dfe8d` | pending | pending |
+| Package version | 0.3.0 | pending | pending |
+| Date (UTC) | 2026-09-03 | pending | pending |
+| Architecture | darwin-arm64 | pending | pending |
+| Docker / Compose | 29.7.2 / 5.5.0 | pending | pending |
+| Report path | `docs/certification/v0.3.0-darwin-arm64.json` | pending | pending |
+| Result | pass (8/8 checks + cleanup) | pending | pending |
+
+The Windows and Linux reports are release follow-ups; the README support
+matrix claims only environments with a passing report.
+
 ### v0.0.0 (template)
 
 | Field | macOS + Docker Desktop | Windows + Docker Desktop + WSL2 | Linux + Docker Engine |
