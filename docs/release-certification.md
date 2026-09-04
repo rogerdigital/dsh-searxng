@@ -97,6 +97,15 @@ where the full JSON report is archived (for example, attached to the release).
 The Windows and Linux reports are release follow-ups; the README support
 matrix claims only environments with a passing report.
 
+The published npm artifact (`dsh-searxng@0.3.0`, dist tarball SHA-256
+`b89c00e6cc1f78f24e06806db673a9368f6139a18a402b40228d5f4dbca2bc7e`) was
+repacked by npm from the same commit, so its bytes differ from the certified
+tarball. Every shipped file (`lib/`, `assets/`, `README.md`, `LICENSE`,
+`cordis.patch.yml`) is byte-identical; `package.json` differs only in
+packer-normalized metadata (field order, whitespace, and the
+`packageManager`/`scripts` fields npm keeps and pnpm pack strips). The
+certification therefore holds for the published content.
+
 ### v0.0.0 (template)
 
 | Field | macOS + Docker Desktop | Windows + Docker Desktop + WSL2 | Linux + Docker Engine |
