@@ -1,0 +1,90 @@
+{
+  "schema": "dsh-vet/v1",
+  "target": {
+    "kind": "npm-package",
+    "specifier": "dsh-searxng",
+    "resolved": {
+      "version": "0.3.0",
+      "integrity": "sha512-RMrobp4Ya6rhWIS7G4QSz2QTvXKXbNAkQhx1Qcb7hZBruxctFlGxR+Ee9R5tqnD+yQjWMyz7V9VvM1snzxH7pw=="
+    }
+  },
+  "scanner": {
+    "name": "dsh-vet",
+    "version": "0.3.0",
+    "ranAt": "2026-09-04T03:11:47.828Z"
+  },
+  "summary": {
+    "grade": "A",
+    "counts": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 1,
+      "info": 1
+    }
+  },
+  "findings": [
+    {
+      "id": "perm.undeclared-fs-write",
+      "title": "Write/delete target is a runtime value — scope not statically verifiable",
+      "severity": "low",
+      "confidence": "low",
+      "evidence": [
+        {
+          "file": "lib/cli.mjs",
+          "line": 7073,
+          "snippet": "await fs.rename(path, failedPath);",
+          "note": "review how the target is derived; the scanner cannot resolve it statically"
+        },
+        {
+          "file": "lib/cli.mjs",
+          "line": 7091,
+          "snippet": "await fs.rm(failedPath, { force: true });",
+          "note": "review how the target is derived; the scanner cannot resolve it statically"
+        },
+        {
+          "file": "lib/cli.mjs",
+          "line": 7096,
+          "snippet": "await fs.rm(backupPath, { force: true });",
+          "note": "review how the target is derived; the scanner cannot resolve it statically"
+        },
+        {
+          "file": "lib/cli.mjs",
+          "line": 7103,
+          "snippet": "await fs.rename(path, failedPath);",
+          "note": "review how the target is derived; the scanner cannot resolve it statically"
+        },
+        {
+          "file": "lib/cli.mjs",
+          "line": 7106,
+          "snippet": "await fs.rm(path);",
+          "note": "review how the target is derived; the scanner cannot resolve it statically"
+        },
+        {
+          "file": ".",
+          "note": "…and 12 more"
+        }
+      ],
+      "remediation": "Keep the derivation next to the call, test the invariant (fixed child of a validated root), and document the managed scope so reviewers can verify it.",
+      "references": [
+        "https://github.com/rogerdigital/dsh-vet/blob/main/docs/rules/perm.undeclared-fs-write.md"
+      ]
+    },
+    {
+      "id": "perm.network-client",
+      "title": "Imports network modules without an observable client call",
+      "severity": "info",
+      "confidence": "high",
+      "evidence": [
+        {
+          "file": "lib/cli.mjs",
+          "note": "import present, no client call site"
+        }
+      ],
+      "remediation": "Remove the unused import.",
+      "references": [
+        "https://github.com/rogerdigital/dsh-vet/blob/main/docs/rules/perm.network-client.md"
+      ]
+    }
+  ]
+}
