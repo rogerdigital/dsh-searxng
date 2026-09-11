@@ -25,6 +25,14 @@ export interface DockerAdapter {
    */
   imageExists(image: string, signal?: AbortSignal): Promise<boolean>
   /**
+   * Optional capability: the container's published port bindings, read from a
+   * label-verified `docker container inspect`. Powers read-only privacy
+   * posture checks (loopback binding); a malformed ports payload throws
+   * instead of skipping entries, so an unparseable answer can never read as
+   * "loopback verified".
+   */
+  publishedHostBindings?(identity: ManagedIdentity, signal?: AbortSignal): Promise<readonly HostPortBinding[]>
+  /**
    * Optional capability to delete a named temporary Docker resource after
    * re-verifying this installation's ownership labels. Reserved: the repair
    * executor currently removes orphaned filesystem staging directories only
@@ -43,6 +51,13 @@ export interface DockerDeploymentStatus {
   ownership: 'absent' | 'owned' | 'foreign'
   container: 'absent' | 'running' | 'stopped'
   composePath?: string
+}
+
+/** One published container port as bound on the host. */
+export interface HostPortBinding {
+  containerPort: number
+  hostIp: string
+  hostPort: number
 }
 
 export interface CliDockerAdapterOptions {
@@ -290,6 +305,37 @@ export class CliDockerAdapter implements DockerAdapter {
   async up(identity: ManagedIdentity, signal?: AbortSignal): Promise<void> {
     await this.inspectOwnership(identity, signal)
     await this.runCompose(identity, ['up', '--detach'], 'up', signal)
+  }
+
+  async publishedHostBindings(identity: ManagedIdentity, signal?: AbortSignal): Promise<readonly HostPortBinding[]> {
+    validateIdentity(identity)
+    signal?.throwIfAborted()
+    const container = await this.inspectContainer(identity, signal)
+    if (container === undefined) return []
+    const networkSettings = container.NetworkSettings
+    if (networkSettings === undefined) return []
+    if (networkSettings === null || typeof networkSettings !== 'object' || Array.isArray(networkSettings)) {
+      throw operationFailed('inspect')
+    }
+    const ports = (networkSettings as Record<string, unknown>).Ports
+    if (ports === undefined) return []
+    if (ports === null || typeof ports !== 'object' || Array.isArray(ports)) throw operationFailed('inspect')
+    const bindings: HostPortBinding[] = []
+    for (const [containerPortSpec, entries] of Object.entries(ports as Record<string, unknown>)) {
+      const containerPort = /^(\d+)\/(?:tcp|udp)$/.exec(containerPortSpec)?.[1]
+      if (containerPort === undefined) throw operationFailed('inspect')
+      if (entries === null || entries === undefined) continue
+      if (!Array.isArray(entries)) throw operationFailed('inspect')
+      for (const entry of entries) {
+        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) throw operationFailed('inspect')
+        const record = entry as Record<string, unknown>
+        if (typeof record.HostIp !== 'string' || typeof record.HostPort !== 'string' || !/^\d+$/.test(record.HostPort)) {
+          throw operationFailed('inspect')
+        }
+        bindings.push({ containerPort: Number(containerPort), hostIp: record.HostIp, hostPort: Number(record.HostPort) })
+      }
+    }
+    return bindings
   }
 
   async restart(identity: ManagedIdentity, signal?: AbortSignal): Promise<void> {

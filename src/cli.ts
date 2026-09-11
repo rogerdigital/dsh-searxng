@@ -9,17 +9,18 @@ import { parseCliArgs } from './cli/args.ts'
 import { FileAssetRenderer, type StagingAssetRenderer } from './cli/assets.ts'
 import { CliDockerAdapter } from './cli/docker.ts'
 import { loadDeploymentCatalog, type DeploymentDefinition } from './cli/deployments.ts'
-import { diagnose, formatAge, inspectSnapshot, type SnapshotDependencies } from './cli/diagnostics.ts'
+import { diagnose, formatAge, formatPrivacyPosture, inspectSnapshot, type SnapshotDependencies } from './cli/diagnostics.ts'
 import { homeId, managedDir, NodeEnvironmentService, resolveDshHome, type PortChecker } from './cli/environment.ts'
 import { CliError } from './cli/errors.ts'
 import { FileJournalStore, type JournalStore } from './cli/journal.ts'
-import { presentError, presentSuccess } from './cli/presenter.ts'
+import { presentError, presentPublicSuccess, presentSuccess } from './cli/presenter.ts'
 import { NodeProcessRunner, type CommandRunner } from './cli/process.ts'
 import { NodeProfileManager } from './cli/profile.ts'
 import { executeRepair, executeRecovery, planRecovery, planRepair, type RecoveryOutcome, type RepairDependencies, type RecoveryPlan } from './cli/repair.ts'
 import { remove, removeManagedDirectory, type RemoveDependencies } from './cli/remove.ts'
 import { DefaultSearxngProbe } from './cli/searxng.ts'
 import { setup, type SetupDependencies } from './cli/setup.ts'
+import { formatTuneReport, runTuneReport } from './cli/tune.ts'
 import { FileStateStore } from './cli/state.ts'
 import { updateManagedService, type UpdateDependencies, type UpdatePhase } from './cli/update.ts'
 
@@ -78,6 +79,7 @@ Usage:
   dsh-searxng setup [--profile NAME] [--port PORT] [--url URL] [--json]
   dsh-searxng status [--profile NAME] [--json]
   dsh-searxng doctor [--profile NAME] [--json]
+  dsh-searxng tune [--profile NAME] [--json]
   dsh-searxng repair [--profile NAME] [--json]
   dsh-searxng update [--profile NAME] [--deployment-version N] [--json]
   dsh-searxng remove [--profile NAME] [--service] [--purge-data --yes] [--json]
@@ -86,6 +88,7 @@ Commands:
   setup    Configure an external SearXNG endpoint or create an owned Docker service
   status   Stop at the first failed health check
   doctor   Report the complete ordered diagnostic chain
+  tune     Run the read-only engine-health probe battery and report evidence
   repair   Plan and execute ownership-safe repairs for the managed deployment
   update   Move the managed deployment to a packaged version with verified rollback
   remove   Detach a profile, optionally removing the owned service and data
@@ -337,7 +340,10 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
     if (command.command === 'status' || command.command === 'doctor') {
       const result = await diagnose(command.profile, command.command, dependencies, options.signal)
       if (format === 'json') presentSuccess(result, presenter)
-      else if (result.healthy) stdout(`${command.command === 'status' ? 'Status' : 'Doctor'}: healthy\n`)
+      else if (result.healthy) {
+        stdout(`${command.command === 'status' ? 'Status' : 'Doctor'}: healthy\n`)
+        if (result.privacy !== undefined) stdout(`${formatPrivacyPosture(result.privacy)}\n`)
+      }
       else {
         const failure = result.checks.find((check) => check.status === 'fail')?.error
         presentError(failure === undefined
@@ -345,6 +351,23 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
           : new CliError(failure.code, failure.message, failure.action), presenter)
       }
       return result.healthy ? 0 : 1
+    }
+
+    if (command.command === 'tune') {
+      const report = await runTuneReport(command.profile, {
+        environment: dependencies.environment,
+        state: dependencies.state,
+        profiles: dependencies.profiles,
+        now: dependencies.now,
+        ...(typeof (dependencies as unknown as { fetch?: unknown }).fetch === 'function'
+          ? { fetch: (dependencies as unknown as { fetch: typeof globalThis.fetch }).fetch }
+          : {}),
+      }, options.signal)
+      // The report is public by construction: fixed battery, engine names,
+      // timings. Key-based redaction would blank its query labels.
+      if (format === 'json') presentPublicSuccess(report, presenter)
+      else stdout(formatTuneReport(report))
+      return 0
     }
 
     if (command.command === 'repair') {

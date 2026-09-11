@@ -64,8 +64,13 @@ With a named profile, use `dsh plugin --profile <name> add dsh-searxng`.
 # Fast health result; stops at the first failure.
 npx dsh-searxng status --profile web
 
-# Ordered environment, Docker, ownership, HTTP, JSON, search, profile, and provider checks.
+# Ordered environment, Docker, ownership, HTTP, JSON, search, profile, and provider checks,
+# plus the local privacy posture with its explicit out-of-scope limits.
 npx dsh-searxng doctor --profile web
+
+# Read-only engine-health probe battery: per-engine reported failures with reasons,
+# result contribution, and evidence limits. Writes nothing.
+npx dsh-searxng tune --profile web
 
 # Plan and execute ownership-safe repairs for the managed deployment.
 npx dsh-searxng repair --profile web
@@ -127,8 +132,9 @@ Repeated queries are served from an in-process cache scoped to the provider
 instance (nothing is written to disk); a cache hit performs no network request.
 Concurrent searches pass a token bucket (burst 2, then one request per
 `minIntervalMs`), and a full queue rejects immediately with a retryable error
-instead of holding the caller. Failed responses are never cached, and an empty
-result page is returned as-is — the `engines`/`categories` allowlist is never
+instead of holding the caller. Failed responses and empty result pages are never cached —
+a cached empty page would mask upstream recovery for the whole TTL — and an empty result
+page is returned as-is: the `engines`/`categories` allowlist is never
 silently widened to chase results. When the instance answers HTTP 429, the
 provider honors `Retry-After` and retries at most once within the remaining
 budget.

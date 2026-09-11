@@ -41,7 +41,7 @@ describe('parseCliArgs', () => {
     expect(parseCliArgs(['setup', '--port', String(port)])).toMatchObject({ command: 'setup', port, portExplicit: true })
   })
 
-  it.each(['status', 'doctor'])('parses %s with defaults', (command) => {
+  it.each(['status', 'doctor', 'tune'])('parses %s with defaults', (command) => {
     expect(parseCliArgs([command])).toEqual({ command, profile: 'web', json: false })
   })
 

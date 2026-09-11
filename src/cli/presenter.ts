@@ -25,6 +25,22 @@ export function presentSuccess(value: unknown, options: PresenterOptions): void 
   options.stdout(output)
 }
 
+/**
+ * Success output for payloads that are public by construction (fixed probe
+ * batteries, engine names, timings). Key-based redaction would blank their
+ * `query` fields, so the caller must guarantee no user-derived secret can
+ * appear anywhere in the value.
+ */
+export function presentPublicSuccess(value: unknown, options: PresenterOptions): void {
+  let output: string
+  try {
+    output = options.format === 'json' ? `${stableJson(value)}\n` : 'Success\n'
+  } catch {
+    output = SERIALIZATION_FALLBACK
+  }
+  options.stdout(output)
+}
+
 export function presentError(error: unknown, options: PresenterOptions): void {
   let output: string
   try {

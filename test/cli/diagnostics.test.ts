@@ -1,3 +1,6 @@
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { CliError } from '../../src/cli/errors.ts'
 import { diagnose, inspectSnapshot, type DiagnosticDependencies, type SnapshotDependencies } from '../../src/cli/diagnostics.ts'
@@ -352,5 +355,126 @@ describe('inspectSnapshot', () => {
     const ownership = result.checks.find((check) => check.id === 'ownership')
     expect(ownership).toMatchObject({ status: 'fail', error: { code: 'E_RESOURCE_FOREIGN' } })
     expect(result.healthy).toBe(false)
+  })
+})
+
+describe('doctor privacy posture', () => {
+  async function withBundleDirectory(mode: number): Promise<string> {
+    const base = await mkdtemp(join(tmpdir(), 'dsh-searxng-privacy-'))
+    const bundleDir = join(base, `config-${'b'.repeat(64)}`)
+    const searxngDir = join(bundleDir, 'searxng')
+    await mkdir(searxngDir, { recursive: true })
+    await writeFile(join(searxngDir, 'settings.yml'), 'use_default_settings: true\nserver:\n  secret_key: test\n')
+    await writeFile(join(bundleDir, '.env'), 'DSH_SEARXNG_IMAGE=x\n')
+    await writeFile(join(bundleDir, 'compose.yml'), 'services: {}\n')
+    await chmod(join(searxngDir, 'settings.yml'), mode)
+    await chmod(join(bundleDir, '.env'), mode)
+    return bundleDir
+  }
+
+  function managedHarnessWithBundle(bundleDir: string, bindings?: Array<{ containerPort: number; hostIp: string; hostPort: number }>) {
+    const test = harness('managed')
+    vi.mocked(test.dependencies.environment.resolve).mockResolvedValue({
+      dshHome: '/dsh', profileDir: '/dsh/profiles/web', managedDir: dirname(bundleDir), homeId: HOME_ID,
+    })
+    vi.mocked(test.dependencies.docker.deploymentStatus).mockResolvedValue({
+      ownership: 'owned', container: 'running', composePath: join(bundleDir, 'compose.yml'),
+    })
+    if (bindings !== undefined) {
+      ;(test.dependencies.docker as { publishedHostBindings?: unknown }).publishedHostBindings =
+        vi.fn(async () => bindings)
+    }
+    return { ...test, dispose: async () => { await rm(dirname(bundleDir), { recursive: true, force: true }) } }
+  }
+
+  it('reports a verified local posture for a loopback-bound managed deployment', async () => {
+    const bundleDir = await withBundleDirectory(0o600)
+    const test = managedHarnessWithBundle(bundleDir, [{ containerPort: 8080, hostIp: '127.0.0.1', hostPort: 8080 }])
+    try {
+      const result = await diagnose('web', 'doctor', test.dependencies)
+      const byId = new Map(result.privacy?.findings.map((finding) => [finding.id, finding]) ?? [])
+      expect(byId.get('loopback-bind')).toMatchObject({ status: 'verified' })
+      // Windows has no POSIX permission bits; the finding honestly reads unknown there.
+      expect(byId.get('config-file-permissions')).toMatchObject(
+        process.platform === 'win32'
+          ? { status: 'unknown', message: expect.stringMatching(/windows/i) }
+          : { status: 'verified' },
+      )
+      expect(byId.get('effective-logging')).toMatchObject({ status: 'unknown', message: expect.stringMatching(/defaults apply/i) })
+      expect(result.privacy?.outOfScope.some((line) => /upstream/i.test(line))).toBe(true)
+    } finally {
+      await test.dispose()
+    }
+  })
+
+  it('marks non-loopback published bindings as exposed', async () => {
+    const bundleDir = await withBundleDirectory(0o600)
+    const test = managedHarnessWithBundle(bundleDir, [
+      { containerPort: 8080, hostIp: '127.0.0.1', hostPort: 8080 },
+      { containerPort: 8080, hostIp: '0.0.0.0', hostPort: 8080 },
+    ])
+    try {
+      const result = await diagnose('web', 'doctor', test.dependencies)
+      const byId = new Map(result.privacy?.findings.map((finding) => [finding.id, finding]) ?? [])
+      expect(byId.get('loopback-bind')).toMatchObject({ status: 'exposed', message: expect.stringContaining('0.0.0.0') })
+    } finally {
+      await test.dispose()
+    }
+  })
+
+  it('reports unknown when the adapter cannot report bindings', async () => {
+    const bundleDir = await withBundleDirectory(0o600)
+    const test = managedHarnessWithBundle(bundleDir)
+    try {
+      const result = await diagnose('web', 'doctor', test.dependencies)
+      const byId = new Map(result.privacy?.findings.map((finding) => [finding.id, finding]) ?? [])
+      expect(byId.get('loopback-bind')).toMatchObject({ status: 'unknown' })
+    } finally {
+      await test.dispose()
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')('marks group-readable bundle configuration as exposed', async () => {
+    const bundleDir = await withBundleDirectory(0o644)
+    const test = managedHarnessWithBundle(bundleDir, [{ containerPort: 8080, hostIp: '127.0.0.1', hostPort: 8080 }])
+    try {
+      const result = await diagnose('web', 'doctor', test.dependencies)
+      const byId = new Map(result.privacy?.findings.map((finding) => [finding.id, finding]) ?? [])
+      expect(byId.get('config-file-permissions')).toMatchObject({ status: 'exposed', message: expect.stringMatching(/settings\.yml|\.env/) })
+    } finally {
+      await test.dispose()
+    }
+  })
+
+  it('scopes the external posture to transport and authorization', async () => {
+    const secure = harness('external')
+    const secureState = state('external')
+    secureState.profiles.web = { mode: 'external', endpoint: 'https://search.example.com' }
+    vi.mocked(secure.dependencies.state.read).mockResolvedValue(secureState)
+    vi.mocked(secure.dependencies.profiles.preview).mockResolvedValue({
+      installed: true, attached: true, config: { baseURL: 'https://search.example.com', authHeader: 'Bearer tok' },
+    })
+    const secureResult = await diagnose('web', 'doctor', secure.dependencies)
+    const secureById = new Map(secureResult.privacy?.findings.map((finding) => [finding.id, finding]) ?? [])
+    expect(secureById.get('transport')).toMatchObject({ status: 'verified' })
+    expect(secureById.get('remote-auth')).toMatchObject({ status: 'verified' })
+
+    const plain = harness('external')
+    const plainState = state('external')
+    plainState.profiles.web = { mode: 'external', endpoint: 'http://search.example.com' }
+    vi.mocked(plain.dependencies.state.read).mockResolvedValue(plainState)
+    vi.mocked(plain.dependencies.profiles.preview).mockResolvedValue({
+      installed: true, attached: true, config: { baseURL: 'http://search.example.com' },
+    })
+    const plainResult = await diagnose('web', 'doctor', plain.dependencies)
+    const plainById = new Map(plainResult.privacy?.findings.map((finding) => [finding.id, finding]) ?? [])
+    expect(plainById.get('transport')).toMatchObject({ status: 'exposed', message: expect.stringMatching(/plaintext/i) })
+    expect(plainById.get('remote-auth')).toMatchObject({ status: 'unknown' })
+  })
+
+  it('omits the posture for status runs', async () => {
+    const test = harness('managed')
+    const result = await diagnose('web', 'status', test.dependencies)
+    expect(result.privacy).toBeUndefined()
   })
 })

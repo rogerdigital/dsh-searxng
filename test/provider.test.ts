@@ -415,7 +415,7 @@ describe('SearxngSearchProvider', () => {
     })
 
     it('serves a repeated query from the provider cache without a second fetch', async () => {
-      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [] }))
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [{ url: 'https://example.com/r' }] }))
       vi.stubGlobal('fetch', fetchMock)
       const provider = new SearxngSearchProvider({ baseURL: BASE, minIntervalMs: 0 })
       await provider.search({ query: 'repeat me' }, undefined)
