@@ -140,7 +140,7 @@ jobs:
           pnpm certify:platform -- --tarball "$tarball" | tee "$RUNNER_TEMP/certification-report.json"
       - name: Upload certification report
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: linux-certification-report
           path: ${{ runner.temp }}/certification-report.json
