@@ -222,6 +222,7 @@ describe('SearxngSearchProvider', () => {
       const controller = new AbortController()
 
       const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' }, controller.signal)
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce())
       controller.abort()
 
       await expect(attempt).rejects.toMatchObject({ code: 'WEB_ABORTED' })
@@ -346,7 +347,7 @@ describe('SearxngSearchProvider', () => {
       const expectation = expect(attempt).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
       await vi.runAllTimersAsync()
       await expectation
-      expect(cancellations).toBe(2)
+      expect(cancellations).toBe(3)
     })
 
     it('does not mask the primary HTTP failure when body cancellation rejects', async () => {
@@ -381,9 +382,29 @@ describe('SearxngSearchProvider', () => {
       expect(rejection).toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
     })
 
-    it('stops after two transient attempts', async () => {
+    it('stops after three transient attempts', async () => {
       vi.useFakeTimers()
       const fetchMock = vi.fn().mockRejectedValue(new TypeError('offline'))
+      vi.stubGlobal('fetch', fetchMock)
+      const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })
+      const expectation = expect(attempt).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      await vi.runAllTimersAsync()
+      await expectation
+      expect(fetchMock).toHaveBeenCalledTimes(3)
+      vi.useRealTimers()
+    })
+
+    it.each([401, 403])('does not retry HTTP %i', async (status) => {
+      const fetchMock = vi.fn().mockResolvedValue(new Response('denied', { status }))
+      vi.stubGlobal('fetch', fetchMock)
+      await expect(new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' }))
+        .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    it('retries HTTP 429 exactly once under the rate-limit backoff', async () => {
+      vi.useFakeTimers()
+      const fetchMock = vi.fn().mockResolvedValue(new Response('denied', { status: 429 }))
       vi.stubGlobal('fetch', fetchMock)
       const attempt = new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' })
       const expectation = expect(attempt).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
@@ -393,12 +414,47 @@ describe('SearxngSearchProvider', () => {
       vi.useRealTimers()
     })
 
-    it.each([401, 403, 429])('does not retry HTTP %i', async (status) => {
-      const fetchMock = vi.fn().mockResolvedValue(new Response('denied', { status }))
+    it('serves a repeated query from the provider cache without a second fetch', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ results: [] }))
       vi.stubGlobal('fetch', fetchMock)
-      await expect(new SearxngSearchProvider({ baseURL: BASE }).search({ query: 'q' }))
-        .rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
+      const provider = new SearxngSearchProvider({ baseURL: BASE, minIntervalMs: 0 })
+      await provider.search({ query: 'repeat me' }, undefined)
+      await provider.search({ query: 'repeat me' }, undefined)
       expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    it('maps a full pacing queue to an actionable WEB_PROVIDER_ERROR', async () => {
+      vi.useFakeTimers()
+      const fetchMock = vi.fn(() => new Promise<Response>(() => {}))
+      vi.stubGlobal('fetch', fetchMock)
+      const provider = new SearxngSearchProvider({ baseURL: BASE, minIntervalMs: 1_500, queueCapacity: 1 })
+      void provider.search({ query: 'one' }, undefined).catch(() => {})
+      void provider.search({ query: 'two' }, undefined).catch(() => {})
+      await vi.advanceTimersByTimeAsync(0)
+      void provider.search({ query: 'three' }, undefined).catch(() => {})
+      await expect(provider.search({ query: 'four' }, undefined)).rejects.toSatisfy((error: unknown) => {
+        expect((error as WebError).code).toBe('WEB_PROVIDER_ERROR')
+        expect((error as Error).message).toMatch(/pacing/i)
+        return true
+      })
+      vi.useRealTimers()
+    })
+
+    it('maps pacing budget exhaustion to an actionable WEB_PROVIDER_ERROR', async () => {
+      vi.useFakeTimers()
+      vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})))
+      const provider = new SearxngSearchProvider({ baseURL: BASE, minIntervalMs: 5_000, totalBudgetMs: 1_000 })
+      void provider.search({ query: 'one' }, undefined).catch(() => {})
+      void provider.search({ query: 'two' }, undefined).catch(() => {})
+      const third = provider.search({ query: 'three' }, undefined)
+      const expectation = expect(third).rejects.toSatisfy((error: unknown) => {
+        expect((error as WebError).code).toBe('WEB_PROVIDER_ERROR')
+        expect((error as Error).message).toMatch(/budget/i)
+        return true
+      })
+      await vi.advanceTimersByTimeAsync(1_100)
+      await expectation
+      vi.useRealTimers()
     })
 
     it('applies a finite default timeout even when fetch ignores abort', async () => {
@@ -433,7 +489,7 @@ describe('SearxngSearchProvider', () => {
       const expectation = expect(attempt).rejects.toMatchObject({ code: 'WEB_PROVIDER_ERROR' })
       await vi.runAllTimersAsync()
       await expectation
-      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(fetchMock).toHaveBeenCalledTimes(3)
       vi.useRealTimers()
     })
 

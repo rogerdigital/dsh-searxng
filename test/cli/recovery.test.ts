@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { SEARXNG_IMAGE, type AssetRenderer } from '../../src/cli/assets.ts'
+import { SEARXNG_IMAGE, type AssetRenderer, type StageInput } from '../../src/cli/assets.ts'
 import type { DockerAdapter } from '../../src/cli/docker.ts'
 import { CliError } from '../../src/cli/errors.ts'
 import type { EnvironmentService } from '../../src/cli/environment.ts'
@@ -966,9 +966,13 @@ describe('setup respects an interrupted journal', () => {
           state: graph.dependencies.state,
           journal: graph.dependencies.journal,
           docker: graph.docker,
-          assets: { render: vi.fn(async () => { throw new Error('setup must not render') }) },
+          assets: {
+            render: vi.fn(async () => { throw new Error('setup must not render') }),
+            stage: vi.fn(async () => { throw new Error('setup must not stage') }),
+          },
           searxng: graph.searxng,
           profiles: graph.profiles,
+          catalog: [],
           now: graph.dependencies.now,
         },
       ).then(
@@ -1127,9 +1131,21 @@ describe('non-update journal escape path', () => {
           docker: setupDocker,
           assets: {
             render: vi.fn(async () => ({ composePath, configurationSha256: CURRENT_HASH })),
+            stage: vi.fn(async (input: StageInput) => ({
+              directory: dirname(composePath),
+              configurationSha256: CURRENT_HASH,
+              definition: input.definition,
+            })),
           },
           searxng,
           profiles,
+          catalog: [{
+            deploymentVersion: 1,
+            image: SEARXNG_IMAGE,
+            composeAsset: 'docker/compose.yml',
+            settingsAsset: 'docker/settings.yml.template',
+            stateSchemas: [1, 2],
+          }],
           now: () => new Date(RECOVERY_TIME),
         },
       )

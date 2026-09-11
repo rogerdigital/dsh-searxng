@@ -16,8 +16,8 @@ import {
   isValidSearxngBaseUrl,
   mapSearxngClientResponse,
   mapSearxngClientResult,
-  searchSearxng,
 } from './searxng-client.ts'
+import { SearxngSearchSession } from './search-session.ts'
 import type { SearxngSearchResponse } from './types.ts'
 
 /** Stable id this provider registers under. */
@@ -38,6 +38,14 @@ export interface SearxngSearchProviderOptions {
   categories?: string
   /** Authorization header value for instances fronted by an API-key gate. */
   authHeader?: string
+  /** Cached entry lifetime in milliseconds; 0 disables. Default 600_000. */
+  cacheTtlMs?: number
+  /** Minimum spacing between network attempts; 0 disables pacing. Default 1500. */
+  minIntervalMs?: number
+  /** Maximum requests waiting for a pacing slot before rejecting. Default 8. */
+  queueCapacity?: number
+  /** Total wall-clock budget for one search call in milliseconds. Default 15_000. */
+  totalBudgetMs?: number
 }
 
 /** Map one SearXNG result to the DSH web source shape. */
@@ -54,7 +62,11 @@ export function mapSearxngResponse(response: SearxngSearchResponse): WebSearchRe
 export class SearxngSearchProvider implements WebSearchProvider {
   readonly id = SEARXNG_PROVIDER_ID
 
-  constructor(private readonly options: SearxngSearchProviderOptions) {}
+  private readonly session: SearxngSearchSession
+
+  constructor(private readonly options: SearxngSearchProviderOptions) {
+    this.session = new SearxngSearchSession(options)
+  }
 
   available(): boolean {
     return isValidSearxngBaseUrl(this.options.baseURL)
@@ -62,7 +74,7 @@ export class SearxngSearchProvider implements WebSearchProvider {
 
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
     try {
-      return await searchSearxng(this.options, request, signal)
+      return await this.session.search(request.query, signal)
     } catch (error: unknown) {
       if (!(error instanceof SearxngClientError)) {
         throw new WebError('SearXNG request failed', 'WEB_PROVIDER_ERROR')
@@ -79,6 +91,18 @@ export class SearxngSearchProvider implements WebSearchProvider {
       if (error.kind === 'timeout') {
         throw new WebError(
           'SearXNG request timed out; check the instance and network, then retry',
+          'WEB_PROVIDER_ERROR',
+        )
+      }
+      if (error.kind === 'budget') {
+        throw new WebError(
+          'SearXNG search exceeded its total time budget; the instance is too slow or overloaded, then retry',
+          'WEB_PROVIDER_ERROR',
+        )
+      }
+      if (error.kind === 'busy') {
+        throw new WebError(
+          'SearXNG provider is pacing concurrent searches and its queue is full; retry after in-flight searches settle',
           'WEB_PROVIDER_ERROR',
         )
       }

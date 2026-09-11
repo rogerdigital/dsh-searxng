@@ -38,6 +38,14 @@ export interface Config {
   categories?: string
   /** Authorization header value for instances fronted by an API-key gate. */
   authHeader?: string
+  /** Cached query result lifetime in milliseconds; 0 disables caching. Default 600000. */
+  cacheTtlMs?: number
+  /** Minimum spacing between network requests in milliseconds; 0 disables pacing. Default 1500. */
+  minIntervalMs?: number
+  /** Maximum requests waiting for a pacing slot before rejecting. Default 8. */
+  queueCapacity?: number
+  /** Total wall-clock budget for one search call in milliseconds. Default 15000. */
+  totalBudgetMs?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -46,6 +54,10 @@ export const Config: z<Config> = z.object({
   engines: z.string(),
   categories: z.string(),
   authHeader: z.string(),
+  cacheTtlMs: z.number(),
+  minIntervalMs: z.number(),
+  queueCapacity: z.number(),
+  totalBudgetMs: z.number(),
 })
 
 /** Register the SearXNG search provider with `ctx.web`. */
@@ -58,5 +70,9 @@ export function apply(ctx: Context, config: Config): void {
     ...config.engines !== undefined && config.engines.length > 0 ? { engines: config.engines } : {},
     ...config.categories !== undefined && config.categories.length > 0 ? { categories: config.categories } : {},
     ...config.authHeader !== undefined && config.authHeader.length > 0 ? { authHeader: config.authHeader } : {},
+    ...config.cacheTtlMs !== undefined ? { cacheTtlMs: config.cacheTtlMs } : {},
+    ...config.minIntervalMs !== undefined ? { minIntervalMs: config.minIntervalMs } : {},
+    ...config.queueCapacity !== undefined ? { queueCapacity: config.queueCapacity } : {},
+    ...config.totalBudgetMs !== undefined ? { totalBudgetMs: config.totalBudgetMs } : {},
   }))
 }

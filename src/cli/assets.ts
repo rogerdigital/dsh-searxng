@@ -7,6 +7,11 @@ import { parse, stringify } from 'yaml'
 import { CliError } from './errors.ts'
 import { isDigestPinnedImage, isSafeAssetPath, type DeploymentDefinition } from './deployments.ts'
 
+/**
+ * Image of the packaged deployment catalog's version-1 entry. The catalog is
+ * the source of truth for what `setup` installs; this constant remains a
+ * shared reference for tests that assert catalog contents.
+ */
 export const SEARXNG_IMAGE =
   'ghcr.io/searxng/searxng:2026.8.20-8d3dd0cd4@sha256:e7bb47bebf338c52c55c7bed92293873cfe757b554b261829c0d710fd8307fa3'
 
