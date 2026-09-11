@@ -71,7 +71,7 @@ reports. This is development evidence, not a new telemetry service or runtime de
 Near-term execution checklist:
 
 - [ ] Establish the baseline and task set alongside M1.
-- [ ] Validate M1 defaults against cold and burst workloads before making them defaults.
+- [x] Validate M1 defaults against cold and burst workloads before making them defaults (docs/evaluation/reports/2026-09-11-m1-defaults.md).
 - [ ] Deliver the M2 read-only report and test whether it helps resolve representative failures.
 - [ ] Evaluate candidate Chinese configurations in isolated development instances during M2.
 - [ ] Gate M3 on repeatable task-quality or maintenance benefit without violating the recorded
