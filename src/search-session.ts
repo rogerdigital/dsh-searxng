@@ -302,6 +302,10 @@ export class SearxngSearchSession {
 
   private writeCached(key: string, value: SearxngClientResult): void {
     if (this.cacheTtlMs === 0) return
+    // An empty page is a success but carries no reusable information; caching
+    // it would mask upstream recovery for the whole TTL (observed in the
+    // 2026-09-11 evaluation: a cooled-down instance served stale empties).
+    if (value.sources.length === 0) return
     this.cache.delete(key)
     this.cache.set(key, { expiresAt: Date.now() + this.cacheTtlMs, value })
     while (this.cache.size > this.cacheCapacity) {

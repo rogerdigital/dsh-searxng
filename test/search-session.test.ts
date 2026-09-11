@@ -78,6 +78,16 @@ describe('SearxngSearchSession cache', () => {
     expect(fetch).toHaveBeenCalledTimes(2)
   })
 
+  it('does not cache an empty result page', async () => {
+    const fetch = vi.fn(async () => jsonResponse({ results: [] }))
+    const session = new SearxngSearchSession({ baseURL: BASE, fetch, cacheTtlMs: 60_000, minIntervalMs: 0 })
+    await session.search('q', undefined)
+    await session.search('q', undefined)
+    // An empty page is a success but carries no reusable information; caching
+    // it would mask upstream recovery for the whole TTL.
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
   it('does not cache failures', async () => {
     const fetch = vi.fn()
       .mockResolvedValueOnce(new Response('denied', { status: 403 }))
