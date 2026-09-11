@@ -38,8 +38,6 @@ export interface CliDependencies extends SetupDependencies {
   removeManagedDirectory: RemoveDependencies['removeManagedDirectory']
   journal: JournalStore
   probeAssets?: SnapshotDependencies['probeAssets']
-  /** Overrides the packaged deployment catalog; production loads assets/deployments. */
-  catalog?: readonly DeploymentDefinition[]
   /** Overrides the bundle secret reader; production preserves the existing secret. */
   readPreservedSecret?: UpdateDependencies['readPreservedSecret']
 }
@@ -203,6 +201,24 @@ function createRepairDependencies(
   }
 }
 
+/** Setup wiring mirrors update: catalog-driven staging over the shared dependency object. */
+function createSetupDependencies(
+  dependencies: SetupDependencies,
+  extras: Partial<CliDependencies>,
+): SetupDependencies {
+  const assets = dependencies.assets as Partial<StagingAssetRenderer>
+  if (typeof assets.stage !== 'function') {
+    throw new CliError('E_INTERNAL', 'The asset renderer cannot stage deployments', 'Reinstall dsh-searxng and retry')
+  }
+  return {
+    ...dependencies,
+    assets: assets as StagingAssetRenderer,
+    // Override first, packaged default second, so real invocations never
+    // silently skip catalog-driven selection.
+    catalog: extras.catalog ?? loadDeploymentCatalog(),
+  }
+}
+
 function recoveryEnvelope(plan: RecoveryPlan, outcome: RecoveryOutcome) {
   return {
     interrupted: {
@@ -266,6 +282,7 @@ export function createProductionDependencies(options: ProductionDependencyOption
     searxng: new DefaultSearxngProbe(),
     profiles: new NodeProfileManager({ commandRunner: runner, dshHome }),
     now: () => new Date(),
+    catalog: loadDeploymentCatalog(),
     confirmPurge,
     removeManagedDirectory,
     journal: new FileJournalStore(managedDir(dshHome)),
@@ -301,7 +318,7 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
           portExplicit: command.portExplicit,
           ...(command.url === undefined ? {} : { url: command.url }),
         },
-        dependencies,
+        createSetupDependencies(dependencies, dependencies as Partial<CliDependencies>),
         options.signal,
       )
       if (format === 'json') presentSuccess(result, presenter)

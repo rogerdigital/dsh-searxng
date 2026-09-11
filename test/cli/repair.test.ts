@@ -820,7 +820,7 @@ describe('repair CLI', () => {
         removeManagedDirectory: vi.fn(async () => {}),
         journal: test.journal.store,
         probeAssets: vi.fn(async () => 'valid' as const),
-      },
+      } as unknown as NonNullable<Parameters<typeof runCli>[1]>['dependencies'],
       stdout: (text) => stdout.push(text),
       stderr: (text) => stderr.push(text),
     })
