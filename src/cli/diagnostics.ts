@@ -443,6 +443,12 @@ async function loopbackFinding(
 }
 
 async function bundlePermissionFinding(bundleDir: string): Promise<PrivacyFinding> {
+  // POSIX permission bits are not enforced on Windows: stat reports a nominal
+  // mode regardless of the on-disk ACL, so a check there could only produce
+  // false alarms. Missing evidence reads unknown, never a pass or an alarm.
+  if (process.platform === 'win32') {
+    return { id: 'config-file-permissions', status: 'unknown', message: 'POSIX file permissions are not enforced on Windows; bundle permissions were not checked' }
+  }
   const exposed: string[] = []
   try {
     for (const name of [join('searxng', 'settings.yml'), '.env']) {

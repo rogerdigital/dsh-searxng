@@ -394,7 +394,12 @@ describe('doctor privacy posture', () => {
       const result = await diagnose('web', 'doctor', test.dependencies)
       const byId = new Map(result.privacy?.findings.map((finding) => [finding.id, finding]) ?? [])
       expect(byId.get('loopback-bind')).toMatchObject({ status: 'verified' })
-      expect(byId.get('config-file-permissions')).toMatchObject({ status: 'verified' })
+      // Windows has no POSIX permission bits; the finding honestly reads unknown there.
+      expect(byId.get('config-file-permissions')).toMatchObject(
+        process.platform === 'win32'
+          ? { status: 'unknown', message: expect.stringMatching(/windows/i) }
+          : { status: 'verified' },
+      )
       expect(byId.get('effective-logging')).toMatchObject({ status: 'unknown', message: expect.stringMatching(/defaults apply/i) })
       expect(result.privacy?.outOfScope.some((line) => /upstream/i.test(line))).toBe(true)
     } finally {
@@ -429,7 +434,7 @@ describe('doctor privacy posture', () => {
     }
   })
 
-  it('marks group-readable bundle configuration as exposed', async () => {
+  it.skipIf(process.platform === 'win32')('marks group-readable bundle configuration as exposed', async () => {
     const bundleDir = await withBundleDirectory(0o644)
     const test = managedHarnessWithBundle(bundleDir, [{ containerPort: 8080, hostIp: '127.0.0.1', hostPort: 8080 }])
     try {
