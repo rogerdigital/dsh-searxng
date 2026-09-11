@@ -11,7 +11,7 @@ export type CliCommand =
       json: boolean
     }
   | {
-      command: 'status' | 'doctor'
+      command: 'status' | 'doctor' | 'tune'
       profile: string
       json: boolean
     }
@@ -106,8 +106,8 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     }
     return { command: 'help' }
   }
-  if (!command || extra.length > 0 || !['setup', 'status', 'doctor', 'repair', 'update', 'remove'].includes(command)) {
-    invalid('expected one command: setup, status, doctor, repair, update, or remove')
+  if (!command || extra.length > 0 || !['setup', 'status', 'doctor', 'tune', 'repair', 'update', 'remove'].includes(command)) {
+    invalid('expected one command: setup, status, doctor, tune, repair, update, or remove')
   }
   const cliCommand = command as CliCommand['command']
 

@@ -119,7 +119,7 @@ export class DefaultSearxngProbe implements SearxngProbe {
         headers: options.authHeader === undefined ? {} : { authorization: options.authHeader },
         signal: requestSignal,
       })
-      classifyStatus(response.status)
+      classifyProbeStatus(response.status)
       if (!response.ok) throw searchFailed('SearXNG HTTP endpoint returned an error')
     } catch (error) {
       rethrowCancellation(error, signal)
@@ -177,7 +177,7 @@ async function runProbe(
         : toCliError(error)
       if (!isTransientFailure(error)) throw lastError
       if (attempt === attempts) throw lastError
-      await delay(allowEmptyResults ? READINESS_RETRY_DELAY_MS : SEARCH_RETRY_DELAY_MS, signal)
+      await probeDelay(allowEmptyResults ? READINESS_RETRY_DELAY_MS : SEARCH_RETRY_DELAY_MS, signal)
     }
   }
   throw lastError instanceof EmptySearchResultsError ? searchFailed('SearXNG returned no usable search result') : toCliError(lastError)
@@ -219,7 +219,7 @@ async function runReadiness(options: ProbeOptions, signal?: AbortSignal): Promis
       if (options.attempts !== undefined && attempt >= options.attempts) throw startupTimeout()
       const delayMs = Math.min(READINESS_RETRY_DELAY_MS, deadline - Date.now())
       if (delayMs <= 0) throw startupTimeout()
-      await delay(delayMs, signal)
+      await probeDelay(delayMs, signal)
     }
   }
 }
@@ -246,7 +246,7 @@ async function probeAttempt(
     maxAttempts: 1,
     fetch: options.fetch,
   })
-  classifyStatus(request.response.status)
+  classifyProbeStatus(request.response.status)
   const results = parseResults(request.payload)
   const resultCount = results.filter(hasValidHttpUrl).length
   if (results.length > 0 && resultCount === 0) throw new MalformedProbeResponseError()
@@ -278,11 +278,16 @@ function validateEndpoint(baseURL: string): string {
 }
 
 function buildProbeUrl(endpoint: string, options: ProbeOptions, attempt = 1): string {
-  const url = new URL(endpoint)
-  url.pathname = `${url.pathname.replace(/\/+$/, '')}/search`
   // Retries vary the query with a random suffix: upstream engines cool down
   // per exact query, so sequential validations must not reuse the same strings.
   const query = attempt === 1 ? PROBE_QUERY : `${PROBE_QUERY} ${randomBytes(4).toString('hex')}`
+  return buildProbeSearchUrl(endpoint, options, query)
+}
+
+/** Search URL for one explicit query; shared by lifecycle probes and `tune`. */
+export function buildProbeSearchUrl(endpoint: string, options: ProbeOptions, query: string): string {
+  const url = new URL(endpoint)
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}/search`
   const params = new URLSearchParams({ q: query, format: 'json' })
   for (const key of ['language', 'engines', 'categories'] as const) {
     const value = options[key]
@@ -292,7 +297,8 @@ function buildProbeUrl(endpoint: string, options: ProbeOptions, attempt = 1): st
   return url.toString()
 }
 
-function classifyStatus(status: number): void {
+/** Map one SearXNG HTTP status to its stable CLI error (throws when unusable). */
+export function classifyProbeStatus(status: number): void {
   if (status === 401) {
     throw new CliError('E_AUTH_FAILED', 'SearXNG authentication failed', 'Check the configured authorization header and retry')
   }
@@ -360,7 +366,8 @@ function searchFailed(message: string): CliError {
   return new CliError('E_SEARCH_FAILED', message, 'Check the SearXNG endpoint and run dsh-searxng doctor')
 }
 
-function delay(delayMs: number, signal?: AbortSignal): Promise<void> {
+/** Abortable fixed delay; shared by lifecycle probes and `tune` spacing. */
+export function probeDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) {
     return Promise.reject(signal.reason ?? new DOMException('The operation was aborted', 'AbortError'))
   }
