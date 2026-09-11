@@ -489,3 +489,44 @@ describe('CliDockerAdapter image operations', () => {
     await expectCode(new CliDockerAdapter(new FakeRunner(failed('permission denied'))).imageExists(image), 'E_INTERNAL')
   })
 })
+
+describe('publishedHostBindings', () => {
+  it('reports container port bindings with host IPs from docker inspect', async () => {
+    const runner = new FakeRunner(ok(JSON.stringify([{
+      Config: { Labels: ownedLabels },
+      NetworkSettings: { Ports: {
+        '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '8080' }, { HostIp: '::1', HostPort: '8080' }],
+      } },
+    }])))
+    const adapter = new CliDockerAdapter(runner)
+    await expect(adapter.publishedHostBindings!(identity)).resolves.toEqual([
+      { containerPort: 8080, hostIp: '127.0.0.1', hostPort: 8080 },
+      { containerPort: 8080, hostIp: '::1', hostPort: 8080 },
+    ])
+  })
+
+  it('returns an empty list for an absent container or unpublished ports', async () => {
+    const absent = new CliDockerAdapter(new FakeRunner(...absentResourceResults().slice(0, 1)))
+    await expect(absent.publishedHostBindings!(identity)).resolves.toEqual([])
+    const unpublished = new CliDockerAdapter(new FakeRunner(ok(JSON.stringify([{
+      Config: { Labels: ownedLabels },
+      NetworkSettings: {},
+    }]))))
+    await expect(unpublished.publishedHostBindings!(identity)).resolves.toEqual([])
+  })
+
+  it('throws for a foreign container instead of reporting its bindings', async () => {
+    const runner = new FakeRunner(ok(JSON.stringify([{ Config: { Labels: {} } }])))
+    const adapter = new CliDockerAdapter(runner)
+    await expectCode(adapter.publishedHostBindings!(identity), 'E_RESOURCE_FOREIGN')
+  })
+
+  it('throws on a malformed ports payload rather than skipping entries', async () => {
+    const runner = new FakeRunner(ok(JSON.stringify([{
+      Config: { Labels: ownedLabels },
+      NetworkSettings: { Ports: { '8080/tcp': [{ HostIp: '0.0.0.0', HostPort: 'not-a-number' }] } },
+    }])))
+    const adapter = new CliDockerAdapter(runner)
+    await expectCode(adapter.publishedHostBindings!(identity), 'E_INTERNAL')
+  })
+})

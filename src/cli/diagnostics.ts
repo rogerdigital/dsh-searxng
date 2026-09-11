@@ -1,12 +1,14 @@
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { DockerAdapter, DockerDeploymentStatus } from './docker.ts'
+import { parse as parseYaml } from 'yaml'
+import type { DockerAdapter, DockerDeploymentStatus, HostPortBinding } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService } from './environment.ts'
 import { stateSha256, type JournalStore, type OperationJournal, type OperationKind, type OperationPhase } from './journal.ts'
 import { bundleDirectory, isStagingDirectoryName, rethrowCancellation, stateIdentity } from './managed.ts'
 import type { ProfileAttachmentConfig, ProfileAttachmentPreview, ProfileManager } from './profile.ts'
 import type { SearxngProbe } from './searxng.ts'
+import type { ManagedIdentity } from './assets.ts'
 import type { DeploymentSnapshot, StateStore } from './state.ts'
 
 export interface DiagnosticCheck {
@@ -25,6 +27,24 @@ export interface InterruptedOperationReport {
   ageMs: number
 }
 
+/**
+ * One local privacy check. `verified` means the local configuration proves
+ * the claim; `exposed` means it contradicts it; `unknown` means missing
+ * evidence — never a pass. Local switches are never an end-to-end guarantee;
+ * `PrivacyPosture.outOfScope` names what no local check can see.
+ */
+export interface PrivacyFinding {
+  id: string
+  status: 'verified' | 'exposed' | 'unknown'
+  message: string
+}
+
+export interface PrivacyPosture {
+  mode: 'managed' | 'external'
+  findings: PrivacyFinding[]
+  outOfScope: string[]
+}
+
 export interface DiagnosticResult {
   profile: string
   mode?: 'managed' | 'external'
@@ -32,6 +52,8 @@ export interface DiagnosticResult {
   healthy: boolean
   checks: DiagnosticCheck[]
   interruptedOperation?: InterruptedOperationReport
+  /** Doctor only: local privacy checks and their explicit limits. */
+  privacy?: PrivacyPosture
 }
 
 export interface DiagnosticDependencies {
@@ -379,6 +401,134 @@ export function formatAge(ageMs: number): string {
   return `${days} day${days === 1 ? '' : 's'}`
 }
 
+const PRIVACY_OUT_OF_SCOPE_SHARED: readonly string[] = [
+  'Upstream search engines receive the queries and log them under their own policies; this CLI cannot verify or control that',
+  'Network observers between this host, the instance, and the engines are outside local verification',
+]
+
+const PRIVACY_OUT_OF_SCOPE_MANAGED: readonly string[] = [
+  ...PRIVACY_OUT_OF_SCOPE_SHARED,
+  'Container logs on this host are not configured or verified for query redaction',
+]
+
+const PRIVACY_OUT_OF_SCOPE_EXTERNAL: readonly string[] = [
+  ...PRIVACY_OUT_OF_SCOPE_SHARED,
+  "The remote instance operator's logs and data handling are outside local verification",
+]
+
+const LOOPBACK_ADDRESSES = new Set(['127.0.0.1', '::1'])
+
+async function loopbackFinding(
+  docker: DockerAdapter,
+  identity: ManagedIdentity,
+  signal?: AbortSignal,
+): Promise<PrivacyFinding> {
+  if (docker.publishedHostBindings === undefined) {
+    return { id: 'loopback-bind', status: 'unknown', message: 'The Docker adapter cannot report published port bindings for this deployment' }
+  }
+  let bindings: readonly HostPortBinding[]
+  try {
+    bindings = await docker.publishedHostBindings(identity, signal)
+  } catch {
+    return { id: 'loopback-bind', status: 'unknown', message: 'Published port bindings could not be read from the running container' }
+  }
+  if (bindings.length === 0) {
+    return { id: 'loopback-bind', status: 'unknown', message: 'The container publishes no ports through Docker' }
+  }
+  const exposed = [...new Set(bindings.filter((binding) => !LOOPBACK_ADDRESSES.has(binding.hostIp)).map((binding) => binding.hostIp))]
+  if (exposed.length === 0) {
+    return { id: 'loopback-bind', status: 'verified', message: `Published ports bind to loopback only (${[...new Set(bindings.map((binding) => binding.hostIp))].join(', ')})` }
+  }
+  return { id: 'loopback-bind', status: 'exposed', message: `Published ports bind to non-loopback interfaces (${exposed.join(', ')})` }
+}
+
+async function bundlePermissionFinding(bundleDir: string): Promise<PrivacyFinding> {
+  const exposed: string[] = []
+  try {
+    for (const name of [join('searxng', 'settings.yml'), '.env']) {
+      const fileMode = (await stat(join(bundleDir, name))).mode & 0o777
+      if ((fileMode & 0o077) !== 0) exposed.push(`${name} is ${fileMode.toString(8)}`)
+    }
+  } catch {
+    return { id: 'config-file-permissions', status: 'unknown', message: 'The managed configuration bundle is unavailable for a permission check' }
+  }
+  return exposed.length === 0
+    ? { id: 'config-file-permissions', status: 'verified', message: 'Bundle configuration files are owner-only (0600)' }
+    : { id: 'config-file-permissions', status: 'exposed', message: `Bundle configuration is readable beyond the owner: ${exposed.join('; ')}` }
+}
+
+async function effectiveLoggingFinding(bundleDir: string): Promise<PrivacyFinding> {
+  let parsed: unknown
+  try {
+    parsed = parseYaml(await readFile(join(bundleDir, 'searxng', 'settings.yml'), 'utf8'))
+  } catch {
+    return { id: 'effective-logging', status: 'unknown', message: 'The effective settings could not be parsed; logging behavior is unverified' }
+  }
+  if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) && 'logging' in (parsed as Record<string, unknown>)) {
+    return { id: 'effective-logging', status: 'unknown', message: 'Explicit logging configuration is present in the effective settings; review what it records' }
+  }
+  return { id: 'effective-logging', status: 'unknown', message: 'No explicit logging configuration in the effective settings; SearXNG defaults apply' }
+}
+
+/**
+ * Collect the doctor privacy posture. Every finding fails independently to
+ * `unknown` — a missing check is never a pass, and the posture never blocks
+ * or fails the diagnostic chain.
+ */
+async function collectPrivacyPosture(input: {
+  mode: 'managed' | 'external'
+  endpoint: string
+  authConfigured: boolean
+  bundleDir?: string
+  identity?: ManagedIdentity
+  docker: DockerAdapter
+  signal?: AbortSignal
+}): Promise<PrivacyPosture> {
+  if (input.mode === 'external') {
+    const transport: PrivacyFinding = input.endpoint.startsWith('https://')
+      ? { id: 'transport', status: 'verified', message: 'The endpoint uses HTTPS' }
+      : { id: 'transport', status: 'exposed', message: 'The endpoint uses plaintext HTTP; traffic is observable on the network path' }
+    const auth: PrivacyFinding = input.authConfigured
+      ? { id: 'remote-auth', status: 'verified', message: 'An authorization header is configured for the remote instance' }
+      : { id: 'remote-auth', status: 'unknown', message: 'No authorization header is configured for the remote instance' }
+    return { mode: 'external', findings: [transport, auth], outOfScope: [...PRIVACY_OUT_OF_SCOPE_EXTERNAL] }
+  }
+  if (input.bundleDir === undefined) {
+    return {
+      mode: 'managed',
+      findings: [
+        { id: 'loopback-bind', status: 'unknown', message: 'The managed bundle is unavailable; local privacy checks did not run' },
+      ],
+      outOfScope: [...PRIVACY_OUT_OF_SCOPE_MANAGED],
+    }
+  }
+  const findings: PrivacyFinding[] = []
+  if (input.identity === undefined) {
+    findings.push({ id: 'loopback-bind', status: 'unknown', message: 'The managed deployment identity is unavailable; the running bindings were not checked' })
+  } else {
+    findings.push(await loopbackFinding(input.docker, input.identity, input.signal).catch(() => ({
+      id: 'loopback-bind', status: 'unknown', message: 'Published port bindings could not be read from the running container',
+    } as PrivacyFinding)))
+  }
+  findings.push(await bundlePermissionFinding(input.bundleDir).catch(() => ({
+    id: 'config-file-permissions', status: 'unknown', message: 'The managed configuration bundle is unavailable for a permission check',
+  }) as PrivacyFinding))
+  findings.push(await effectiveLoggingFinding(input.bundleDir).catch(() => ({
+    id: 'effective-logging', status: 'unknown', message: 'The effective settings could not be parsed; logging behavior is unverified',
+  }) as PrivacyFinding))
+  return { mode: 'managed', findings, outOfScope: [...PRIVACY_OUT_OF_SCOPE_MANAGED] }
+}
+
+/** Human rendering of the privacy posture; the JSON form is the object itself. */
+export function formatPrivacyPosture(posture: PrivacyPosture): string {
+  return [
+    'Privacy posture (local checks only):',
+    ...posture.findings.map((finding) => `  ${finding.id}: ${finding.status} — ${finding.message}`),
+    '  Out of scope of local checks:',
+    ...posture.outOfScope.map((line) => `  - ${line}`),
+  ].join('\n')
+}
+
 export async function diagnose(
   profile: string,
   kind: 'status' | 'doctor',
@@ -514,11 +664,34 @@ export async function diagnose(
     )
   })
 
+  // Privacy posture is supplementary local evidence: it never blocks the
+  // chain, and status runs stay lean by design.
+  let privacy: PrivacyPosture | undefined
+  if (kind === 'doctor' && entry !== undefined) {
+    const authConfigured = typeof preview?.config?.authHeader === 'string' && preview.config.authHeader.length > 0
+    const managedContext = entry.mode === 'managed' && state?.managed !== undefined && environment !== undefined
+      ? {
+          bundleDir: bundleDirectory(environment.managedDir, state.managed.current, deployment?.composePath),
+          identity: stateIdentity(environment.managedDir, state.homeId, state.managed.current),
+        }
+      : undefined
+    privacy = await collectPrivacyPosture({
+      mode: entry.mode,
+      endpoint: entry.endpoint,
+      authConfigured,
+      ...(managedContext === undefined || managedContext.bundleDir === undefined ? {} : { bundleDir: managedContext.bundleDir }),
+      ...(managedContext === undefined ? {} : { identity: managedContext.identity }),
+      docker: dependencies.docker,
+      ...(signal === undefined ? {} : { signal }),
+    })
+  }
+
   return {
     profile,
     ...(entry === undefined ? {} : { mode: entry.mode, endpoint: entry.endpoint }),
     healthy: !checks.some((check) => check.status === 'fail'),
     checks,
     ...(interruptedOperation === undefined ? {} : { interruptedOperation }),
+    ...(privacy === undefined ? {} : { privacy }),
   }
 }
