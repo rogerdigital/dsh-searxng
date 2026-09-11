@@ -4,13 +4,14 @@ import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
-import { SEARXNG_IMAGE, type AssetRenderer, type ManagedIdentity } from '../../src/cli/assets.ts'
+import { SEARXNG_IMAGE, type AssetRenderer, type ManagedIdentity, type StageInput, type StagingAssetRenderer } from '../../src/cli/assets.ts'
 import type { DockerAdapter } from '../../src/cli/docker.ts'
 import { CliError } from '../../src/cli/errors.ts'
 import type { EnvironmentService } from '../../src/cli/environment.ts'
 import type { ProfileAttachmentConfig, ProfileManager } from '../../src/cli/profile.ts'
 import type { SearxngProbe } from '../../src/cli/searxng.ts'
 import type { DeploymentSnapshot, StateStore, StateV2 } from '../../src/cli/state.ts'
+import type { DeploymentDefinition } from '../../src/cli/deployments.ts'
 import { createSetup, setup, type SetupDependencies } from '../../src/cli/setup.ts'
 import { createLoopbackPortChecker, isMainModule, runCli } from '../../src/cli.ts'
 
@@ -21,9 +22,25 @@ const ENDPOINT = 'http://127.0.0.1:8080'
 const COMPOSE_PATH = join(MANAGED_DIR, `config-${'a'.repeat(64)}`, 'compose.yml')
 const RENDERED_HASH = 'a'.repeat(64)
 const PERSISTED_HASH = 'b'.repeat(64)
+const STAGED_DIR = join(MANAGED_DIR, `config-${'a'.repeat(64)}`)
+
+const CATALOG_V1: DeploymentDefinition = {
+  deploymentVersion: 1,
+  image: SEARXNG_IMAGE,
+  composeAsset: 'docker/compose.yml',
+  settingsAsset: 'docker/settings.yml.template',
+  stateSchemas: [1, 2],
+}
+
+const CATALOG_V2: DeploymentDefinition = {
+  ...CATALOG_V1,
+  deploymentVersion: 2,
+  image: `ghcr.io/searxng/searxng:2026.9.10-0123456@sha256:${'c'.repeat(64)}`,
+}
 
 interface HarnessOptions {
   state?: StateV2
+  catalog?: readonly DeploymentDefinition[]
   ownership?: 'absent' | 'owned'
   readinessFailures?: number
   realSearchFailures?: number
@@ -69,6 +86,7 @@ function harness(options: HarnessOptions = {}) {
   const events: string[] = []
   const writes: StateV2[] = []
   const renders: Parameters<AssetRenderer['render']>[0][] = []
+  const stages: StageInput[] = []
   const identities: ManagedIdentity[] = []
   let state: StateV2 = structuredClone(options.state ?? { schemaVersion: 2, homeId: HOME_ID, profiles: {} })
   let readinessFailures = options.readinessFailures ?? 0
@@ -134,11 +152,16 @@ function harness(options: HarnessOptions = {}) {
     imageExists: vi.fn(async () => false),
     deploymentStatus: vi.fn(async () => ({ ownership: 'owned' as const, container: 'running' as const, composePath: COMPOSE_PATH })),
   }
-  const assets: AssetRenderer = {
+  const assets: StagingAssetRenderer = {
     render: vi.fn(async (input) => {
       events.push('render')
       renders.push(input)
       return { composePath: COMPOSE_PATH, configurationSha256: RENDERED_HASH }
+    }),
+    stage: vi.fn(async (input: StageInput) => {
+      events.push('stage')
+      stages.push(input)
+      return { directory: STAGED_DIR, configurationSha256: RENDERED_HASH, definition: input.definition }
     }),
   }
   const searxng: SearxngProbe = {
@@ -209,10 +232,11 @@ function harness(options: HarnessOptions = {}) {
     assets,
     searxng,
     profiles,
+    catalog: options.catalog ?? [CATALOG_V1],
     now: () => new Date('2026-08-30T01:02:03.004Z'),
   }
   return {
-    deps, events, writes, renders, identities, docker, assets, environment, profiles, probeInputs,
+    deps, events, writes, renders, stages, identities, docker, assets, environment, profiles, probeInputs,
     state: () => state, profileEndpoint: () => profileEndpoint,
   }
 }
@@ -225,11 +249,12 @@ describe('setup', () => {
     expect(result).toEqual({ profile: 'web', endpoint: ENDPOINT, reused: false })
     expect(test.events).toEqual([
       'lock', 'environment', 'state-read', 'dsh-preflight', 'docker-preflight', 'ownership', 'profile-preview', 'managed-preflight',
-      'render', 'docker-up', 'readiness', 'real-search', 'profile-attach',
+      'stage', 'docker-up', 'readiness', 'real-search', 'profile-attach',
       'provider-search', 'state-write', 'unlock',
     ])
-    expect(test.renders[0]).toMatchObject({ stateDir: MANAGED_DIR, image: SEARXNG_IMAGE, port: 8080, secret: 'b'.repeat(64) })
-    expect(test.renders[0]?.identity).toEqual({
+    expect(test.renders).toEqual([])
+    expect(test.stages[0]).toMatchObject({ stateDir: MANAGED_DIR, port: 8080, secret: 'b'.repeat(64), definition: CATALOG_V1 })
+    expect(test.stages[0]?.identity).toEqual({
       stateDir: MANAGED_DIR,
       composePath: join(MANAGED_DIR, `config-${'0'.repeat(64)}`, 'compose.yml'),
       homeId: HOME_ID,
@@ -259,8 +284,39 @@ describe('setup', () => {
   it('generates a 32-byte lowercase hexadecimal secret without returning it', async () => {
     const test = harness()
     await setup({ profile: 'web', port: 8080 }, test.deps)
-    expect(test.renders[0]?.secret).toMatch(/^[a-f0-9]{64}$/)
-    expect(JSON.stringify(test.writes)).not.toContain(test.renders[0]!.secret)
+    expect(test.stages[0]?.secret).toMatch(/^[a-f0-9]{64}$/)
+    expect(JSON.stringify(test.writes)).not.toContain(test.stages[0]!.secret)
+  })
+
+  it('selects the newest catalog deployment and stages it for a fresh managed install', async () => {
+    const test = harness({ catalog: [CATALOG_V1, CATALOG_V2] })
+    const result = await createSetup({ randomSecret: () => 'b'.repeat(64) })({ profile: 'web', port: 8080 }, test.deps)
+
+    expect(result).toEqual({ profile: 'web', endpoint: ENDPOINT, reused: false })
+    expect(test.assets.render).not.toHaveBeenCalled()
+    expect(test.stages[0]).toMatchObject({ stateDir: MANAGED_DIR, port: 8080, secret: 'b'.repeat(64), definition: CATALOG_V2 })
+    expect(test.writes[0]?.managed?.current).toMatchObject({
+      deploymentVersion: 2,
+      image: CATALOG_V2.image,
+      configurationSha256: RENDERED_HASH,
+    })
+  })
+
+  it('reuses a healthy recorded deployment that remains in the catalog even when a newer entry exists', async () => {
+    const test = harness({ state: managedState(), ownership: 'owned', catalog: [CATALOG_V1, CATALOG_V2] })
+    await expect(setup({ profile: 'work', port: 8080 }, test.deps)).resolves.toEqual({ profile: 'work', endpoint: ENDPOINT, reused: true })
+    expect(test.assets.stage).not.toHaveBeenCalled()
+    expect(test.writes[0]?.managed?.current).toMatchObject({ deploymentVersion: 1, image: SEARXNG_IMAGE })
+  })
+
+  it('refuses a recorded deployment that is absent from the packaged catalog', async () => {
+    const foreign = managedState({ deploymentVersion: 3, image: `ghcr.io/searxng/searxng:unknown@sha256:${'d'.repeat(64)}` })
+    const test = harness({ state: foreign, ownership: 'owned', catalog: [CATALOG_V1, CATALOG_V2] })
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toMatchObject({
+      code: 'E_STATE_INVALID',
+      message: 'Managed deployment state does not match Docker resources',
+    })
+    expect(test.assets.stage).not.toHaveBeenCalled()
   })
 
   it('strictly reuses a matching healthy owned deployment without port preflight, render, or up', async () => {
@@ -288,6 +344,7 @@ describe('setup', () => {
     ])
     expect(test.environment.preflightManaged).not.toHaveBeenCalled()
     expect(test.assets.render).not.toHaveBeenCalled()
+    expect(test.assets.stage).not.toHaveBeenCalled()
     expect(test.docker.up).not.toHaveBeenCalled()
     expect(test.docker.down).not.toHaveBeenCalled()
     expect(randomSecret).not.toHaveBeenCalled()
@@ -319,6 +376,7 @@ describe('setup', () => {
       await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toBe(failure)
       expect(test.docker.restart).not.toHaveBeenCalled()
       expect(test.assets.render).not.toHaveBeenCalled()
+    expect(test.assets.stage).not.toHaveBeenCalled()
     },
   )
 
@@ -433,6 +491,7 @@ describe('setup', () => {
       code: 'E_STATE_INVALID', action: expect.stringMatching(/doctor|repair/i),
     })
     expect(test.assets.render).not.toHaveBeenCalled()
+    expect(test.assets.stage).not.toHaveBeenCalled()
     expect(test.docker.up).not.toHaveBeenCalled()
   })
 
@@ -462,6 +521,7 @@ describe('setup', () => {
     expect(test.docker.preflight).not.toHaveBeenCalled()
     expect(test.docker.inspectOwnership).not.toHaveBeenCalled()
     expect(test.assets.render).not.toHaveBeenCalled()
+    expect(test.assets.stage).not.toHaveBeenCalled()
     expect(test.environment.preflightManaged).not.toHaveBeenCalled()
     expect(test.state().managed).toEqual(initial.managed)
     expect(test.state().profiles.work).toEqual({ mode: 'external', endpoint: 'https://search.example/path' })
@@ -633,6 +693,7 @@ describe('setup', () => {
     await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toMatchObject({ code: 'E_PORT_CONFLICT' })
     expect(test.events).toEqual(['lock', 'environment', 'state-read', 'dsh-preflight', 'docker-preflight', 'ownership', 'profile-preview', 'managed-preflight', 'unlock'])
     expect(test.assets.render).not.toHaveBeenCalled()
+    expect(test.assets.stage).not.toHaveBeenCalled()
     expect(test.docker.up).not.toHaveBeenCalled()
   })
 
@@ -641,6 +702,7 @@ describe('setup', () => {
     await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toMatchObject({ code: 'E_RESOURCE_FOREIGN' })
     expect(test.events).toEqual(['lock', 'environment', 'state-read', 'dsh-preflight', 'docker-preflight', 'ownership', 'unlock'])
     expect(test.assets.render).not.toHaveBeenCalled()
+    expect(test.assets.stage).not.toHaveBeenCalled()
     expect(test.docker.up).not.toHaveBeenCalled()
   })
 
@@ -880,6 +942,7 @@ describe('production CLI entry', () => {
     expect(test.profiles.preview).toHaveBeenCalledWith('web', endpoint, undefined)
     expect(test.environment.preflightManaged).not.toHaveBeenCalled()
     expect(test.assets.render).not.toHaveBeenCalled()
+    expect(test.assets.stage).not.toHaveBeenCalled()
   })
 
   it('prints an actionable one-write human ready result without exposing secrets', async () => {

@@ -118,6 +118,33 @@ The setup command manages the `web-search-searxng` row in
 | `engines` | none | Comma-separated engine allowlist. |
 | `categories` | none | Comma-separated category filter. |
 | `authHeader` | none | Authorization header for a protected external instance. |
+| `cacheTtlMs` | 600000 | Cached query result lifetime in milliseconds; `0` disables caching. |
+| `minIntervalMs` | 1500 | Minimum spacing between network requests; `0` disables pacing. |
+| `queueCapacity` | 8 | Requests that may wait for a pacing slot before the provider rejects with backpressure. |
+| `totalBudgetMs` | 15000 | Wall-clock budget for one search call, spanning pacing wait, backoff, and network attempts. |
+
+Repeated queries are served from an in-process cache scoped to the provider
+instance (nothing is written to disk); a cache hit performs no network request.
+Concurrent searches pass a token bucket (burst 2, then one request per
+`minIntervalMs`), and a full queue rejects immediately with a retryable error
+instead of holding the caller. Failed responses are never cached, and an empty
+result page is returned as-is — the `engines`/`categories` allowlist is never
+silently widened to chase results. When the instance answers HTTP 429, the
+provider honors `Retry-After` and retries at most once within the remaining
+budget.
+
+## Per-query controls
+
+SearXNG supports per-query routing inside the query string itself; the provider
+passes query syntax through untouched:
+
+- `:zh-CN` / `:en` — select the result language for this query (`:` prefix).
+- `!bing` / `!news` — select one engine or category for this query (`!` prefix).
+- `site:example.com` — restrict results to one domain (engine-dependent support).
+
+For example, the query `:zh-CN 大模型 排行榜` searches in Chinese regardless of
+the profile's `language`, and `!github compose network mapping` uses only the
+GitHub engine. Verify engine names against your instance's engine list.
 
 If several DSH search providers are available, select this one with
 `DSH_WEB_SEARCH_PROVIDER=searxng` or the corresponding `searchProvider` DSH web configuration.
@@ -161,10 +188,10 @@ If several DSH search providers are available, select this one with
 - External SearXNG mode does not require Docker and works on any platform with Node.js 20+.
 - Podman and Podman Compose are not supported in the managed path.
 
-Release prerequisites: before any deployment catalog entry beyond version 1 ships, `setup` must
-select deployments from the packaged catalog instead of the compiled-in default pin, so a new
-catalog entry is installable without an intermediate CLI upgrade (tracked follow-up from the
-lifecycle work).
+`setup` selects the deployment to install from the packaged deployment catalog
+(newest entry compatible with the current state schema) and reuses a healthy
+existing deployment that is still listed in the catalog; use `update` to move
+between deployment versions.
 
 dsh is in developer preview with breaking changes expected. Version 0.2.1 supports
 `@deepseek-ai/dsh-web >=0.1.0-rc.6 <0.2.0` and

@@ -12,6 +12,8 @@ export type SearxngClientFailureKind =
   | 'network'
   | 'contract'
   | 'http'
+  | 'busy'
+  | 'budget'
 
 export class SearxngClientError extends Error {
   constructor(
@@ -129,21 +131,9 @@ export async function searchSearxng(
   if (!isValidSearxngBaseUrl(options.baseURL)) {
     throw new SearxngClientError('invalid-url', 'SearXNG base URL is invalid')
   }
-  const params = new URLSearchParams({ q: request.query, format: 'json' })
-  for (const key of ['language', 'engines', 'categories'] as const) {
-    const value = options[key]
-    if (value !== undefined && value.length > 0) params.set(key, value)
-  }
-
   const result = await requestJsonWithRetry({
-    url: buildSearchUrl(options.baseURL, params),
-    headers: {
-      accept: 'application/json',
-      'user-agent': USER_AGENT,
-      ...(options.authHeader !== undefined && options.authHeader.length > 0
-        ? { authorization: options.authHeader }
-        : {}),
-    },
+    url: buildSearchUrl(options.baseURL, buildSearxngSearchParams(options, request.query)),
+    headers: searxngRequestHeaders(options),
     ...(signal === undefined ? {} : { signal }),
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
@@ -158,6 +148,27 @@ export async function searchSearxng(
     throw new SearxngClientError('contract', 'SearXNG returned an unprocessable response body')
   }
   return mapSearxngClientResponse(result.payload)
+}
+
+/** Query parameters for one SearXNG JSON search; shared by the free client and the session. */
+export function buildSearxngSearchParams(options: SearxngClientOptions, query: string): URLSearchParams {
+  const params = new URLSearchParams({ q: query, format: 'json' })
+  for (const key of ['language', 'engines', 'categories'] as const) {
+    const value = options[key]
+    if (value !== undefined && value.length > 0) params.set(key, value)
+  }
+  return params
+}
+
+/** Request headers (accept, user agent, optional authorization) for one SearXNG search. */
+export function searxngRequestHeaders(options: SearxngClientOptions): Record<string, string> {
+  return {
+    accept: 'application/json',
+    'user-agent': USER_AGENT,
+    ...(options.authHeader !== undefined && options.authHeader.length > 0
+      ? { authorization: options.authHeader }
+      : {}),
+  }
 }
 
 function cancelResponseBody(response: Response): void {
@@ -230,7 +241,7 @@ function normalizeRequestFailure(error: unknown, signal?: AbortSignal): SearxngC
   return new SearxngClientError('network', 'SearXNG request failed', undefined, { cause: error })
 }
 
-function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+export function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(new SearxngClientError('caller-abort', 'SearXNG request aborted'))
   return new Promise((resolve, reject) => {
     const onAbort = () => {
@@ -246,7 +257,7 @@ function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-function buildSearchUrl(baseURL: string, params: URLSearchParams): string {
+export function buildSearchUrl(baseURL: string, params: URLSearchParams): string {
   const url = new URL(baseURL)
   url.pathname = `${url.pathname.replace(/\/+$/, '')}/search`
   url.search = params.toString()
@@ -258,7 +269,7 @@ function nonEmpty(value: string | null | undefined): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined
 }
 
-function isSearxngSearchResponse(value: unknown): value is SearxngSearchResponse {
+export function isSearxngSearchResponse(value: unknown): value is SearxngSearchResponse {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
   return Array.isArray((value as Record<string, unknown>).results)
 }

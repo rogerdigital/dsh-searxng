@@ -1,5 +1,7 @@
 import { randomBytes } from 'node:crypto'
-import { SEARXNG_IMAGE, type AssetRenderer, type ManagedIdentity } from './assets.ts'
+import { join } from 'node:path'
+import { type AssetRenderer, type ManagedIdentity, type StagingAssetRenderer } from './assets.ts'
+import { selectDeployment, type DeploymentDefinition } from './deployments.ts'
 import type { DockerAdapter } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService, ResolvedEnvironment } from './environment.ts'
@@ -14,9 +16,11 @@ export interface SetupDependencies {
   state: StateStore
   journal: JournalStore
   docker: DockerAdapter
-  assets: AssetRenderer
+  assets: StagingAssetRenderer
   searxng: SearxngProbe
   profiles: ProfileManager
+  /** Packaged deployment catalog; fresh installs stage its newest state-compatible entry. */
+  catalog: readonly DeploymentDefinition[]
   now(): Date
 }
 
@@ -112,11 +116,18 @@ function isMatchingManagedState(
   identity: ManagedIdentity,
   endpoint: string,
   port: number,
+  catalog: readonly DeploymentDefinition[],
 ): boolean {
   return managed !== undefined &&
     homeId === identity.homeId &&
-    managed.current.deploymentVersion === 1 &&
-    managed.current.image === SEARXNG_IMAGE &&
+    // The recorded deployment must be one this package still ships: reuse
+    // keeps older-but-current catalog entries running (update moves versions),
+    // while an unknown version/image means state and resources no longer
+    // describe a packaged deployment.
+    catalog.some((deployment) =>
+      deployment.deploymentVersion === managed.current.deploymentVersion &&
+      deployment.image === managed.current.image,
+    ) &&
     managed.current.endpoint === endpoint &&
     managed.current.port === port &&
     managed.current.projectName === identity.projectName &&
@@ -130,12 +141,17 @@ function managedState(
   identity: ManagedIdentity,
   dependencies: SetupDependencies,
   configurationSha256?: string,
+  deployment?: DeploymentDefinition,
 ): StateV2 {
   const prior = previous.managed?.current
+  // Fresh installs take their identity from the staged catalog deployment;
+  // every other caller reuses the recorded current deployment.
+  const source = deployment ?? prior
+  if (source === undefined) throw setupFailed()
   const digest = configurationSha256 ?? prior?.configurationSha256
   const current: DeploymentSnapshot = {
-    deploymentVersion: prior?.deploymentVersion ?? 1,
-    image: SEARXNG_IMAGE,
+    deploymentVersion: source.deploymentVersion,
+    image: source.image,
     endpoint,
     port: input.port,
     projectName: identity.projectName,
@@ -287,12 +303,16 @@ async function managedSetup(
 ): Promise<SetupResult> {
   const endpoint = `http://127.0.0.1:${input.port}`
   const placeholderIdentity = canonicalIdentity(environment.managedDir, environment.homeId)
+  // Fresh installs target the newest catalog deployment compatible with the
+  // current state schema; the same catalog decides whether an existing
+  // deployment can be reused below.
+  const deployment = selectDeployment(dependencies.catalog, previous.schemaVersion)
 
   await dependencies.docker.preflight(signal)
   const ownership = await dependencies.docker.inspectOwnership(placeholderIdentity, signal)
   const hasState = previous.managed !== undefined
   const matching = hasState && ownership === 'owned' &&
-    isMatchingManagedState(previous.managed, previous.homeId, placeholderIdentity, endpoint, input.port)
+    isMatchingManagedState(previous.managed, previous.homeId, placeholderIdentity, endpoint, input.port, dependencies.catalog)
 
   if ((hasState && !matching) || (!hasState && ownership === 'owned')) {
     throw inconsistentManagedDeployment()
@@ -345,21 +365,21 @@ async function managedSetup(
   }
 
   await dependencies.environment.preflightManaged(input.port, signal)
-  const rendered = await dependencies.assets.render({
+  const staged = await dependencies.assets.stage({
     stateDir: environment.managedDir,
     identity: placeholderIdentity,
-    image: SEARXNG_IMAGE,
     port: input.port,
     secret: randomSecret(),
+    definition: deployment,
   })
-  const identity = { ...placeholderIdentity, composePath: rendered.composePath }
+  const identity = { ...placeholderIdentity, composePath: join(staged.directory, 'compose.yml') }
   try {
     // From this point onward, any resources discovered under this identity may
     // only have been created by this first-setup transaction.
     await dependencies.docker.up(identity, signal)
     await dependencies.searxng.readiness(preview.config, signal)
     await dependencies.searxng.realSearch(preview.config, signal)
-    const next = managedState(previous, input, endpoint, identity, dependencies, rendered.configurationSha256)
+    const next = managedState(previous, input, endpoint, identity, dependencies, staged.configurationSha256, staged.definition)
     await attachAndCommit(input, endpoint, previous, next, dependencies, signal)
     return { profile: input.profile, endpoint, reused: false }
   } catch (primary) {
