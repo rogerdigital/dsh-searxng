@@ -73,7 +73,7 @@ Near-term execution checklist:
 - [ ] Establish the baseline and task set alongside M1.
 - [x] Validate M1 defaults against cold and burst workloads before making them defaults (docs/evaluation/reports/2026-09-11-m1-defaults.md).
 - [x] Deliver the M2 read-only report and test whether it helps resolve representative failures (delivered 2026-09-11; a live run surfaced per-engine rate limiting and CAPTCHA causes on a degraded instance).
-- [ ] Evaluate candidate Chinese configurations in isolated development instances during M2.
+- [x] Evaluate candidate Chinese configurations in isolated development instances during M2 (2026-09-12: no candidate passed; M3/M4 deferred — docs/evaluation/reports/2026-09-12-zh-candidates-defer.md).
 - [ ] Gate M3 on repeatable task-quality or maintenance benefit without violating the recorded
   regression bounds; identify which configuration changes actually require an apply workflow.
 - [ ] Gate M4 on an effective `zh` candidate, documented network limits, and M3 recovery checks.
