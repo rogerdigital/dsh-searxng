@@ -1,6 +1,6 @@
 {
   "name": "dsh-searxng",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "SearXNG-backed search provider for the DeepSeek Harness web capability seam (ctx.web)",
   "type": "module",
   "packageManager": "pnpm@10.23.0",
@@ -65,9 +65,15 @@
     "@deepseek-ai/dsh-web": ">=0.1.0-rc.6 <0.2.0"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": { "optional": true },
-    "@deepseek-ai/dsh-launch-environment": { "optional": true },
-    "@deepseek-ai/dsh-web": { "optional": true }
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-launch-environment": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-web": {
+      "optional": true
+    }
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
