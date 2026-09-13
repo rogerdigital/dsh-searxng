@@ -188,8 +188,8 @@ If several DSH search providers are available, select this one with
   the release tarball in [docs/release-certification.md](docs/release-certification.md) — one
   each from macOS + Docker Desktop, Windows + Docker Desktop + WSL2, and Linux + Docker Engine +
   Compose v2.
-- Docker Desktop on macOS is certified for `0.3.0`
-  (`docs/certification/v0.3.0-darwin-arm64.json`); Docker Desktop on Windows is compatible (same
+- Docker Desktop on macOS is certified for `0.4.0`
+  (`docs/certification/v0.4.0-darwin-arm64.json`); Docker Desktop on Windows is compatible (same
   engine, same Compose v2 plugin) but uncertified until its report exists for a given release.
 - External SearXNG mode does not require Docker and works on any platform with Node.js 20+.
 - Podman and Podman Compose are not supported in the managed path.
@@ -199,7 +199,7 @@ If several DSH search providers are available, select this one with
 existing deployment that is still listed in the catalog; use `update` to move
 between deployment versions.
 
-dsh is in developer preview with breaking changes expected. Version 0.2.1 supports
+dsh is in developer preview with breaking changes expected. Version 0.4.0 supports
 `@deepseek-ai/dsh-web >=0.1.0-rc.6 <0.2.0` and
 `@deepseek-ai/dsh-launch-environment >=0.0.1-rc.3 <0.2.0`.
 

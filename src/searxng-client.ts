@@ -1,6 +1,6 @@
 import type { SearxngResult, SearxngSearchResponse } from './types.ts'
 
-const USER_AGENT = 'dsh-searxng/0.2.1'
+const USER_AGENT = 'dsh-searxng/0.4.0'
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000
 const DEFAULT_RETRY_DELAY_MS = 100
 const RETRYABLE_STATUSES = new Set([502, 503, 504])
