@@ -632,3 +632,47 @@ describe('SearxngSearchProvider', () => {
     })
   })
 })
+
+describe('SearxngSearchProvider baseURLs', () => {
+  const PRIMARY = 'http://127.0.0.1:9090'
+  const SECONDARY = 'http://127.0.0.1:8081'
+  const POOL_RESULT = { results: [{ url: 'https://example.com/r', title: 'R' }] }
+
+  it('is available when every pool entry is usable', () => {
+    expect(new SearxngSearchProvider({ baseURL: BASE, baseURLs: [PRIMARY, BASE] }).available()).toBe(true)
+  })
+
+  it('is unavailable when any pool entry is invalid', () => {
+    const provider = new SearxngSearchProvider({ baseURL: BASE, baseURLs: [BASE, 'not a url'] })
+    expect(provider.available()).toBe(false)
+  })
+
+  it('routes through the pool primary and fails over within the pool, ignoring baseURL', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.startsWith(PRIMARY)) throw new TypeError('down')
+      return jsonResponse(POOL_RESULT)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const provider = new SearxngSearchProvider({ baseURL: BASE, baseURLs: [PRIMARY, SECONDARY] })
+    const result = await provider.search({ query: 'q' })
+
+    expect(result.sources.length).toBe(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(String(fetchMock.mock.calls[0]![0])).toContain(PRIMARY)
+    expect(String(fetchMock.mock.calls[1]![0])).toContain(SECONDARY)
+    expect(String(fetchMock.mock.calls[0]![0])).not.toContain(`${BASE}/`)
+  })
+
+  it('rejects with invalid-url when a pool entry is malformed', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const provider = new SearxngSearchProvider({ baseURL: BASE, baseURLs: [BASE, 'not a url'] })
+    await expect(provider.search({ query: 'q' })).rejects.toMatchObject({
+      code: 'WEB_PROVIDER_ERROR',
+      message: expect.stringContaining('absolute HTTP URL'),
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})

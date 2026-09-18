@@ -30,6 +30,8 @@ export const inject = ['web']
 export interface Config {
   /** SearXNG instance base URL without a query or fragment. Falls back to `$SEARXNG_BASE_URL`. Empty → unavailable. */
   baseURL?: string
+  /** Failover pool of SearXNG base URLs; the first entry is primary and a non-empty list wins over `baseURL`. */
+  baseURLs?: string[]
   /** Locale passed as SearXNG's `language` parameter, e.g. `zh-CN`. */
   language?: string
   /** Comma-separated engine allowlist passed as SearXNG's `engines` parameter. */
@@ -50,6 +52,7 @@ export interface Config {
 
 export const Config: z<Config> = z.object({
   baseURL: z.string(),
+  baseURLs: z.array(z.string()),
   language: z.string(),
   engines: z.string(),
   categories: z.string(),
@@ -66,6 +69,7 @@ export function apply(ctx: Context, config: Config): void {
     // No public instance is assumed: most disable the JSON format and
     // rate-limit heavily, so an unset base URL honestly reads "unavailable".
     baseURL: config.baseURL ?? launchEnvironmentOf(ctx).get('SEARXNG_BASE_URL')?.value ?? '',
+    ...(Array.isArray(config.baseURLs) && config.baseURLs.length > 0 ? { baseURLs: config.baseURLs } : {}),
     ...config.language !== undefined && config.language.length > 0 ? { language: config.language } : {},
     ...config.engines !== undefined && config.engines.length > 0 ? { engines: config.engines } : {},
     ...config.categories !== undefined && config.categories.length > 0 ? { categories: config.categories } : {},

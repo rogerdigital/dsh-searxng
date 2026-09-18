@@ -273,3 +273,151 @@ describe('SearxngSearchSession budget', () => {
     expect(fetch).toHaveBeenCalledTimes(2)
   })
 })
+
+const BASE_B = 'http://127.0.0.1:8081'
+
+function poolSession(fetch: unknown, options: Record<string, unknown> = {}) {
+  return new SearxngSearchSession({
+    baseURL: BASE,
+    baseURLs: [BASE, BASE_B],
+    fetch: fetch as typeof globalThis.fetch,
+    minIntervalMs: 0,
+    retryDelayMs: 1,
+    ...options,
+  })
+}
+
+describe('SearxngSearchSession failover', () => {
+  it('fails over to the secondary endpoint on a network failure', async () => {
+    const fetch = vi.fn(async (url: string) => {
+      if (url.startsWith(BASE)) throw new TypeError('fetch failed')
+      return jsonResponse(RESULT)
+    })
+    const result = await poolSession(fetch).search('q', undefined)
+    expect(result.sources.length).toBe(1)
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(fetch.mock.calls[1]?.[0]).toContain(BASE_B)
+  })
+
+  it('fails over after a retryable HTTP status', async () => {
+    const fetch = vi.fn(async (url: string) =>
+      url.startsWith(BASE) ? jsonResponse({}, 502) : jsonResponse(RESULT))
+    const result = await poolSession(fetch).search('q', undefined)
+    expect(result.sources.length).toBe(1)
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(fetch.mock.calls[1]?.[0]).toContain(BASE_B)
+  })
+
+  it('fails over after a rate limit once Retry-After fits the budget', async () => {
+    const fetch = vi.fn(async (url: string) =>
+      url.startsWith(BASE)
+        ? new Response(JSON.stringify({}), {
+            status: 429,
+            headers: { 'content-type': 'application/json', 'retry-after': '0' },
+          })
+        : jsonResponse(RESULT))
+    const result = await poolSession(fetch).search('q', undefined)
+    expect(result.sources.length).toBe(1)
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(fetch.mock.calls[1]?.[0]).toContain(BASE_B)
+  })
+
+  it('does not fail over on a non-retryable HTTP status', async () => {
+    const fetch = vi.fn(async (url: string) =>
+      url.startsWith(BASE) ? jsonResponse({}, 403) : jsonResponse(RESULT))
+    await expect(poolSession(fetch).search('q', undefined)).rejects.toMatchObject({ kind: 'http', status: 403 })
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not fail over on an unprocessable response body', async () => {
+    const fetch = vi.fn(async (url: string) =>
+      url.startsWith(BASE)
+        ? new Response('not json', { status: 200, headers: { 'content-type': 'text/plain' } })
+        : jsonResponse(RESULT))
+    await expect(poolSession(fetch).search('q', undefined)).rejects.toMatchObject({ kind: 'contract' })
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('throws the last failure after exhausting attempts across the pool', async () => {
+    const fetch = vi.fn(async (url: string) => {
+      if (url.startsWith(BASE)) throw new TypeError('fetch failed')
+      return jsonResponse({}, 502)
+    })
+    await expect(poolSession(fetch).search('q', undefined)).rejects.toMatchObject({ kind: 'network' })
+    expect(fetch).toHaveBeenCalledTimes(3)
+    // Both endpoints carry fresh penalties; the pool-order tie goes to the primary.
+    expect(fetch.mock.calls[2]?.[0]).toContain(BASE)
+  })
+
+  it('steers the next search away from a failing primary until it recovers', async () => {
+    const fetch = vi.fn(async (url: string) => {
+      if (url.startsWith(BASE)) throw new TypeError('fetch failed')
+      return jsonResponse(RESULT)
+    })
+    const session = poolSession(fetch)
+    await session.search('one', undefined)
+    await session.search('two', undefined)
+    expect(fetch).toHaveBeenCalledTimes(3)
+    expect(fetch.mock.calls[2]?.[0]).toContain(BASE_B)
+  })
+
+  it('returns to the primary after its health penalty decays', async () => {
+    vi.useFakeTimers()
+    const fetch = vi.fn(async (url: string) => {
+      if (url.startsWith(BASE)) throw new TypeError('fetch failed')
+      return jsonResponse(RESULT)
+    })
+    const session = poolSession(fetch)
+    const first = session.search('one', undefined)
+    await vi.advanceTimersByTimeAsync(10)
+    await first
+    vi.advanceTimersByTime(65_000)
+    const second = session.search('two', undefined)
+    await vi.advanceTimersByTimeAsync(10)
+    await second
+    expect(fetch.mock.calls[2]?.[0]).toContain(BASE)
+    expect(fetch).toHaveBeenCalledTimes(4)
+  })
+
+  it('serves a repeat query from the pool cache when the serving endpoint died', async () => {
+    let primaryUp = true
+    const fetch = vi.fn(async (url: string) => {
+      if (url.startsWith(BASE) && !primaryUp) throw new TypeError('fetch failed')
+      return jsonResponse(RESULT)
+    })
+    const session = poolSession(fetch, { cacheTtlMs: 60_000 })
+    await session.search('same', undefined)
+    primaryUp = false
+    const again = await session.search('same', undefined)
+    expect(again.sources.length).toBe(1)
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('waits on the selected endpoint bucket, not the primary one, when steering', async () => {
+    vi.useFakeTimers()
+    const fetch = vi.fn(async (url: string) => {
+      if (url.startsWith(BASE)) throw new TypeError('fetch failed')
+      return jsonResponse(RESULT)
+    })
+    const session = new SearxngSearchSession({
+      baseURL: BASE,
+      baseURLs: [BASE, BASE_B],
+      fetch: fetch as typeof globalThis.fetch,
+      minIntervalMs: 1_500,
+      retryDelayMs: 1,
+    })
+    const one = session.search('one', undefined)
+    await vi.advanceTimersByTimeAsync(10)
+    await one
+    // The primary stays penalized, so both follow-ups select the secondary and
+    // pace on its bucket: the second waits for its refill, never for the
+    // primary's.
+    await session.search('two', undefined)
+    const three = session.search('three', undefined)
+    await vi.advanceTimersByTimeAsync(2_000)
+    await three
+    const urls = fetch.mock.calls.map((call) => String(call[0]))
+    expect(urls[0]).toContain(BASE)
+    expect(urls.slice(1).every((url) => url.startsWith(BASE_B))).toBe(true)
+  })
+})

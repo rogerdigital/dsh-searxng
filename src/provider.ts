@@ -17,7 +17,7 @@ import {
   mapSearxngClientResponse,
   mapSearxngClientResult,
 } from './searxng-client.ts'
-import { SearxngSearchSession } from './search-session.ts'
+import { SearxngSearchSession, resolveEndpointPool } from './search-session.ts'
 import type { SearxngSearchResponse } from './types.ts'
 
 /** Stable id this provider registers under. */
@@ -30,6 +30,11 @@ export const SEARXNG_PROVIDER_ID = 'searxng'
 export interface SearxngSearchProviderOptions {
   /** Absolute HTTP(S) SearXNG base URL without credentials, query, or fragment. */
   baseURL: string
+  /**
+   * Failover pool of SearXNG base URLs; the first entry is primary. A non-empty
+   * list wins over `baseURL`.
+   */
+  baseURLs?: string[]
   /** Locale passed as SearXNG's `language` parameter, e.g. `zh-CN`. */
   language?: string
   /** Comma-separated engine allowlist passed as SearXNG's `engines` parameter. */
@@ -63,13 +68,17 @@ export class SearxngSearchProvider implements WebSearchProvider {
   readonly id = SEARXNG_PROVIDER_ID
 
   private readonly session: SearxngSearchSession
+  private readonly endpoints: readonly string[]
 
   constructor(private readonly options: SearxngSearchProviderOptions) {
     this.session = new SearxngSearchSession(options)
+    this.endpoints = resolveEndpointPool(options)
   }
 
   available(): boolean {
-    return isValidSearxngBaseUrl(this.options.baseURL)
+    // Every named endpoint must be usable: silently skipping one the operator
+    // configured would hide a mistake behind partial availability.
+    return this.endpoints.every(isValidSearxngBaseUrl)
   }
 
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
