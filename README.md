@@ -119,6 +119,7 @@ The setup command manages the `web-search-searxng` row in
 | Key | Default | Meaning |
 |---|---|---|
 | `baseURL` | managed or `--url` endpoint | SearXNG base URL. |
+| `baseURLs` | none | Failover pool of SearXNG base URLs; the first entry is primary and a non-empty list wins over `baseURL`. |
 | `language` | none | SearXNG language, for example `zh-CN` or `en-US`. |
 | `engines` | none | Comma-separated engine allowlist. |
 | `categories` | none | Comma-separated category filter. |
@@ -138,6 +139,33 @@ page is returned as-is: the `engines`/`categories` allowlist is never
 silently widened to chase results. When the instance answers HTTP 429, the
 provider honors `Retry-After` and retries at most once within the remaining
 budget.
+
+### Multi-instance failover
+
+List two or more endpoints in `baseURLs` (at most 8, duplicates collapse) to
+route searches across them — for example a local managed instance first and a
+remote one second:
+
+```yaml
+web-search-searxng:
+  baseURLs:
+    - http://127.0.0.1:8080
+    - https://searxng.example.net
+```
+
+The first entry is primary. When an attempt fails with a network error, a
+timeout, or HTTP 502/503/504/429, the endpoint's health penalty rises and the
+next attempt (and the first attempt of later searches) goes to the healthiest
+endpoint; penalties decay with a 30 s half-life, so the primary recovers the
+first slot about a minute after its last failure, or immediately after a
+successful search. Malformed responses (`contract` failures) and other 4xx
+statuses never fail over — those are configuration problems on that endpoint
+that switching would silently mask. The cache is keyed by the whole pool, the
+pacing bucket is per endpoint, and the `totalBudgetMs` deadline spans every
+endpoint's attempts; empty result pages are valid answers and never trigger
+failover. `setup --url` still records a single external endpoint per profile —
+configuring a pool is a manual profile-config edit until the CLI follow-up
+ships.
 
 ## Per-query controls
 

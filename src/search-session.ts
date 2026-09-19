@@ -27,6 +27,11 @@ import type { SearxngClientOptions, SearxngClientResult } from './searxng-client
 
 /** Knobs are per provider instance; defaults follow docs/development-plan.md M1. */
 export interface SearxngSearchSessionOptions extends SearxngClientOptions {
+  /**
+   * Failover pool of SearXNG base URLs; the first entry is primary. A non-empty
+   * list wins over `baseURL`. Absent or empty keeps single-`baseURL` behavior.
+   */
+  baseURLs?: string[]
   /** Cached entry lifetime in milliseconds; 0 disables caching. Default 600_000. */
   cacheTtlMs?: number
   /** Maximum cached entries (LRU). Default 64. */
@@ -47,6 +52,33 @@ const DEFAULT_TOTAL_BUDGET_MS = 15_000
 const DEFAULT_BACKOFF_AFTER_RATE_LIMIT_MS = 1_000
 const MAX_ATTEMPTS = 3
 const RETRYABLE_STATUSES = new Set([502, 503, 504])
+const MAX_POOL_ENTRIES = 8
+const HEALTH_HALF_LIFE_MS = 30_000
+const HEALTH_EPSILON = 0.25
+
+/**
+ * Resolve the failover pool: a non-empty `baseURLs` (exact duplicates collapse,
+ * first occurrence kept, at most 8 entries) wins over `baseURL`; otherwise the
+ * pool is the single `baseURL` (possibly `''`, which reads as unavailable).
+ */
+export function resolveEndpointPool(options: { baseURL?: string; baseURLs?: readonly string[] }): string[] {
+  const listed = options.baseURLs
+  if (listed === undefined || listed.length === 0) return [options.baseURL ?? '']
+  for (const entry of listed) {
+    if (typeof entry !== 'string') throw new RangeError('baseURLs entries must be strings')
+  }
+  const pool = [...new Set(listed)]
+  if (pool.length > MAX_POOL_ENTRIES) {
+    throw new RangeError(`baseURLs must list at most ${MAX_POOL_ENTRIES} endpoints`)
+  }
+  return pool
+}
+
+/** Health-decay record for one pool endpoint: failures accumulate, time heals. */
+interface EndpointHealth {
+  penalty: number
+  lastFailureAt: number
+}
 
 interface CacheEntry {
   readonly expiresAt: number
@@ -167,12 +199,14 @@ class Pacer {
 
 export class SearxngSearchSession {
   private readonly options: SearxngSearchSessionOptions
+  private readonly pool: readonly string[]
+  private readonly health: ReadonlyMap<string, EndpointHealth>
+  private readonly pacers: ReadonlyMap<string, Pacer> | undefined
   private readonly cacheTtlMs: number
   private readonly cacheCapacity: number
   private readonly totalBudgetMs: number
   private readonly perAttemptTimeoutMs: number
   private readonly retryDelayMs: number
-  private readonly pacing: Pacer | undefined
   private readonly cache = new Map<string, CacheEntry>()
 
   constructor(options: SearxngSearchSessionOptions) {
@@ -199,18 +233,22 @@ export class SearxngSearchSession {
       throw new RangeError('totalBudgetMs must be a positive safe integer')
     }
     this.options = options
+    this.pool = resolveEndpointPool(options)
+    this.health = new Map(this.pool.map((endpoint) => [endpoint, { penalty: 0, lastFailureAt: 0 }]))
     this.cacheTtlMs = cacheTtlMs
     this.cacheCapacity = cacheCapacity
     this.totalBudgetMs = totalBudgetMs
     this.perAttemptTimeoutMs = options.timeoutMs ?? 10_000
     this.retryDelayMs = options.retryDelayMs ?? 100
-    this.pacing = minIntervalMs === 0 ? undefined : new Pacer(2, minIntervalMs, queueCapacity)
+    this.pacers = minIntervalMs === 0
+      ? undefined
+      : new Map(this.pool.map((endpoint) => [endpoint, new Pacer(2, minIntervalMs, queueCapacity)]))
   }
 
   /** Run one search through instance-local cache, pacing, and the total budget. */
   async search(query: string, signal?: AbortSignal): Promise<SearxngClientResult> {
     if (signal?.aborted) throw new SearxngClientError('caller-abort', 'SearXNG search aborted')
-    if (!isValidSearxngBaseUrl(this.options.baseURL)) {
+    if (!this.pool.every(isValidSearxngBaseUrl)) {
       throw new SearxngClientError('invalid-url', 'SearXNG base URL is invalid')
     }
     const key = this.cacheKey(query)
@@ -218,17 +256,23 @@ export class SearxngSearchSession {
     if (cached !== undefined) return structuredClone(cached)
 
     const deadlineAt = Date.now() + this.totalBudgetMs
-    await this.pacing?.acquire(deadlineAt, signal)
-
     let lastFailure: SearxngClientError | undefined
     let rateLimitBackoffUsed = false
+    let pacingEndpoint: string | undefined
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
       const remaining = deadlineAt - Date.now()
       if (remaining <= 0) throw lastFailure ?? budgetExpired()
+      const endpoint = this.selectEndpoint()
+      // Pacing is per endpoint: a failover attempt waits only on the endpoint it
+      // targets, and same-endpoint retries keep the slot acquired for attempt 1.
+      if (endpoint !== pacingEndpoint) {
+        await this.pacers?.get(endpoint)?.acquire(deadlineAt, signal)
+        pacingEndpoint = endpoint
+      }
       let outcome: Awaited<ReturnType<typeof requestJsonWithRetry>>
       try {
         outcome = await requestJsonWithRetry({
-          url: buildSearchUrl(this.options.baseURL, buildSearxngSearchParams(this.options, query)),
+          url: buildSearchUrl(endpoint, buildSearxngSearchParams(this.options, query)),
           headers: searxngRequestHeaders(this.options),
           ...(signal === undefined ? {} : { signal }),
           timeoutMs: Math.max(1, Math.min(this.perAttemptTimeoutMs, Math.ceil(remaining))),
@@ -239,6 +283,7 @@ export class SearxngSearchSession {
         if (!(error instanceof SearxngClientError)) throw error
         if (error.kind !== 'timeout' && error.kind !== 'network') throw error
         lastFailure = error
+        this.recordFailure(endpoint)
         if (attempt === MAX_ATTEMPTS) throw error
         const delay = Math.min(this.retryDelayMs, deadlineAt - Date.now() - 1)
         if (delay <= 0) throw error
@@ -251,6 +296,7 @@ export class SearxngSearchSession {
           throw new SearxngClientError('contract', 'SearXNG returned an unprocessable response body')
         }
         const mapped = mapSearxngClientResponse(outcome.payload)
+        this.recordSuccess(endpoint)
         this.writeCached(key, mapped)
         return mapped
       }
@@ -260,6 +306,7 @@ export class SearxngSearchSession {
       const retryableStatus = RETRYABLE_STATUSES.has(status)
       const rateLimited = status === 429 && !rateLimitBackoffUsed
       if (!retryableStatus && !rateLimited) throw lastFailure
+      this.recordFailure(endpoint)
       let delay = this.retryDelayMs
       if (status === 429) {
         rateLimitBackoffUsed = true
@@ -274,11 +321,53 @@ export class SearxngSearchSession {
     throw lastFailure ?? budgetExpired()
   }
 
+  /**
+   * Lowest quantized effective penalty wins; ties resolve to pool order, so the
+   * primary is sticky and regains the first slot once its penalty decays below
+   * the epsilon (about two half-lives after its last failure).
+   */
+  private selectEndpoint(): string {
+    let best: string | undefined
+    let bestScore = Number.POSITIVE_INFINITY
+    for (const endpoint of this.pool) {
+      const score = this.effectivePenalty(this.health.get(endpoint))
+      if (score < bestScore) {
+        best = endpoint
+        bestScore = score
+      }
+    }
+    // resolveEndpointPool always yields at least one entry; the guard only
+    // satisfies the index-access type.
+    if (best === undefined) throw new SearxngClientError('invalid-url', 'SearXNG base URL is invalid')
+    return best
+  }
+
+  private effectivePenalty(health: EndpointHealth | undefined): number {
+    if (health === undefined || health.penalty === 0) return 0
+    const elapsed = Date.now() - health.lastFailureAt
+    const effective = health.penalty * 2 ** (-elapsed / HEALTH_HALF_LIFE_MS)
+    return effective < HEALTH_EPSILON ? 0 : effective
+  }
+
+  private recordFailure(endpoint: string): void {
+    const health = this.health.get(endpoint)
+    if (health === undefined) return
+    health.penalty += 1
+    health.lastFailureAt = Date.now()
+  }
+
+  private recordSuccess(endpoint: string): void {
+    const health = this.health.get(endpoint)
+    if (health === undefined) return
+    health.penalty = 0
+  }
+
   private cacheKey(query: string): string {
     // Exact query text (syntax and case preserved) plus every resolved
-    // request-shaping option and the endpoint identity.
+    // request-shaping option and the pool identity: one pool serves equivalent
+    // content, so entries are shared across its endpoints, not per endpoint.
     return JSON.stringify([
-      this.options.baseURL,
+      this.pool,
       this.options.language ?? '',
       this.options.engines ?? '',
       this.options.categories ?? '',
