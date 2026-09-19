@@ -70,7 +70,11 @@ reports. This is development evidence, not a new telemetry service or runtime de
 
 Near-term execution checklist:
 
-- [ ] Establish the baseline and task set alongside M1.
+- [x] Establish the baseline and task set alongside M1 (windows 1 and 2 recorded:
+  docs/evaluation/reports/2026-09-12-baseline-default-tasks-v1.md and
+  2026-09-19-baseline-default-tasks-v1-window2.md — 36/36 answerable in both windows,
+  one network environment, no cross-network claim; `scripts/eval-tasks-v1.mjs` runs
+  the battery for further windows, including from a second network).
 - [x] Validate M1 defaults against cold and burst workloads before making them defaults (docs/evaluation/reports/2026-09-11-m1-defaults.md).
 - [x] Deliver the M2 read-only report and test whether it helps resolve representative failures (delivered 2026-09-11; a live run surfaced per-engine rate limiting and CAPTCHA causes on a degraded instance).
 - [x] Evaluate candidate Chinese configurations in isolated development instances during M2 (2026-09-12: no candidate passed; M3/M4 deferred — docs/evaluation/reports/2026-09-12-zh-candidates-defer.md).
