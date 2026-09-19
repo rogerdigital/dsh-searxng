@@ -70,6 +70,12 @@ Report per-task differences and exceptions, not only averages.
 
 ## Run procedure (managed baseline or candidate)
 
+`scripts/eval-tasks-v1.mjs` automates the window pattern used by the recorded baseline
+reports: tune brackets before and after, the 36 `tasks-v1.md` queries sequential with a
+2.5 s gap, and a per-task top-five JSONL capture for snippet-level judgment. Run it from
+any network with `--base <endpoint> --out <dir>`; the capture is the judgment input, not
+a judgment.
+
 ```sh
 # 1. Record the environment and configuration under test.
 npx dsh-searxng status --profile web --json
