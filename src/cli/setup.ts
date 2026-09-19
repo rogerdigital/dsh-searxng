@@ -6,7 +6,7 @@ import type { DockerAdapter } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService, ResolvedEnvironment } from './environment.ts'
 import type { JournalStore, OperationKind } from './journal.ts'
-import { canonicalIdentity, healthyTimestamp, isAbort } from './managed.ts'
+import { canonicalIdentity, bundleComposePath, healthyTimestamp, isAbort } from './managed.ts'
 import type { ProfileManager } from './profile.ts'
 import type { SearxngProbe } from './searxng.ts'
 import type { DeploymentSnapshot, StateStore, StateV2 } from './state.ts'
@@ -47,6 +47,33 @@ function managedRecoveryFailed(): CliError {
     'Managed SearXNG is still unhealthy after restart',
     'Run dsh-searxng doctor and repair the managed deployment',
   )
+}
+
+/**
+ * Recovery for a matching deployment whose readiness timed out. A present but
+ * wedged runtime restarts; a runtime whose container is gone (the leftover of
+ * `remove --service` without `--purge-data`, or a manual compose down) is
+ * recreated from the recorded content-addressed bundle — restarting a
+ * nonexistent container is the one shape this deployment state could not
+ * previously recover from.
+ */
+async function recoverUnhealthyRuntime(
+  previous: StateV2,
+  environment: ResolvedEnvironment,
+  identity: ManagedIdentity,
+  dependencies: SetupDependencies,
+  signal?: AbortSignal,
+): Promise<void> {
+  const status = await dependencies.docker.deploymentStatus(identity, signal)
+  if (status.container !== 'absent') {
+    await dependencies.docker.restart(identity, signal)
+    return
+  }
+  const composePath = previous.managed === undefined
+    ? undefined
+    : bundleComposePath(environment.managedDir, previous.managed.current)
+  if (composePath === undefined) throw inconsistentManagedDeployment()
+  await dependencies.docker.up({ ...identity, composePath }, signal)
 }
 
 function portMigrationRequired(): CliError {
@@ -326,7 +353,7 @@ async function managedSetup(
     } catch (error) {
       if (isAbort(error, signal)) throw error
       if (!(error instanceof CliError) || error.code !== 'E_SEARXNG_START_TIMEOUT') throw error
-      await dependencies.docker.restart(placeholderIdentity, signal)
+      await recoverUnhealthyRuntime(previous, environment, placeholderIdentity, dependencies, signal)
       try {
         await dependencies.searxng.readiness(preview.config, signal)
       } catch (recoveryError) {

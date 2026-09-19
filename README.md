@@ -99,7 +99,10 @@ resources are refused.
 `$DSH_HOME/dsh-searxng/journal.json` between the first mutation and validated completion; `setup`
 and `remove` read that journal to refuse during or clean up after an interruption.
 
-- `setup` refuses to run while an interrupted operation is recorded and points at `repair`.
+- `setup` refuses to run while an interrupted operation is recorded and points at `repair`. When a matching
+  deployment is recorded but unhealthy, it restarts a wedged runtime, or — if the container is gone while the
+  recorded bundle survives (the leftover of `remove --service` without `--purge-data`, or a manual
+  `docker compose down`) — recreates the runtime from that bundle.
 - `repair` takes over when a journal exists: it recomputes the recovery decision from disk (clear
   the journal, validate the target, or resume the rollback) before any ordinary repair, and also
   removes quarantined stale locks left by dead processes. `doctor` reports the interrupted
