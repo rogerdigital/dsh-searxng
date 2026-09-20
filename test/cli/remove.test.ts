@@ -11,7 +11,13 @@ const PROJECT = `dsh-searxng-${HOME_ID}`
 const ENDPOINT = 'http://127.0.0.1:8080'
 const COMPOSE = `/dsh/dsh-searxng/config-${'a'.repeat(64)}/compose.yml`
 
-function managedState(extraProfiles: StateV2['profiles'] = {}): StateV2 {
+function managedState(extraProfiles: StateV2['profiles'] = {}, withDigest = false): StateV2 {
+  const state = managedStateWithoutDigest(extraProfiles)
+  if (withDigest) state.managed!.current.configurationSha256 = 'b'.repeat(64)
+  return state
+}
+
+function managedStateWithoutDigest(extraProfiles: StateV2['profiles'] = {}): StateV2 {
   return {
     schemaVersion: 2,
     homeId: HOME_ID,
@@ -30,6 +36,7 @@ function harness(options: {
   state?: StateV2
   ownershipError?: unknown
   foreignOnSecondOwnership?: boolean
+  deploymentStatus?: { ownership: 'absent' | 'owned'; container: 'absent' | 'running' | 'stopped'; composePath?: string }
   confirmed?: boolean
   writeFailure?: boolean
   dshError?: unknown
@@ -65,7 +72,7 @@ function harness(options: {
         ownershipCalls += 1
         if (options.foreignOnSecondOwnership && ownershipCalls === 2) throw new CliError('E_RESOURCE_FOREIGN', 'foreign', 'repair')
         if (options.ownershipError !== undefined) throw options.ownershipError
-        return { ownership: 'owned' as const, container: 'running' as const, composePath: COMPOSE }
+        return options.deploymentStatus ?? { ownership: 'owned' as const, container: 'running' as const, composePath: COMPOSE }
       }),
       down: vi.fn(async (_identity, volumes) => { events.push(`down:${volumes}`) }),
     },
@@ -184,6 +191,32 @@ describe('remove', () => {
     expect(result.dataPurged).toBe(true)
     expect(accepted.events).toContain('down:true')
     expect(accepted.events.at(-1)).toBe('remove-dir:/dsh')
+  })
+
+  it('removes labeled leftovers of a container-less deployment using the bundle recorded in state', async () => {
+    const test = harness({
+      state: managedState({}, true),
+      deploymentStatus: { ownership: 'owned', container: 'absent' },
+      confirmed: true,
+    })
+    const result = await remove({ profile: 'web', service: true, purgeData: true, confirmed: false }, test.dependencies)
+    expect(result).toMatchObject({ serviceRemoved: true, dataPurged: true })
+    const derivedCompose = `/dsh/dsh-searxng/config-${'b'.repeat(64)}/compose.yml`
+    expect(test.dependencies.docker.down).toHaveBeenCalledWith(
+      expect.objectContaining({ composePath: derivedCompose }),
+      true,
+      undefined,
+    )
+    expect(test.events).toContain('down:true')
+    expect(test.events.at(-1)).toBe('remove-dir:/dsh')
+  })
+
+  it('refuses to tear down container-less leftovers without a recorded configuration digest', async () => {
+    const test = harness({ deploymentStatus: { ownership: 'owned', container: 'absent' } })
+    await expect(remove({ profile: 'web', service: true, purgeData: false, confirmed: false }, test.dependencies))
+      .rejects.toMatchObject({ code: 'E_REMOVE_BLOCKED' })
+    expect(test.dependencies.docker.down).not.toHaveBeenCalled()
+    expect(test.events).toEqual(['ownership'])
   })
 
   it('blocks foreign ownership before every destructive operation', async () => {
