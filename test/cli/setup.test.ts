@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
 import { SEARXNG_IMAGE, type AssetRenderer, type ManagedIdentity, type StageInput, type StagingAssetRenderer } from '../../src/cli/assets.ts'
-import type { DockerAdapter } from '../../src/cli/docker.ts'
+import type { DockerAdapter, DockerDeploymentStatus } from '../../src/cli/docker.ts'
 import { CliError } from '../../src/cli/errors.ts'
 import type { EnvironmentService } from '../../src/cli/environment.ts'
 import type { ProfileAttachmentConfig, ProfileManager } from '../../src/cli/profile.ts'
@@ -50,6 +50,7 @@ interface HarnessOptions {
   ownershipError?: unknown
   writeError?: unknown
   ownershipSequence?: ReadonlyArray<'absent' | 'owned' | Error>
+  deploymentStatus?: DockerDeploymentStatus
   readinessErrors?: readonly unknown[]
   upError?: unknown
   downError?: unknown
@@ -150,7 +151,8 @@ function harness(options: HarnessOptions = {}) {
     logs: vi.fn(async () => ''),
     pull: vi.fn(),
     imageExists: vi.fn(async () => false),
-    deploymentStatus: vi.fn(async () => ({ ownership: 'owned' as const, container: 'running' as const, composePath: COMPOSE_PATH })),
+    deploymentStatus: vi.fn(async () =>
+      options.deploymentStatus ?? { ownership: 'owned' as const, container: 'running' as const, composePath: COMPOSE_PATH }),
   }
   const assets: StagingAssetRenderer = {
     render: vi.fn(async (input) => {
@@ -359,6 +361,41 @@ describe('setup', () => {
       configurationSha256: PERSISTED_HASH,
     })
     expect(test.state().managed?.lastHealthyAt).toBe('2026-08-30T01:02:03.004Z')
+  })
+
+  it('recovers a matching deployment whose container is gone by recreating the runtime from the recorded bundle', async () => {
+    const test = harness({
+      state: managedState(),
+      ownership: 'owned',
+      readinessFailures: 1,
+      deploymentStatus: { ownership: 'owned', container: 'absent' },
+    })
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).resolves.toMatchObject({ reused: false })
+    expect(test.events).toEqual([
+      'lock', 'environment', 'state-read', 'dsh-preflight', 'docker-preflight', 'ownership', 'profile-preview', 'readiness', 'docker-up',
+      'readiness', 'real-search', 'profile-attach', 'provider-search',
+      'state-write', 'unlock',
+    ])
+    expect(test.docker.restart).not.toHaveBeenCalled()
+    expect(test.docker.up).toHaveBeenCalledWith(
+      expect.objectContaining({ composePath: join(MANAGED_DIR, `config-${PERSISTED_HASH}`, 'compose.yml') }),
+      undefined,
+    )
+    expect(test.assets.render).not.toHaveBeenCalled()
+    expect(test.assets.stage).not.toHaveBeenCalled()
+    expect(test.state().managed?.current).toMatchObject({ configurationSha256: PERSISTED_HASH })
+  })
+
+  it('refuses to recreate a missing runtime when the state records no configuration digest', async () => {
+    const test = harness({
+      state: managedState({ configurationSha256: undefined }),
+      ownership: 'owned',
+      readinessFailures: 1,
+      deploymentStatus: { ownership: 'owned', container: 'absent' },
+    })
+    await expect(setup({ profile: 'web', port: 8080 }, test.deps)).rejects.toMatchObject({ code: 'E_STATE_INVALID' })
+    expect(test.docker.up).not.toHaveBeenCalled()
+    expect(test.docker.restart).not.toHaveBeenCalled()
   })
 
   it('does not restart when readiness passes but real search has an unclassified deterministic failure', async () => {
