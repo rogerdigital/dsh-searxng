@@ -112,7 +112,8 @@ and `remove` read that journal to refuse during or clean up after an interruptio
   rolls back to the previous image and configuration and revalidates them; same-version updates
   are rejected with `E_DEPLOYMENT_UNSUPPORTED`.
 - `remove --service` clears the journal once the deployment is gone, so a subsequent `setup` is
-  not refused.
+  not refused. It also removes the labeled leftovers of a container-less deployment by deriving the
+  compose file from the bundle recorded in state.
 
 ## Provider configuration
 

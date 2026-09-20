@@ -1,11 +1,11 @@
 import { lstat, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, normalize } from 'node:path'
 import type { ManagedIdentity } from './assets.ts'
-import type { DockerAdapter } from './docker.ts'
+import type { DockerAdapter, DockerDeploymentStatus } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService } from './environment.ts'
 import type { JournalStore, OperationJournal } from './journal.ts'
-import { stateIdentity } from './managed.ts'
+import { bundleComposePath, stateIdentity } from './managed.ts'
 import type { ProfileManager } from './profile.ts'
 import type { StateStore, StateV2 } from './state.ts'
 
@@ -31,6 +31,22 @@ function removalFailed(message: string): CliError {
 
 function identity(managedDir: string, homeId: string, managed: NonNullable<StateV2['managed']>, composePath?: string) {
   return stateIdentity(managedDir, homeId, managed.current, composePath)
+}
+
+/**
+ * Compose path for teardown: the inspected container label when a container
+ * exists, else — for the labeled leftovers of a container-less deployment
+ * (`remove --service` without `--purge-data`, or a manual compose down) — the
+ * bundle recorded in state. No recorded digest means no derivable path.
+ */
+function removalComposePath(
+  managedDir: string,
+  managed: NonNullable<StateV2['managed']>,
+  status: DockerDeploymentStatus,
+): string | undefined {
+  if (status.composePath !== undefined) return status.composePath
+  if (status.container !== 'absent') return undefined
+  return bundleComposePath(managedDir, managed.current)
 }
 
 async function writeWithRestore(state: StateStore, previous: StateV2, next: StateV2): Promise<void> {
@@ -97,8 +113,9 @@ export async function remove(
     if (input.service && managed !== undefined) {
       await dependencies.docker.preflight(signal)
       const status = await dependencies.docker.deploymentStatus(identity(resolved.managedDir, previous.homeId, managed), signal)
-      if (status.ownership !== 'owned' || status.composePath === undefined) throw blocked('Managed Docker resources are absent or incomplete')
-      initialIdentity = identity(resolved.managedDir, previous.homeId, managed, status.composePath)
+      const composePath = removalComposePath(resolved.managedDir, managed, status)
+      if (status.ownership !== 'owned' || composePath === undefined) throw blocked('Managed Docker resources are absent or incomplete')
+      initialIdentity = identity(resolved.managedDir, previous.homeId, managed, composePath)
     }
 
     await dependencies.environment.preflightDsh(signal)
@@ -121,8 +138,9 @@ export async function remove(
 
     if (input.service && managed !== undefined && initialIdentity !== undefined) {
       const finalStatus = await dependencies.docker.deploymentStatus(identity(resolved.managedDir, previous.homeId, managed), signal)
-      if (finalStatus.ownership !== 'owned' || finalStatus.composePath === undefined) throw blocked('Managed Docker ownership changed during removal')
-      await dependencies.docker.down(identity(resolved.managedDir, previous.homeId, managed, finalStatus.composePath), input.purgeData, signal)
+      const finalComposePath = removalComposePath(resolved.managedDir, managed, finalStatus)
+      if (finalStatus.ownership !== 'owned' || finalComposePath === undefined) throw blocked('Managed Docker ownership changed during removal')
+      await dependencies.docker.down(identity(resolved.managedDir, previous.homeId, managed, finalComposePath), input.purgeData, signal)
       if (input.purgeData) purgeDshHome = resolved.dshHome
     }
     // The journal's evidence purpose ends with the deployment: once service
