@@ -36,15 +36,22 @@ const TASKS = [
 ]
 
 function parseArgs(argv) {
-  const options = { base: 'http://127.0.0.1:8080', out: './eval-tasks-v1', cli: join(here, '..', 'lib', 'cli.mjs'), profile: 'web' }
+  const options = {
+    base: 'http://127.0.0.1:8080',
+    out: './eval-tasks-v1',
+    cli: join(here, '..', 'lib', 'cli.mjs'),
+    profile: 'web',
+    noTune: false,
+  }
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
     if (arg === '--base') options.base = argv[++i]
     else if (arg === '--out') options.out = argv[++i]
     else if (arg === '--cli') options.cli = argv[++i]
     else if (arg === '--profile') options.profile = argv[++i]
+    else if (arg === '--no-tune') options.noTune = true
     else if (arg === '--help' || arg === '-h') {
-      console.log('usage: node scripts/eval-tasks-v1.mjs [--base URL] [--out DIR] [--cli PATH] [--profile NAME]')
+      console.log('usage: node scripts/eval-tasks-v1.mjs [--base URL] [--out DIR] [--cli PATH] [--profile NAME] [--no-tune]')
       process.exit(0)
     } else {
       console.error(`unknown argument: ${arg}`)
@@ -90,15 +97,20 @@ mkdirSync(outDir, { recursive: true })
 const batteryPath = join(outDir, 'battery.jsonl')
 writeFileSync(batteryPath, '')
 
+const maybeTune = options.noTune
+  ? async (label) => { console.log(`[tune ${label}] skipped (--no-tune)`) }
+  : async (label) => {
+      await tune(resolve(options.cli), options.profile, join(outDir, `tune-${label}.json`))
+      console.log(`[tune ${label}] captured`)
+    }
+
 console.log(`base=${options.base} out=${outDir}`)
-await tune(resolve(options.cli), options.profile, join(outDir, 'tune-before.json'))
-console.log('[tune before] captured')
+await maybeTune('before')
 for (const [task, q] of TASKS) {
   const row = await query(options.base, task, q)
   appendFileSync(batteryPath, `${JSON.stringify(row)}\n`)
   console.log(`[${task}] ${row.ms}ms count=${row.count ?? '-'} ${row.error ?? ''}`)
   await sleep(GAP_MS)
 }
-await tune(resolve(options.cli), options.profile, join(outDir, 'tune-after.json'))
-console.log('[tune after] captured')
+await maybeTune('after')
 console.log('DONE')

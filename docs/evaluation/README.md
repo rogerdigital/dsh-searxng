@@ -74,7 +74,9 @@ Report per-task differences and exceptions, not only averages.
 reports: tune brackets before and after, the 36 `tasks-v1.md` queries sequential with a
 2.5 s gap, and a per-task top-five JSONL capture for snippet-level judgment. Run it from
 any network with `--base <endpoint> --out <dir>`; the capture is the judgment input, not
-a judgment.
+a judgment. `--no-tune` skips the brackets where no dsh profile exists (the per-task
+`unresponsive` capture still records engine failures); `.github/workflows/eval-window.yml`
+runs the battery on a GitHub-hosted runner as a labeled second network environment.
 
 ```sh
 # 1. Record the environment and configuration under test.
