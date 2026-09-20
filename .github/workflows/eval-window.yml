@@ -1,0 +1,93 @@
+name: Evaluation window
+
+# Runs the docs/evaluation/tasks-v1.md battery against an isolated SearXNG
+# instance staged from the packaged catalog pin — a second network environment
+# for the baseline evidence (labeled per environment in the recorded report).
+# Manual only; produces an artifact, never a claim by itself.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  tasks-v1-window:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Stage the bundle from the catalog pin
+        run: |
+          IMAGE="$(node -p "require('./assets/deployments/v1.json').deployments[0].image")"
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          BUNDLE="${RUNNER_TEMP}/eval-bundle"
+          mkdir -p "${BUNDLE}/searxng"
+          cp assets/docker/compose.yml "${BUNDLE}/compose.yml"
+          sed "s/__DSH_SEARXNG_SECRET__/$(openssl rand -hex 32)/" \
+            assets/docker/settings.yml.template > "${BUNDLE}/searxng/settings.yml"
+          {
+            echo "DSH_SEARXNG_IMAGE=${IMAGE}"
+            echo "DSH_SEARXNG_CONTAINER=eval-searxng"
+            echo "DSH_SEARXNG_PORT=8080"
+            echo "DSH_SEARXNG_HOME_ID=eval0"
+            echo "DSH_SEARXNG_DEPLOYMENT_VERSION=1"
+            echo "DSH_SEARXNG_SETTINGS_DIR=${BUNDLE}/searxng"
+            echo "DSH_SEARXNG_CACHE_VOLUME=eval-searxng-cache"
+            echo "DSH_SEARXNG_NETWORK=eval-searxng-network"
+          } > "${BUNDLE}/.env"
+
+      - name: Start the isolated instance
+        run: |
+          BUNDLE="${RUNNER_TEMP}/eval-bundle"
+          docker compose --project-directory "${BUNDLE}" --env-file "${BUNDLE}/.env" \
+            -f "${BUNDLE}/compose.yml" --project-name eval-searxng up --detach
+
+      - name: Wait for readiness
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8080/healthz >/dev/null; then
+              echo "searxng ready"; exit 0
+            fi
+            sleep 2
+          done
+          docker logs eval-searxng --tail 50
+          exit 1
+
+      - name: Run the tasks-v1 battery (36 queries, 2.5 s gap)
+        run: node scripts/eval-tasks-v1.mjs --base http://127.0.0.1:8080 --out eval-window --no-tune
+
+      - name: Summarize engine contributions
+        run: |
+          node -e '
+            const fs = require("node:fs")
+            const rows = fs.readFileSync("eval-window/battery.jsonl", "utf8").trim().split("\n").map(JSON.parse)
+            const engines = {}
+            for (const row of rows) {
+              for (const hit of row.top5 ?? []) engines[hit.engine] = (engines[hit.engine] ?? 0) + 1
+              for (const [engine] of row.unresponsive ?? []) engines[engine] = engines[engine] ?? 0
+            }
+            const ms = rows.map((r) => r.ms)
+            console.log("tasks:", rows.length, "errors:", rows.filter((r) => r.error).length)
+            console.log("mean ms:", Math.round(ms.reduce((a, b) => a + b, 0) / ms.length), "max ms:", Math.max(...ms))
+            console.log("top5 contribution:", JSON.stringify(engines))
+          '
+
+      - name: Upload capture artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-window
+          path: eval-window/battery.jsonl
+          if-no-files-found: error
+
+      - name: Tear down
+        if: always()
+        run: |
+          BUNDLE="${RUNNER_TEMP}/eval-bundle"
+          docker compose --project-directory "${BUNDLE}" --env-file "${BUNDLE}/.env" \
+            -f "${BUNDLE}/compose.yml" --project-name eval-searxng down --volumes || true
