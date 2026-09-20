@@ -201,7 +201,7 @@ describe('remove', () => {
     })
     const result = await remove({ profile: 'web', service: true, purgeData: true, confirmed: false }, test.dependencies)
     expect(result).toMatchObject({ serviceRemoved: true, dataPurged: true })
-    const derivedCompose = `/dsh/dsh-searxng/config-${'b'.repeat(64)}/compose.yml`
+    const derivedCompose = join('/dsh', 'dsh-searxng', `config-${'b'.repeat(64)}`, 'compose.yml')
     expect(test.dependencies.docker.down).toHaveBeenCalledWith(
       expect.objectContaining({ composePath: derivedCompose }),
       true,
