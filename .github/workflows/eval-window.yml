@@ -7,6 +7,10 @@ name: Evaluation window
 
 on:
   workflow_dispatch: {}
+  pull_request:
+    paths:
+      - .github/workflows/eval-window.yml
+      - scripts/eval-tasks-v1.mjs
 
 permissions:
   contents: read
